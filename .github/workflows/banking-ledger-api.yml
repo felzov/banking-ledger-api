@@ -1,0 +1,71 @@
+name: banking-ledger-api
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "banking-ledger-api/**"
+      - ".github/workflows/banking-ledger-api.yml"
+  pull_request:
+    paths:
+      - "banking-ledger-api/**"
+      - ".github/workflows/banking-ledger-api.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+defaults:
+  run:
+    working-directory: banking-ledger-api
+
+jobs:
+  quality:
+    name: lint, typecheck, test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v7
+        with:
+          version: "0.12.23"
+          enable-cache: true
+          cache-dependency-glob: banking-ledger-api/uv.lock
+
+      - name: Install dependencies
+        run: uv sync --frozen
+
+      - name: Lint
+        run: uv run ruff check .
+
+      - name: Format check
+        run: uv run ruff format --check .
+
+      - name: Type check
+        run: uv run mypy
+
+      - name: Test
+        run: uv run pytest
+
+  docker:
+    name: docker build
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Build runtime image
+        uses: docker/build-push-action@v7
+        with:
+          context: banking-ledger-api
+          target: runtime
+          push: false
+          tags: banking-ledger-api:ci
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
