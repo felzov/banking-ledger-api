@@ -1,4 +1,4 @@
-# revolut-portfolio
+# portfolio
 
 Production-oriented Python backend projects with a focus on fintech and banking systems.
 
