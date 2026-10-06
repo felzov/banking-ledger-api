@@ -1,8 +1,15 @@
 .DEFAULT_GOAL := help
 .PHONY: help install up down logs test lint fmt typecheck check
 
+# Load the local .env (if present) and export it, so host-side tools (pytest, alembic) see the
+# same credentials as Docker Compose. DATABASE_URL is derived from them rather than duplicated;
+# an explicitly set DATABASE_URL (e.g. in CI) wins.
+-include .env
+export
+DATABASE_URL ?= postgresql+asyncpg://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@127.0.0.1:$(POSTGRES_PORT)/$(POSTGRES_DB)
+
 help: ## List available targets
-	@grep -E '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-10s %s\n", $$1, $$2}'
+	@grep -hE '^[a-z-]+:.*## ' $(MAKEFILE_LIST) | awk -F':.*## ' '{printf "  %-10s %s\n", $$1, $$2}'
 
 install: ## Create the local venv from uv.lock
 	uv sync --frozen
