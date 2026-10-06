@@ -13,7 +13,7 @@ rails. The MVP has neither.
 
 - A row in `transactions` exists only after it has been posted successfully. There is no
   `status` column.
-- `transactions`, `transaction_entries` and `audit_events` are append-only. A
+- `transactions`, `ledger_entries` and `audit_events` are append-only. A
   `BEFORE UPDATE OR DELETE` trigger raises. The application's database role will not be
   granted `UPDATE` or `DELETE` on these tables.
 - Rejected and failed attempts are recorded in `audit_events` (see ADR 0007), not as
