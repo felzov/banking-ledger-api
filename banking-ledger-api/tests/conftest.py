@@ -1,19 +1,72 @@
 from collections.abc import AsyncIterator
 
 import pytest
+from alembic import command
 from httpx import ASGITransport, AsyncClient
 from pydantic import SecretStr
+from sqlalchemy import URL
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from ledger_api.config import Settings
+from ledger_api.data.engine import create_engine
 from ledger_api.main import create_app
+from tests.database import (
+    configured_database_url,
+    disposable_database_url,
+    recreate_database,
+    run_alembic,
+)
 
 # Valid asyncpg URL on a port where nothing listens: the app starts, the database is "down".
 UNREACHABLE_DATABASE_URL = "postgresql+asyncpg://ledger:synthetic@127.0.0.1:1/ledger"
 
 
+def settings_for(database_url: URL | str) -> Settings:
+    if isinstance(database_url, URL):
+        database_url = database_url.render_as_string(hide_password=False)
+    return Settings(app_env="test", database_url=SecretStr(database_url))
+
+
+@pytest.fixture(scope="session")
+def test_database_url() -> URL:
+    return disposable_database_url(configured_database_url(), "")
+
+
+@pytest.fixture(scope="session")
+async def engine(test_database_url: URL) -> AsyncIterator[AsyncEngine]:
+    """A freshly created and migrated test database, built once per test run.
+
+    The schema comes from the Alembic migrations, never from metadata.create_all(): the
+    ledger invariants live in triggers that only the migrations install.
+    """
+    assert test_database_url.database is not None
+    await recreate_database(configured_database_url(), test_database_url.database)
+    engine = create_engine(settings_for(test_database_url))
+    await run_alembic(engine, lambda config: command.upgrade(config, "head"))
+    yield engine
+    await engine.dispose()
+
+
+@pytest.fixture
+async def db_session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
+    """A session inside an outer transaction that is always rolled back: tests leave no data.
+
+    Code under test may commit: with create_savepoint it only releases a SAVEPOINT.
+    """
+    async with engine.connect() as connection:
+        transaction = await connection.begin()
+        session = AsyncSession(
+            bind=connection, join_transaction_mode="create_savepoint", expire_on_commit=False
+        )
+        try:
+            yield session
+        finally:
+            await session.close()
+            await transaction.rollback()
+
+
 @pytest.fixture
 async def client() -> AsyncIterator[AsyncClient]:
-    settings = Settings(app_env="test", database_url=SecretStr(UNREACHABLE_DATABASE_URL))
-    transport = ASGITransport(app=create_app(settings))
+    transport = ASGITransport(app=create_app(settings_for(UNREACHABLE_DATABASE_URL)))
     async with AsyncClient(transport=transport, base_url="http://testserver") as async_client:
         yield async_client

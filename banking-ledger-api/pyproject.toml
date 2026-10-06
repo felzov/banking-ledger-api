@@ -34,7 +34,7 @@ dev = [
 [tool.ruff]
 line-length = 100
 target-version = "py314"
-src = ["src", "tests"]
+src = ["src", "tests", "migrations"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP", "S", "ASYNC", "N", "SIM", "PT", "RUF"]
@@ -46,7 +46,7 @@ select = ["E", "F", "I", "B", "UP", "S", "ASYNC", "N", "SIM", "PT", "RUF"]
 strict = true
 python_version = "3.14"
 plugins = ["pydantic.mypy"]
-files = ["src", "tests"]
+files = ["src", "tests", "migrations"]
 
 [tool.pydantic-mypy]
 init_forbid_extra = true
@@ -56,8 +56,13 @@ warn_required_dynamic_aliases = true
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 asyncio_mode = "auto"
-asyncio_default_fixture_loop_scope = "function"
+# One event loop for the whole run: asyncpg connections belong to the loop that created them,
+# and the session-scoped database engine is shared by every test.
+asyncio_default_fixture_loop_scope = "session"
+asyncio_default_test_loop_scope = "session"
 addopts = ["--strict-markers", "--strict-config", "-ra"]
+# A SQLAlchemy warning (e.g. an ambiguous relationship or an unsafe type cache) is a bug.
+filterwarnings = ["error::sqlalchemy.exc.SAWarning"]
 markers = [
     "concurrency: tests that exercise real parallel database connections",
 ]
