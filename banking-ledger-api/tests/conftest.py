@@ -1,7 +1,9 @@
 from collections.abc import AsyncIterator
+from contextlib import asynccontextmanager
 
 import pytest
 from alembic import command
+from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from pydantic import SecretStr
 from sqlalchemy import URL
@@ -65,8 +67,33 @@ async def db_session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
             await transaction.rollback()
 
 
+@asynccontextmanager
+async def serve(app: FastAPI) -> AsyncIterator[AsyncClient]:
+    """An HTTP client for `app` with its lifespan running.
+
+    httpx's ASGITransport does not send lifespan events, so without this the engine would
+    never be created.
+    """
+    async with (
+        app.router.lifespan_context(app),
+        AsyncClient(transport=ASGITransport(app=app), base_url="http://testserver") as client,
+    ):
+        yield client
+
+
 @pytest.fixture
-async def client() -> AsyncIterator[AsyncClient]:
-    transport = ASGITransport(app=create_app(settings_for(UNREACHABLE_DATABASE_URL)))
-    async with AsyncClient(transport=transport, base_url="http://testserver") as async_client:
-        yield async_client
+def app(engine: AsyncEngine, test_database_url: URL) -> FastAPI:
+    # Depends on `engine` so the test database exists and is migrated; the app builds its own.
+    return create_app(settings_for(test_database_url))
+
+
+@pytest.fixture
+async def client(app: FastAPI) -> AsyncIterator[AsyncClient]:
+    async with serve(app) as client:
+        yield client
+
+
+@pytest.fixture
+async def client_without_database() -> AsyncIterator[AsyncClient]:
+    async with serve(create_app(settings_for(UNREACHABLE_DATABASE_URL))) as client:
+        yield client
