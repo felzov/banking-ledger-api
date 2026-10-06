@@ -1,5 +1,10 @@
 name: banking-ledger
 
+# The app reaches PostgreSQL by its service name. Credentials come from .env (single source);
+# a password containing URL-reserved characters (@ : / ?) would need percent-encoding here.
+x-database-url: &database-url
+  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+
 services:
   db:
     image: postgres:18-alpine
@@ -20,11 +25,32 @@ services:
       retries: 10
       start_period: 10s
 
+  # One-shot: applies migrations, then exits. Never done at API startup, where several
+  # workers or replicas would race to migrate the same database.
+  migrate:
+    image: banking-ledger-api:dev
+    build:
+      context: .
+      target: runtime
+    command: ["alembic", "upgrade", "head"]
+    environment:
+      <<: *database-url
+      APP_ENV: ${APP_ENV:-development}
+    volumes:
+      # Edited migrations apply without rebuilding the image.
+      - ./migrations:/app/migrations:ro
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
   api:
+    image: banking-ledger-api:dev
     build:
       context: .
       target: runtime
     environment:
+      <<: *database-url
       APP_ENV: ${APP_ENV:-development}
       # Mounted source shadows the installed package so --reload picks up edits.
       PYTHONPATH: /app/src
@@ -43,6 +69,8 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      migrate:
+        condition: service_completed_successfully
 
 volumes:
   pgdata:

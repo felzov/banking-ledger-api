@@ -31,6 +31,9 @@ RUN groupadd --system --gid 10001 app \
 
 WORKDIR /app
 COPY --from=builder --chown=app:app /app/.venv /app/.venv
+# Migrations ship in the image so a one-shot container can apply them (`alembic upgrade head`).
+COPY --chown=app:app alembic.ini ./
+COPY --chown=app:app migrations ./migrations
 
 ENV PATH="/app/.venv/bin:${PATH}" \
     PYTHONDONTWRITEBYTECODE=1 \

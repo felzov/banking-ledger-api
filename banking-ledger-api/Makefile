@@ -1,5 +1,5 @@
 .DEFAULT_GOAL := help
-.PHONY: help install up down logs test lint fmt typecheck check
+.PHONY: help install up down logs migrate revision db-shell test lint fmt typecheck check
 
 # Load the local .env (if present) and export it, so host-side tools (pytest, alembic) see the
 # same credentials as Docker Compose. DATABASE_URL is derived from them rather than duplicated;
@@ -14,14 +14,24 @@ help: ## List available targets
 install: ## Create the local venv from uv.lock
 	uv sync --frozen
 
-up: ## Build and start the stack in the background
-	docker compose up -d --build
+up: ## Build and start the stack; returns once every service is healthy
+	docker compose up -d --build --wait
 
 down: ## Stop the stack (data volume is kept)
 	docker compose down
 
 logs: ## Follow container logs
 	docker compose logs -f
+
+migrate: ## Apply database migrations from the host (stack must be up)
+	uv run alembic upgrade head
+
+revision: ## Create an empty migration: make revision m="add something"
+	@test -n "$(m)" || (echo 'usage: make revision m="description"' && exit 1)
+	uv run alembic revision -m "$(m)"
+
+db-shell: ## Open psql inside the database container
+	docker compose exec db psql -U $(POSTGRES_USER) -d $(POSTGRES_DB)
 
 test: ## Run the test suite
 	uv run pytest
