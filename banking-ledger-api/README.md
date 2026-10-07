@@ -3,10 +3,14 @@
 A production-oriented banking backend built around a **double-entry ledger**: ACID money
 movement, concurrency control, idempotent APIs, and an append-only audit trail.
 
-> **Status: Phase 2 of 10. Database and domain models.**
-> The PostgreSQL schema, its financial invariants and the async persistence layer exist.
-> Money-moving logic (postings, transfers) and business endpoints do not exist yet. The full
-> design is documented in the [ADRs](docs/adr/).
+> **Status: Phase 3 of 10. Users and accounts.**
+> Users can be registered and customer accounts opened and read, on top of the PostgreSQL
+> schema and its financial invariants. Money-moving logic (postings, transfers) does not exist
+> yet. The full design is documented in the [ADRs](docs/adr/).
+
+> [!WARNING]
+> **The API is unauthenticated until Phase 8.** Anyone who knows a user ID can act as that
+> user. Do not expose it to untrusted clients. See [ADR 0009](docs/adr/0009-owner-scoped-access-and-error-responses.md).
 
 All data is synthetic. No real financial information, credentials or personal data are used.
 
@@ -73,6 +77,48 @@ banking-ledger-api/.venv/bin/pre-commit install
 |---|---|---|
 | GET | `/health/live` | Liveness: the process is serving requests. It checks no dependencies |
 | GET | `/health/ready` | Readiness: PostgreSQL answers `SELECT 1` within 2 s. Otherwise `503 {"status": "unavailable"}` |
+| POST | `/users` | Register a user: `{"email"}`. `201` + `Location`; `409` if the email exists |
+| GET | `/users/{user_id}` | Get a user |
+| POST | `/users/{user_id}/accounts` | Open a customer account: `{"currency": "GBP" \| "EUR"}`. Balance starts at 0. `409` if the user already has one in that currency |
+| GET | `/users/{user_id}/accounts` | List the user's accounts: `{"items": [...]}` |
+| GET | `/users/{user_id}/accounts/{account_id}` | Get one of the user's accounts |
+
+Interactive documentation, including every request and response schema:
+<http://localhost:8000/docs>.
+
+### Example
+
+```bash
+curl -s -X POST localhost:8000/users -H 'content-type: application/json' \
+  -d '{"email": "Alice@Example.com"}'
+# 201 {"id": "<uuid>", "email": "alice@example.com", "created_at": "..."}
+
+curl -s -X POST localhost:8000/users/<user_id>/accounts -H 'content-type: application/json' \
+  -d '{"currency": "GBP"}'
+# 201 {"id": "<uuid>", "currency": "GBP", "balance_minor": 0, "created_at": "..."}
+```
+
+### Rules
+
+- **Accounts are only reachable through their owner.** Every user-scoped route lives under
+  `/users/{user_id}`. Another user's account, a system (settlement) account and a missing
+  account all return the same `404`, so responses never reveal which IDs exist.
+- **Clients never choose** an account's owner (it comes from the URL), its kind (always
+  `customer`) or its balance (starts at 0). Unknown request fields are rejected with `422`.
+- **Emails** are stored in one canonical form: trimmed, syntax-checked, lowercased.
+  ASCII-only addresses are a deliberate MVP boundary. No provider-specific rules (Gmail dots
+  and `+tags` are kept).
+
+### Errors
+
+Every error body is `{"code": "...", "detail": ...}`:
+
+| Status | `code` | When |
+|---|---|---|
+| 404 | `user_not_found`, `account_not_found` | Unknown user; account missing or not the user's |
+| 409 | `email_already_registered`, `account_already_exists` | Uniqueness rules (enforced by the database) |
+| 422 | `validation_error` | Invalid request. `detail` lists `{type, loc, msg}`; submitted values are never echoed |
+| 500 | `internal_error` | Anything unexpected. No details are returned; the traceback goes to the server log |
 
 ## Database
 
@@ -123,7 +169,10 @@ make test
 ```
 
 Negative tests assert the exact constraint or trigger that rejected the data, not just that
-some error occurred. CI runs the same suite against a PostgreSQL service container and
+some error occurred. API tests run each request in a fresh session on the test's rolled-back
+connection, so services still open and commit their own transactions. Tests marked
+`concurrency` race real, committing sessions against the uniqueness rules, and an
+architecture test fails if an account route is ever mounted outside `/users/{user_id}`. CI runs the same suite against a PostgreSQL service container and
 smoke-tests the Compose stack.
 
 ## Architecture decisions
@@ -138,12 +187,13 @@ smoke-tests the Compose stack.
 | [0006](docs/adr/0006-idempotency-inside-the-posting-transaction.md) | Idempotency keys stored inside the posting transaction |
 | [0007](docs/adr/0007-auditing-rejected-financial-attempts.md) | Auditing rejected attempts outside the financial transaction |
 | [0008](docs/adr/0008-redis-only-for-rate-limiting.md) | Redis only for distributed rate limiting |
+| [0009](docs/adr/0009-owner-scoped-access-and-error-responses.md) | Owner-scoped account access and `{code, detail}` error responses |
 
 ## Roadmap
 
 1. ✅ Repository and development environment
 2. ✅ Database and domain models
-3. Users and accounts
+3. ✅ Users and accounts
 4. Ledger and transaction model
 5. Money transfers and database transaction boundaries
 6. Idempotency and concurrency

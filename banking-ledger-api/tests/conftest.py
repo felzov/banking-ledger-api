@@ -1,4 +1,4 @@
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 
 import pytest
@@ -7,8 +7,9 @@ from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 from pydantic import SecretStr
 from sqlalchemy import URL
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 
+from ledger_api.api.dependencies import get_session
 from ledger_api.config import Settings
 from ledger_api.data.engine import create_engine
 from ledger_api.main import create_app
@@ -49,22 +50,47 @@ async def engine(test_database_url: URL) -> AsyncIterator[AsyncEngine]:
     await engine.dispose()
 
 
-@pytest.fixture
-async def db_session(engine: AsyncEngine) -> AsyncIterator[AsyncSession]:
-    """A session inside an outer transaction that is always rolled back: tests leave no data.
+type SessionFactory = Callable[[], AsyncSession]
 
-    Code under test may commit: with create_savepoint it only releases a SAVEPOINT.
+
+@pytest.fixture
+async def db_connection(engine: AsyncEngine) -> AsyncIterator[AsyncConnection]:
+    """One connection inside an outer transaction that is always rolled back.
+
+    Every session a test creates is bound to it, so tests leave no data behind.
     """
     async with engine.connect() as connection:
         transaction = await connection.begin()
-        session = AsyncSession(
-            bind=connection, join_transaction_mode="create_savepoint", expire_on_commit=False
-        )
         try:
-            yield session
+            yield connection
         finally:
-            await session.close()
             await transaction.rollback()
+
+
+@pytest.fixture
+def new_session(db_connection: AsyncConnection) -> SessionFactory:
+    """Factory for fresh sessions on the test connection, e.g. one per service call.
+
+    Services open their own transaction with session.begin(), which requires a session that
+    has not begun one yet. With create_savepoint, their COMMIT only releases a SAVEPOINT.
+    """
+
+    def factory() -> AsyncSession:
+        return AsyncSession(
+            bind=db_connection, join_transaction_mode="create_savepoint", expire_on_commit=False
+        )
+
+    return factory
+
+
+@pytest.fixture
+async def db_session(new_session: SessionFactory) -> AsyncIterator[AsyncSession]:
+    """A session for test setup and assertions; everything is rolled back afterwards."""
+    session = new_session()
+    try:
+        yield session
+    finally:
+        await session.close()
 
 
 @asynccontextmanager
@@ -96,4 +122,22 @@ async def client(app: FastAPI) -> AsyncIterator[AsyncClient]:
 @pytest.fixture
 async def client_without_database() -> AsyncIterator[AsyncClient]:
     async with serve(create_app(settings_for(UNREACHABLE_DATABASE_URL))) as client:
+        yield client
+
+
+@pytest.fixture
+async def api_client(app: FastAPI, new_session: SessionFactory) -> AsyncIterator[AsyncClient]:
+    """Client whose requests run on the test's rolled-back connection.
+
+    Each request gets a fresh session there, so services still open and commit their own
+    transactions, but a COMMIT only releases a SAVEPOINT and the test leaves no data. The
+    real get_session (which commits for real) is covered by test_session_dependency.py.
+    """
+
+    async def session_on_test_connection() -> AsyncIterator[AsyncSession]:
+        async with new_session() as session:
+            yield session
+
+    app.dependency_overrides[get_session] = session_on_test_connection
+    async with serve(app) as client:
         yield client

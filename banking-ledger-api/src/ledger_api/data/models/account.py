@@ -1,9 +1,10 @@
 import uuid
 
 from sqlalchemy import CheckConstraint, ForeignKey, Index, UniqueConstraint, text
-from sqlalchemy.orm import Mapped, mapped_column
+from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from ledger_api.data.base import Base, CreatedAt, MinorUnits, TextEnum, UUIDPrimaryKey
+from ledger_api.data.models.ledger import Ledger
 from ledger_api.domain.account import AccountKind
 
 
@@ -40,3 +41,7 @@ class Account(Base):
     # under a row lock (ADR 0003, ADR 0005).
     balance_minor: Mapped[MinorUnits] = mapped_column(server_default=text("0"))
     created_at: Mapped[CreatedAt]
+
+    # Async SQLAlchemy cannot lazy-load: "raise" turns a forgotten eager load into a clear
+    # error instead of a MissingGreenlet failure. Load it explicitly (e.g. joinedload).
+    ledger: Mapped[Ledger] = relationship(lazy="raise")
