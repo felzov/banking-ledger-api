@@ -4,7 +4,7 @@ from contextlib import asynccontextmanager
 from fastapi import APIRouter, FastAPI
 
 from ledger_api.api.errors import register_error_handlers
-from ledger_api.api.routes import health, users
+from ledger_api.api.routes import accounts, health, users
 from ledger_api.config import Settings
 from ledger_api.data.engine import create_engine, create_sessionmaker
 
@@ -48,4 +48,5 @@ def _user_scoped_router() -> APIRouter:
     """
     scoped = APIRouter()
     scoped.include_router(users.user_router, prefix=USER_SCOPE)
+    scoped.include_router(accounts.router, prefix=USER_SCOPE)
     return scoped
