@@ -12,12 +12,12 @@ concurrent withdrawals can both see the same balance and overdraw the account.
 
 - Use the default READ COMMITTED isolation level. Lock every involved account with
   `SELECT ... FOR UPDATE`, **in ascending id order**, before validating anything.
-- Update balances atomically: `balance = balance + :delta`.
+- Update balances atomically: `balance_minor = balance_minor + :delta`.
 - Retry deadlocks (SQLSTATE `40P01`) up to 3 times with jitter.
 - Set `lock_timeout` and `statement_timeout` so a stuck lock cannot exhaust the connection pool.
 - No network I/O inside a financial transaction.
-- `CHECK (kind = 'system' OR balance >= 0)` is the last line of defense if a code path forgets
-  to lock.
+- `CHECK (kind = 'system' OR balance_minor >= 0)` is the last line of defense if a code path
+  forgets to lock.
 
 ## Why READ COMMITTED is enough here
 

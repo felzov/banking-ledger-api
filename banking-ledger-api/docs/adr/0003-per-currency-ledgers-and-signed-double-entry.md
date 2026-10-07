@@ -13,9 +13,10 @@ and so that the database itself can reject inconsistent data.
 - A `ledgers` table with exactly one ledger per currency. GBP and EUR are seeded. Every account
   and every transaction belongs to one ledger.
 - Each user may hold at most one account per currency (`UNIQUE (user_id, ledger_id)`).
-- Entries carry **signed** amounts. An account's balance is the sum of its entries.
-- Invariant per transaction: at least two entries, and `SUM(amount) = 0`. It is enforced by the
-  domain code **and** by a deferred PostgreSQL constraint trigger that runs at commit.
+- Entries live in `ledger_entries` and carry **signed** amounts (`amount_minor`). An account's
+  balance is the sum of its entries.
+- Invariant per transaction: at least two entries, and `SUM(amount_minor) = 0`. It is enforced
+  by the domain code **and** by a deferred PostgreSQL constraint trigger that runs at commit.
 - Composite foreign keys `(account_id, ledger_id)` and `(transaction_id, ledger_id)` make it
   impossible for an entry to reference an account in a different currency.
 - Deposits and withdrawals are simulated against a per-currency **external settlement** system
@@ -27,9 +28,9 @@ and so that the database itself can reject inconsistent data.
 | Withdrawal from A | A −10000, settlement +10000 |
 | Transfer A → B | A −10000, B +10000 |
 
-- `accounts.balance` is a cached projection. It is updated in the same transaction as the
-  entries, under a row lock. Reconciliation checks that `balance = SUM(entries)` and that every
-  ledger sums to zero.
+- `accounts.balance_minor` is a cached projection. It is updated in the same transaction as
+  the entries, under a row lock. Reconciliation checks that
+  `balance_minor = SUM(ledger_entries.amount_minor)` and that every ledger sums to zero.
 
 ## Alternatives considered
 
