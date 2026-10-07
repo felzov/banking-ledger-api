@@ -9,6 +9,7 @@ from pydantic import SecretStr
 from sqlalchemy import URL
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession
 
+from ledger_api.api.dependencies import get_session
 from ledger_api.config import Settings
 from ledger_api.data.engine import create_engine
 from ledger_api.main import create_app
@@ -121,4 +122,22 @@ async def client(app: FastAPI) -> AsyncIterator[AsyncClient]:
 @pytest.fixture
 async def client_without_database() -> AsyncIterator[AsyncClient]:
     async with serve(create_app(settings_for(UNREACHABLE_DATABASE_URL))) as client:
+        yield client
+
+
+@pytest.fixture
+async def api_client(app: FastAPI, new_session: SessionFactory) -> AsyncIterator[AsyncClient]:
+    """Client whose requests run on the test's rolled-back connection.
+
+    Each request gets a fresh session there, so services still open and commit their own
+    transactions, but a COMMIT only releases a SAVEPOINT and the test leaves no data. The
+    real get_session (which commits for real) is covered by test_session_dependency.py.
+    """
+
+    async def session_on_test_connection() -> AsyncIterator[AsyncSession]:
+        async with new_session() as session:
+            yield session
+
+    app.dependency_overrides[get_session] = session_on_test_connection
+    async with serve(app) as client:
         yield client

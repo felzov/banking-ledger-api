@@ -70,3 +70,11 @@ def test_invalid_addresses_are_rejected(raw: str) -> None:
 def test_invalid_email_error_is_a_value_error() -> None:
     # Pydantic turns ValueError raised in a validator into a 422 validation error.
     assert issubclass(InvalidEmailError, ValueError)
+
+
+def test_rejection_message_does_not_quote_the_input() -> None:
+    with pytest.raises(InvalidEmailError) as excinfo:
+        normalize_email("secret-local-part..x@example.com")
+
+    assert "secret-local-part" not in str(excinfo.value)
+    assert excinfo.value.__cause__ is not None  # the detailed reason is kept for debugging

@@ -22,7 +22,9 @@ def normalize_email(raw: str) -> str:
         # No DNS lookups: validation stays pure, fast and independent of the network.
         result = validate_email(candidate, check_deliverability=False, allow_smtputf8=False)
     except EmailNotValidError as error:
-        raise InvalidEmailError(str(error)) from error
+        # Fixed message: email-validator's reasons quote parts of the input, and validation
+        # errors must never echo what was submitted. The reason stays on __cause__.
+        raise InvalidEmailError("Email address is not valid.") from error
     # ascii_email, not normalized: normalized turns an ASCII punycode domain
     # (xn--...) back into Unicode. It is None only for addresses that need SMTPUTF8, which the
     # ASCII check above already rejects; checked explicitly rather than assumed.
