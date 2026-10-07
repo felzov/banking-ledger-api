@@ -12,6 +12,8 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
+from ledger_api.data.errors import violated_constraint
+
 ALEMBIC_INI = Path(__file__).resolve().parent.parent / "alembic.ini"
 
 # Only databases whose name ends with this suffix may ever be dropped by the test suite.
@@ -66,13 +68,6 @@ async def run_alembic(engine: AsyncEngine, operation: Callable[[Config], None]) 
 
     async with engine.begin() as connection:
         await connection.run_sync(run)
-
-
-def violated_constraint(error: IntegrityError) -> str | None:
-    # The DBAPI error wraps asyncpg's exception, which carries PostgreSQL's constraint name.
-    # Trigger-raised errors set it too, via RAISE ... USING CONSTRAINT.
-    cause = error.orig.__cause__ if error.orig is not None else None
-    return getattr(cause, "constraint_name", None)
 
 
 @asynccontextmanager

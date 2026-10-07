@@ -8,10 +8,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from ledger_api.data.engine import create_sessionmaker
+from ledger_api.data.errors import violated_constraint
 from ledger_api.data.models import Account, LedgerEntry, Transaction
 from ledger_api.domain.currency import Currency
 from ledger_api.domain.transaction import TransactionKind
-from tests.database import check_deferred_constraints, raises_violation, violated_constraint
+from tests.database import check_deferred_constraints, raises_violation
 from tests.factories import (
     add_entries,
     create_customer_account,
