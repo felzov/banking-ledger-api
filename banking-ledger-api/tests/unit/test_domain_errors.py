@@ -1,6 +1,12 @@
 import pytest
 
-from ledger_api.domain.errors import ConflictError, DomainError, NotFoundError
+from ledger_api.domain.errors import (
+    ConflictError,
+    DomainError,
+    NotFoundError,
+    RuleViolationError,
+    UnavailableError,
+)
 
 
 def _concrete_errors() -> list[type[DomainError]]:
@@ -27,7 +33,9 @@ def test_every_concrete_error_has_a_code_message_and_category(
 ) -> None:
     assert error_type.code
     assert error_type.message
-    assert issubclass(error_type, (NotFoundError, ConflictError))
+    assert issubclass(
+        error_type, (NotFoundError, ConflictError, RuleViolationError, UnavailableError)
+    )
 
 
 def test_error_codes_are_unique() -> None:

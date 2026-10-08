@@ -21,6 +21,14 @@ class ConflictError(DomainError):
     """The request conflicts with existing state (a uniqueness rule)."""
 
 
+class RuleViolationError(DomainError):
+    """A well-formed request that a business rule rejects (e.g. insufficient funds)."""
+
+
+class UnavailableError(DomainError):
+    """A transient condition (contention): nothing happened, and retrying may succeed."""
+
+
 class UserNotFoundError(NotFoundError):
     code = "user_not_found"
     message = "User not found."
@@ -41,3 +49,38 @@ class EmailAlreadyRegisteredError(ConflictError):
 class AccountAlreadyExistsError(ConflictError):
     code = "account_already_exists"
     message = "The user already has an account in this currency."
+
+
+class DestinationAccountNotFoundError(NotFoundError):
+    # A transfer's destination: missing, or not a customer account. Revealing that a
+    # destination exists is inherent to paying into it; its owner and balance stay private.
+    code = "destination_account_not_found"
+    message = "Destination account not found."
+
+
+class InvalidAmountError(RuleViolationError):
+    code = "invalid_amount"
+    message = (
+        "Amount must be a positive whole number of minor units within the per-transaction limit."
+    )
+
+
+class SameAccountTransferError(RuleViolationError):
+    code = "same_account_transfer"
+    message = "Source and destination accounts must differ."
+
+
+class CurrencyMismatchError(RuleViolationError):
+    code = "currency_mismatch"
+    message = "Accounts in different currencies cannot transact with each other."
+
+
+class InsufficientFundsError(RuleViolationError):
+    code = "insufficient_funds"
+    message = "The account balance is insufficient."
+
+
+class TemporarilyUnavailableError(UnavailableError):
+    # Lock timeout, statement timeout or exhausted deadlock retries. Nothing was written.
+    code = "temporarily_unavailable"
+    message = "The service is temporarily unavailable. Please retry."

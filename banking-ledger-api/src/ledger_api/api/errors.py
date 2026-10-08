@@ -7,12 +7,20 @@ from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
-from ledger_api.domain.errors import ConflictError, DomainError, NotFoundError
+from ledger_api.domain.errors import (
+    ConflictError,
+    DomainError,
+    NotFoundError,
+    RuleViolationError,
+    UnavailableError,
+)
 
 # Domain errors are mapped by category, so a new error type needs no change here.
 STATUS_BY_CATEGORY: dict[type[DomainError], int] = {
     NotFoundError: status.HTTP_404_NOT_FOUND,
     ConflictError: status.HTTP_409_CONFLICT,
+    RuleViolationError: status.HTTP_422_UNPROCESSABLE_CONTENT,
+    UnavailableError: status.HTTP_503_SERVICE_UNAVAILABLE,
 }
 
 # Fields of a validation error that are safe to return. Pydantic's "input" echoes the
