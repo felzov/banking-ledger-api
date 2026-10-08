@@ -3,10 +3,11 @@
 A production-oriented banking backend built around a **double-entry ledger**: ACID money
 movement, concurrency control, idempotent APIs, and an append-only audit trail.
 
-> **Status: Phase 3 of 10. Users and accounts.**
-> Users can be registered and customer accounts opened and read, on top of the PostgreSQL
-> schema and its financial invariants. Money-moving logic (postings, transfers) does not exist
-> yet. The full design is documented in the [ADRs](docs/adr/).
+> **Status: Phase 4 of 10. Ledger and transaction posting.**
+> Users can be registered and customer accounts opened and read. A concurrency-safe posting
+> engine moves money (deposits, withdrawals, transfers) at the service layer; HTTP endpoints
+> for it arrive in Phase 6 together with idempotency keys. The full design is documented in
+> the [ADRs](docs/adr/).
 
 > [!WARNING]
 > **The API is unauthenticated until Phase 8.** Anyone who knows a user ID can act as that
@@ -122,9 +123,10 @@ Every error body is `{"code": "...", "detail": ...}`:
 
 ## Database
 
-One migration ([`0001_initial_schema`](migrations/versions/0001_initial_schema.py)) creates the
-schema and seeds one ledger per supported currency (GBP, EUR), each with its external
-settlement account.
+[`0001_initial_schema`](migrations/versions/0001_initial_schema.py) creates the schema and
+seeds one ledger per supported currency (GBP, EUR), each with its external settlement account.
+[`0002_seal_transactions_with_entry_count`](migrations/versions/0002_seal_transactions_with_entry_count.py)
+seals every transaction with its declared number of entries.
 
 ```
 users 1 ── 0..* accounts *── 1 ledgers 1 ── * transactions
@@ -137,7 +139,7 @@ users 1 ── 0..* accounts *── 1 ledgers 1 ── * transactions
 | `users` | Identity only (lowercase, unique email) |
 | `ledgers` | One per currency: the boundary money cannot cross |
 | `accounts` | `customer` (owned by a user, one per currency) or `system` (settlement, one per ledger). `balance_minor` is a cached projection of the entries |
-| `transactions` | A posted transaction: `deposit`, `withdrawal` or `transfer`. Append-only |
+| `transactions` | A posted transaction: `deposit`, `withdrawal` or `transfer`, sealed with its `entry_count`. Append-only |
 | `ledger_entries` | One signed `amount_minor` on one account. Append-only |
 
 Conventions: UUIDv7 primary keys; money is `BIGINT` minor units named `*_minor`; timestamps
@@ -149,11 +151,34 @@ Invariants enforced by PostgreSQL itself, so every code path is bound by them:
 | Invariant | Mechanism |
 |---|---|
 | Every transaction has at least 2 entries summing to 0 | Deferred constraint triggers, checked at `COMMIT` |
+| A posted transaction can never gain entries, even balanced ones | `entry_count` in the immutable header, checked by the same trigger |
 | Posted transactions and entries are never updated or deleted | `BEFORE UPDATE OR DELETE` triggers |
 | An entry, its transaction and its account share one ledger (no cross-currency postings) | Composite foreign keys on `(…, ledger_id)` |
 | Customer balances never go negative; settlement balances may | `CHECK (kind = 'system' OR balance_minor >= 0)` |
 | One account per user per currency, one settlement account per ledger | Unique constraint, partial unique index |
 | An account appears at most once per transaction | Unique `(transaction_id, account_id)` |
+
+`balance_minor` is maintained by the application inside the posting transaction, not by a
+constraint. Reconciliation queries ([`data/reconciliation.py`](src/ledger_api/data/reconciliation.py))
+verify that every balance equals its entries and that every ledger's entries and balances
+sum to zero (so the settlement account mirrors the customers' money).
+
+## Posting
+
+Deposits, withdrawals and transfers ([`services/posting.py`](src/ledger_api/services/posting.py))
+each run in one database transaction ([ADR 0010](docs/adr/0010-posting-protocol.md)):
+
+1. Validate the request (amount, distinct accounts) before touching the database.
+2. Lock every account involved in **one** statement, in ascending id order
+   (`ORDER BY id FOR UPDATE OF accounts`): all postings take locks in the same order, so they
+   cannot deadlock, and no ledger row is ever locked.
+3. Check ownership, currency and funds against the locked rows only.
+4. Write the transaction, its entries and relative balance updates; `COMMIT` runs the
+   deferred checks. Any failure rolls back everything.
+
+Deadlocks and serialization failures retry the whole transaction (3 attempts at most); lock
+or statement timeouts and exhausted retries report `temporarily_unavailable`. Amounts are
+limited to 100,000,000 minor units per transaction.
 
 ## Testing
 
@@ -170,10 +195,22 @@ make test
 
 Negative tests assert the exact constraint or trigger that rejected the data, not just that
 some error occurred. API tests run each request in a fresh session on the test's rolled-back
-connection, so services still open and commit their own transactions. Tests marked
-`concurrency` race real, committing sessions against the uniqueness rules, and an
-architecture test fails if an account route is ever mounted outside `/users/{user_id}`. CI runs the same suite against a PostgreSQL service container and
-smoke-tests the Compose stack.
+connection, so services still open and commit their own transactions. An architecture test
+fails if an account route is ever mounted outside `/users/{user_id}`.
+
+Posting is tested at every level:
+
+- **Failure injection** with real commits: a posting broken after its header, after its
+  entries, midway through the balance updates, or at `COMMIT` leaves no trace.
+- **Concurrency** (`-m concurrency`), on real connections with **retries disabled** so a
+  deadlock cannot be retried away: racing withdrawals never overdraw, opposite transfers
+  never deadlock, random concurrent transfers conserve money.
+- **Property-based** ([Hypothesis](https://hypothesis.readthedocs.io/)): posting rules hold for
+  generated inputs, and random sequences of postings match a pure-Python model step by step.
+- **Reconciliation** after every posting test: balances equal entries, ledgers sum to zero.
+
+CI runs the same suite against a PostgreSQL service container and smoke-tests the Compose
+stack.
 
 ## Architecture decisions
 
@@ -188,16 +225,17 @@ smoke-tests the Compose stack.
 | [0007](docs/adr/0007-auditing-rejected-financial-attempts.md) | Auditing rejected attempts outside the financial transaction |
 | [0008](docs/adr/0008-redis-only-for-rate-limiting.md) | Redis only for distributed rate limiting |
 | [0009](docs/adr/0009-owner-scoped-access-and-error-responses.md) | Owner-scoped account access and `{code, detail}` error responses |
+| [0010](docs/adr/0010-posting-protocol.md) | Posting protocol: sealed transactions, one sorted lock, whole-transaction retries |
 
 ## Roadmap
 
 1. ✅ Repository and development environment
 2. ✅ Database and domain models
 3. ✅ Users and accounts
-4. Ledger and transaction model
-5. Money transfers and database transaction boundaries
-6. Idempotency and concurrency
-7. REST API
+4. ✅ Ledger and transaction posting
+5. Audit
+6. Idempotency and concurrency hardening
+7. REST API and statements
 8. Authentication and authorization
-9. Testing and reliability
-10. Security, observability and documentation
+9. Reliability
+10. Security and observability

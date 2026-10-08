@@ -13,6 +13,11 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engin
 from sqlalchemy.pool import NullPool
 
 from ledger_api.data.errors import violated_constraint
+from ledger_api.data.reconciliation import (
+    find_balance_mismatches,
+    find_ledgers_with_nonzero_balances,
+    find_unbalanced_ledgers,
+)
 
 ALEMBIC_INI = Path(__file__).resolve().parent.parent / "alembic.ini"
 
@@ -82,3 +87,13 @@ async def check_deferred_constraints(session: AsyncSession) -> None:
     """Run COMMIT-time checks now. Test transactions are rolled back, so they never commit."""
     await session.flush()
     await session.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+
+
+async def assert_reconciled(session: AsyncSession) -> None:
+    """Every balance equals its entries, and every ledger sums to zero (entries and balances).
+
+    Global by design: tests that COMMIT must leave the shared test database reconciled.
+    """
+    assert await find_balance_mismatches(session) == []
+    assert await find_unbalanced_ledgers(session) == {}
+    assert await find_ledgers_with_nonzero_balances(session) == {}

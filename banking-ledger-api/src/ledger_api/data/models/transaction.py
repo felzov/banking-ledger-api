@@ -5,6 +5,7 @@ from sqlalchemy import (
     ForeignKey,
     ForeignKeyConstraint,
     Index,
+    SmallInteger,
     UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column
@@ -17,12 +18,13 @@ class Transaction(Base):
     """A posted financial transaction. Append-only: a row exists only once posted (ADR 0004).
 
     The database rejects UPDATE and DELETE, and at COMMIT it requires at least two entries
-    that sum to zero (triggers in migration 0001).
+    that sum to zero and whose number equals entry_count (triggers, migrations 0001 and 0002).
     """
 
     __tablename__ = "transactions"
     __table_args__ = (
         CheckConstraint("kind IN ('deposit', 'withdrawal', 'transfer')", name="kind"),
+        CheckConstraint("entry_count >= 2", name="entry_count_min"),
         # Target of the composite foreign key from ledger_entries.
         UniqueConstraint("id", "ledger_id"),
     )
@@ -30,6 +32,9 @@ class Transaction(Base):
     id: Mapped[UUIDPrimaryKey]
     ledger_id: Mapped[uuid.UUID] = mapped_column(ForeignKey("ledgers.id", ondelete="RESTRICT"))
     kind: Mapped[TransactionKind] = mapped_column(TextEnum(TransactionKind))
+    # Seals the transaction: the number of entries it was posted with. The header is immutable,
+    # so entries appended later make the actual count exceed it and COMMIT fails.
+    entry_count: Mapped[int] = mapped_column(SmallInteger)
     created_at: Mapped[CreatedAt]
 
 
