@@ -70,7 +70,7 @@ async def test_balanced_posting_with_more_than_two_entries_is_accepted(
     payer = await create_customer_account(db_session, balance_minor=100)
     first = await create_customer_account(db_session)
     second = await create_customer_account(db_session)
-    transaction = await create_transaction(db_session)
+    transaction = await create_transaction(db_session, entry_count=3)
 
     add_entries(db_session, transaction, (payer, -100), (first, 60), (second, 40))
     await check_deferred_constraints(db_session)
@@ -125,8 +125,7 @@ async def test_unbalancing_entry_appended_to_a_checked_transaction_is_rejected(
     db_session: AsyncSession,
 ) -> None:
     # Once the transaction's own trigger has run, only the trigger on ledger_entries can catch
-    # entries appended afterwards. (Balanced appends are a known gap: the posting
-    # finalization invariant is designed in Phase 4/5.)
+    # entries appended afterwards. Balanced appends are covered in test_transaction_sealing.py.
     payer = await create_customer_account(db_session, balance_minor=5000)
     payee = await create_customer_account(db_session)
     intruder = await create_customer_account(db_session)
@@ -147,7 +146,12 @@ async def _commit_single_entry_deposit(
         ledger = await get_ledger(session, Currency.GBP)
         settlement = await get_settlement_account(session, Currency.GBP)
         session.add(
-            Transaction(id=transaction_id, ledger_id=ledger.id, kind=TransactionKind.DEPOSIT)
+            Transaction(
+                id=transaction_id,
+                ledger_id=ledger.id,
+                kind=TransactionKind.DEPOSIT,
+                entry_count=2,
+            )
         )
         await session.flush()
         session.add(
@@ -234,7 +238,9 @@ async def test_transaction_kind_must_be_known(db_session: AsyncSession) -> None:
     ledger = await get_ledger(db_session, Currency.GBP)
 
     async with raises_violation("ck_transactions_kind"):
-        await db_session.execute(insert(Transaction).values(ledger_id=ledger.id, kind="refund"))
+        await db_session.execute(
+            insert(Transaction).values(ledger_id=ledger.id, kind="refund", entry_count=2)
+        )
 
 
 async def test_every_transaction_kind_is_accepted_by_the_database(

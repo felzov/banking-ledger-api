@@ -57,9 +57,10 @@ async def create_transaction(
     session: AsyncSession,
     currency: Currency = Currency.GBP,
     kind: TransactionKind = TransactionKind.TRANSFER,
+    entry_count: int = 2,
 ) -> Transaction:
     ledger = await get_ledger(session, currency)
-    transaction = Transaction(ledger_id=ledger.id, kind=kind)
+    transaction = Transaction(ledger_id=ledger.id, kind=kind, entry_count=entry_count)
     session.add(transaction)
     await session.flush()
     return transaction
