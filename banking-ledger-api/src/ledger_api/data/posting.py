@@ -36,16 +36,21 @@ class LockedAccount:
 async def find_settlement_account_id(
     session: AsyncSession, *, account_id: uuid.UUID
 ) -> uuid.UUID | None:
-    """The settlement account of `account_id`'s ledger, or None if the account does not exist.
+    """The settlement account of customer account `account_id`'s ledger, or None if there is
+    no such customer account (it does not exist, or is itself a system account).
 
-    Reads immutable facts only (an account's ledger and a ledger's settlement account never
-    change), so it is safe before locking.
+    Reads immutable facts only (an account's kind and ledger, and a ledger's settlement
+    account, never change), so it is safe before locking.
     """
     customer, settlement = aliased(Account), aliased(Account)
     statement = (
         select(settlement.id)
         .join(customer, customer.ledger_id == settlement.ledger_id)
-        .where(customer.id == account_id, settlement.kind == AccountKind.SYSTEM)
+        .where(
+            customer.id == account_id,
+            customer.kind == AccountKind.CUSTOMER,
+            settlement.kind == AccountKind.SYSTEM,
+        )
     )
     return (await session.execute(statement)).scalar_one_or_none()
 

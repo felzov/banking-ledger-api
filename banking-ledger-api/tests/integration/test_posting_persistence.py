@@ -164,6 +164,13 @@ async def test_settlement_lookup_for_an_unknown_account_is_none(db_session: Asyn
     assert await find_settlement_account_id(db_session, account_id=uuid.uuid7()) is None
 
 
+async def test_settlement_lookup_for_a_system_account_is_none(db_session: AsyncSession) -> None:
+    # Otherwise a deposit "into" the settlement account would pair it with itself.
+    settlement = await get_settlement_account(db_session, Currency.GBP)
+
+    assert await find_settlement_account_id(db_session, account_id=settlement.id) is None
+
+
 # --- writing a posting -------------------------------------------------------------------------
 
 
