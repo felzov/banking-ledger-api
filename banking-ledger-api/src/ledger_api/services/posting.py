@@ -12,15 +12,26 @@ Lifecycle of every posting, inside ONE database transaction:
 
 Any error rolls back everything, releasing the locks: nothing partial is ever committed.
 No I/O other than this session happens between BEGIN and COMMIT.
+
+Transient failures retry the WHOLE transaction (steps 2-7), never a part of it: a deadlock
+or serialization failure up to MAX_ATTEMPTS in total, with jittered backoff. A lock or
+statement timeout is not retried (the caller already waited); it, and exhausted retries,
+become TemporarilyUnavailableError. Retrying is safe because a failed attempt committed
+nothing.
 """
 
+import asyncio
+import logging
+import random
 import uuid
-from collections.abc import Collection, Mapping
+from collections.abc import Awaitable, Callable, Collection, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
+from ledger_api.data.errors import sqlstate
 from ledger_api.data.posting import (
     LockedAccount,
     apply_balance_deltas,
@@ -34,6 +45,7 @@ from ledger_api.domain.errors import (
     CurrencyMismatchError,
     DestinationAccountNotFoundError,
     InsufficientFundsError,
+    TemporarilyUnavailableError,
 )
 from ledger_api.domain.posting import (
     Posting,
@@ -43,6 +55,17 @@ from ledger_api.domain.posting import (
     withdrawal_posting,
 )
 from ledger_api.domain.transaction import TransactionKind
+
+logger = logging.getLogger(__name__)
+
+# Attempts per posting, the first one included (ADR 0005). Concurrency tests lower it to 1 so
+# that a deadlock cannot be hidden by a retry.
+MAX_ATTEMPTS = 3
+# deadlock_detected, serialization_failure: the transaction was rolled back; retry it whole.
+RETRYABLE_SQLSTATES = frozenset({"40P01", "40001"})
+# lock_not_available (lock_timeout), query_canceled (statement_timeout): already waited.
+CONTENTION_SQLSTATES = frozenset({"55P03", "57014"})
+RETRY_BACKOFF_SECONDS = (0.01, 0.05)
 
 
 @dataclass(frozen=True, slots=True)
@@ -59,12 +82,15 @@ async def deposit(
 ) -> PostingResult:
     """Credit owner_id's account with money arriving from outside (the settlement account)."""
     validate_amount(amount_minor)
-    async with session.begin():
+
+    async def attempt() -> PostingResult:
         settlement_id = await _settlement_account_of(session, account_id)
         posting = deposit_posting(
             account_id=account_id, settlement_account_id=settlement_id, amount_minor=amount_minor
         )
         return await _post(session, posting, owner_id=owner_id, owned={account_id})
+
+    return await _in_transaction(session, attempt)
 
 
 async def withdraw(
@@ -72,12 +98,15 @@ async def withdraw(
 ) -> PostingResult:
     """Debit owner_id's account with money leaving to outside (the settlement account)."""
     validate_amount(amount_minor)
-    async with session.begin():
+
+    async def attempt() -> PostingResult:
         settlement_id = await _settlement_account_of(session, account_id)
         posting = withdrawal_posting(
             account_id=account_id, settlement_account_id=settlement_id, amount_minor=amount_minor
         )
         return await _post(session, posting, owner_id=owner_id, owned={account_id})
+
+    return await _in_transaction(session, attempt)
 
 
 async def transfer(
@@ -94,7 +123,8 @@ async def transfer(
         destination_account_id=destination_account_id,
         amount_minor=amount_minor,
     )
-    async with session.begin():
+
+    async def attempt() -> PostingResult:
         return await _post(
             session,
             posting,
@@ -102,6 +132,32 @@ async def transfer(
             owned={source_account_id},
             counterparty=destination_account_id,
         )
+
+    return await _in_transaction(session, attempt)
+
+
+async def _in_transaction(
+    session: AsyncSession, attempt: Callable[[], Awaitable[PostingResult]]
+) -> PostingResult:
+    """Run `attempt` in its own transaction, retrying the whole of it on transient failures."""
+    for number in range(1, MAX_ATTEMPTS + 1):
+        try:
+            async with session.begin():
+                return await attempt()
+        except DBAPIError as error:
+            # session.begin() has rolled back: nothing of this attempt was committed.
+            code = sqlstate(error)
+            if code in CONTENTION_SQLSTATES:
+                raise TemporarilyUnavailableError from error
+            if code not in RETRYABLE_SQLSTATES:
+                raise
+            if number == MAX_ATTEMPTS:
+                logger.warning("posting failed after %d attempts (SQLSTATE %s)", number, code)
+                raise TemporarilyUnavailableError from error
+            logger.info("retrying posting after SQLSTATE %s (attempt %d)", code, number)
+            # Jitter, so that the transactions that collided do not collide again in lockstep.
+            await asyncio.sleep(random.uniform(*RETRY_BACKOFF_SECONDS) * number)  # noqa: S311
+    raise AssertionError("unreachable: the last attempt returns or raises")
 
 
 async def _settlement_account_of(session: AsyncSession, account_id: uuid.UUID) -> uuid.UUID:

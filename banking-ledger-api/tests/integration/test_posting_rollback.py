@@ -22,11 +22,9 @@ from ledger_api.data.errors import violated_constraint
 from ledger_api.data.models import Account, LedgerEntry, Transaction
 from ledger_api.domain.currency import Currency
 from ledger_api.services import posting as posting_service
-from ledger_api.services.accounts import open_customer_account
-from ledger_api.services.posting import deposit, withdraw
-from ledger_api.services.users import register_user
+from ledger_api.services.posting import withdraw
 from tests.database import assert_reconciled
-from tests.factories import get_settlement_account
+from tests.factories import commit_funded_account, get_settlement_account
 
 FUNDED = 5_000
 WITHDRAWAL = 1_000
@@ -57,15 +55,10 @@ def sessionmaker(engine: AsyncEngine) -> async_sessionmaker[AsyncSession]:
 
 @pytest.fixture
 async def funded(sessionmaker: async_sessionmaker[AsyncSession]) -> Funded:
-    async with sessionmaker() as session:
-        user = await register_user(session, email=f"rb-{uuid.uuid7().hex}@example.com")
-    async with sessionmaker() as session:
-        account = await open_customer_account(session, owner_id=user.id, currency=Currency.GBP)
-    async with sessionmaker() as session:
-        await deposit(session, owner_id=user.id, account_id=account.id, amount_minor=FUNDED)
+    account = await commit_funded_account(sessionmaker, FUNDED)
     async with sessionmaker() as session:
         settlement = await get_settlement_account(session, Currency.GBP)
-    return Funded(user.id, account.id, settlement.id)
+    return Funded(account.owner_id, account.account_id, settlement.id)
 
 
 async def _snapshot(sessionmaker: async_sessionmaker[AsyncSession], funded: Funded) -> Snapshot:
