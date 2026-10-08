@@ -1,4 +1,4 @@
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 
 
 def violated_constraint(error: IntegrityError) -> str | None:
@@ -12,3 +12,9 @@ def violated_constraint(error: IntegrityError) -> str | None:
     cause = error.orig.__cause__ if error.orig is not None else None
     name = getattr(cause, "constraint_name", None)
     return name if isinstance(name, str) else None
+
+
+def sqlstate(error: DBAPIError) -> str | None:
+    """The SQLSTATE PostgreSQL reported (e.g. 40P01 deadlock_detected), or None."""
+    code = getattr(error.orig, "sqlstate", None)
+    return code if isinstance(code, str) else None
