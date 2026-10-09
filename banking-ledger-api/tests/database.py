@@ -89,6 +89,22 @@ async def check_deferred_constraints(session: AsyncSession) -> None:
     await session.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
 
 
+async def bypass_triggers(session: AsyncSession) -> None:
+    """Disable every trigger (immutability, deferred checks, foreign keys) for the rest of the
+    current transaction. TEST-ONLY, and only inside a transaction that is rolled back.
+
+    session_replication_role = replica is how a superuser skips triggers, so tests use it both
+    to plant corruption that the schema would otherwise refuse (reconciliation must still find
+    it) and to demonstrate that trigger protection does not bind a superuser (ADR 0004).
+    """
+    is_superuser = await session.scalar(
+        text("SELECT rolsuper FROM pg_roles WHERE rolname = current_user")
+    )
+    if not is_superuser:
+        pytest.fail("this test needs a superuser test role to bypass triggers", pytrace=False)
+    await session.execute(text("SET LOCAL session_replication_role = replica"))
+
+
 async def assert_reconciled(session: AsyncSession) -> None:
     """Every balance equals its entries, and every ledger sums to zero (entries and balances).
 

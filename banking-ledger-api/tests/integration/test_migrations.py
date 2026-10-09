@@ -1,20 +1,26 @@
+import pytest
 from alembic import command
+from alembic.config import Config
+from alembic.script import ScriptDirectory
 from sqlalchemy import select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from ledger_api.data.base import Base
+from ledger_api.data.errors import sqlstate
 from ledger_api.data.models import Account, Ledger
 from ledger_api.domain.account import AccountKind
 from ledger_api.domain.currency import Currency
 from tests.database import (
+    ALEMBIC_INI,
     configured_database_url,
     disposable_database_url,
     recreate_database,
     run_alembic,
 )
 
-LEDGER_TABLES = {"users", "ledgers", "accounts", "transactions", "ledger_entries"}
+LEDGER_TABLES = {"users", "ledgers", "accounts", "transactions", "ledger_entries", "audit_events"}
 
 
 async def _public_tables(engine: AsyncEngine) -> set[str]:
@@ -53,6 +59,38 @@ async def test_migrations_upgrade_downgrade_and_upgrade_again() -> None:
 
         await run_alembic(engine, lambda config: command.upgrade(config, "head"))
         assert await _public_tables(engine) == LEDGER_TABLES | {"alembic_version"}
+    finally:
+        await engine.dispose()
+
+
+async def test_downgrade_refuses_to_drop_audit_evidence() -> None:
+    # ADR 0011: a non-empty audit_events table is never dropped by a downgrade. The refusal
+    # aborts the whole downgrade (one transaction), so the schema stays at head, intact.
+    server_url = configured_database_url()
+    url = disposable_database_url(server_url, "_audit_guard")
+    assert url.database is not None
+    await recreate_database(server_url, url.database)
+    engine = create_async_engine(url, poolclass=NullPool)
+    try:
+        await run_alembic(engine, lambda config: command.upgrade(config, "head"))
+        async with engine.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO audit_events (action, outcome, reason) "
+                    "VALUES ('user.register', 'rejected', 'email_already_registered')"
+                )
+            )
+
+        with pytest.raises(DBAPIError) as excinfo:
+            await run_alembic(engine, lambda config: command.downgrade(config, "base"))
+
+        assert sqlstate(excinfo.value) == "2BP01"  # dependent_objects_still_exist
+        assert await _public_tables(engine) == LEDGER_TABLES | {"alembic_version"}
+        async with engine.connect() as connection:
+            assert await connection.scalar(text("SELECT count(*) FROM audit_events")) == 1
+            version = await connection.scalar(text("SELECT version_num FROM alembic_version"))
+        head = ScriptDirectory.from_config(Config(str(ALEMBIC_INI))).get_current_head()
+        assert version == head
     finally:
         await engine.dispose()
 
