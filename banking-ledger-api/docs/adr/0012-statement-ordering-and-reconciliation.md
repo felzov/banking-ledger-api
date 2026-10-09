@@ -42,6 +42,32 @@ Consequences of the argument:
 
 The numbers are never exposed: they would reveal how many entries other accounts post.
 
+### Enforcement (migration 0006)
+
+`GENERATED ALWAYS` does **not** stop a client from choosing the number:
+`INSERT ... OVERRIDING SYSTEM VALUE` needs only the `INSERT` privilege, not superuser rights.
+A balanced, sealed posting numbered below an account's history would pass every other check,
+change every later running balance, and leave totals (hence reconciliation) unchanged.
+
+A `BEFORE INSERT` row trigger (`ledger_entries_sequence_order`) therefore requires each new
+entry's number to be:
+
+- **after the account's latest** (`ck_ledger_entries_sequence_monotonic`): a history can only be
+  appended to;
+- **already issued by the sequence** (`ck_ledger_entries_sequence_issued`): a number jumped far
+  ahead would make every later legitimate entry look backdated and block the account.
+
+The trigger locks the account row (`FOR UPDATE`) before reading the maximum, in a fresh READ
+COMMITTED snapshot. For the posting service that lock is already held (a no-op re-acquisition:
+no new lock order, no new deadlock). A writer that skipped the protocol waits for any in-flight
+posting on the account and then sees its entry. The composite foreign key would also make it
+wait, but only after BEFORE triggers ran: without the trigger's own lock, the race is real (a
+lock-free variant accepted a backdated entry in a test against PostgreSQL).
+
+Residual capability, by design: `OVERRIDING` may still pick a number that is after the
+account's latest and already issued (e.g. one used by another account). Ordering is preserved.
+The trigger, like all triggers, does not bind a superuser or the table owner (ADR 0004).
+
 **Existing rows** are backfilled in UUIDv7 id order. That historical order is best-effort; the
 commit-order guarantee holds for entries written after migration 0005.
 
@@ -108,5 +134,6 @@ database, using `session_replication_role = replica` where the schema itself wou
 
 - Statements are correct under concurrency for postings made after migration 0005.
 - Every page re-reads the account's whole history once.
-- An entry-writing path that does not lock its accounts first would break the ordering without
-  any constraint noticing. Lock-first stays a reviewed rule of the posting protocol (ADR 0010).
+- An entry-writing path that does not lock its accounts first can no longer insert an entry
+  into an account's past: the ordering trigger locks and checks. Lock-first stays a rule of the
+  posting protocol (ADR 0010), which also keeps such paths from deadlocking.

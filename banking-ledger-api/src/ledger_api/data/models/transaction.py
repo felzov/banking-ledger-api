@@ -76,4 +76,6 @@ class LedgerEntry(Base):
     # Drawn while the posting holds the account's row lock, which it keeps until COMMIT: for
     # one account, sequence order is commit order (not across accounts). CACHE 1 keeps values
     # strictly increasing across sessions. Gaps are normal. Never exposed outside the service.
+    # GENERATED ALWAYS can be overridden (OVERRIDING SYSTEM VALUE); a trigger (migration 0006)
+    # rejects any number not after the account's latest or never issued by the sequence.
     sequence_number: Mapped[int] = mapped_column(BigInteger, Identity(always=True, cache=1))

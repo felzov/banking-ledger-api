@@ -212,9 +212,12 @@ async def test_sequence_cache_is_one(db_session: AsyncSession) -> None:
     assert cache == 1
 
 
-async def test_sequence_numbers_cannot_be_chosen_by_the_client(
+async def test_generated_always_refuses_an_explicit_number_without_override(
     sessionmaker: async_sessionmaker[AsyncSession], db_session: AsyncSession
 ) -> None:
+    # Only a plain INSERT is refused. OVERRIDING SYSTEM VALUE gets past GENERATED ALWAYS; the
+    # ordering trigger of migration 0006 is what rejects backdated or unissued numbers then
+    # (test_entry_sequence_order.py).
     funded = await _committed_entry(sessionmaker)
 
     with pytest.raises(DBAPIError) as excinfo:

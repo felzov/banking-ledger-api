@@ -135,7 +135,8 @@ seals every transaction with its declared number of entries.
 [`0003`](migrations/versions/0003_forbid_truncating_ledger_tables.py) forbids TRUNCATE on the
 ledger tables, [`0004`](migrations/versions/0004_add_audit_events.py) adds the audit trail and
 [`0005`](migrations/versions/0005_order_ledger_entries.py) gives entries a commit-ordered
-sequence number.
+sequence number, and [`0006`](migrations/versions/0006_enforce_entry_sequence_order.py) rejects
+entries numbered out of order.
 
 ```
 users 1 ── 0..* accounts *── 1 ledgers 1 ── * transactions ── 0..1 audit_events (succeeded)
@@ -169,7 +170,7 @@ Invariants enforced by PostgreSQL itself, so every code path is bound by them:
 | Customer balances never go negative; settlement balances may | `CHECK (kind = 'system' OR balance_minor >= 0)` |
 | One account per user per currency, one settlement account per ledger | Unique constraint, partial unique index |
 | An account appears at most once per transaction | Unique `(transaction_id, account_id)` |
-| An account's history is a total order, numbered by the database | Unique `(account_id, sequence_number)`, `GENERATED ALWAYS AS IDENTITY (CACHE 1)` |
+| An account's history is a total order, and can only be appended to | Unique `(account_id, sequence_number)`, `GENERATED ALWAYS AS IDENTITY (CACHE 1)`, and a `BEFORE INSERT` trigger rejecting a number not after the account's latest or never issued by the sequence. `GENERATED ALWAYS` alone is not enough: `OVERRIDING SYSTEM VALUE` bypasses it |
 | An audit event is well-formed: reason exactly when not succeeded, a transaction exactly for successful postings (at most one event per transaction), an actor for every success, details a JSON object of at most 2048 bytes | CHECK and unique constraints on `audit_events` |
 | Audit evidence is not dropped by a routine downgrade | Migration 0004 refuses to drop a non-empty `audit_events` |
 
