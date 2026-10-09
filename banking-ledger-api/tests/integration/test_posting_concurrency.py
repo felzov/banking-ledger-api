@@ -16,13 +16,14 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from ledger_api.data.engine import create_sessionmaker
-from ledger_api.data.models import Account, LedgerEntry, Transaction
+from ledger_api.data.models import Account, AuditEvent, LedgerEntry, Transaction
+from ledger_api.domain.audit import AuditAction, AuditOutcome
 from ledger_api.domain.currency import Currency
 from ledger_api.domain.errors import InsufficientFundsError
 from ledger_api.domain.transaction import TransactionKind
 from ledger_api.services import posting as posting_service
 from ledger_api.services.posting import PostingResult, deposit, transfer, withdraw
-from tests.database import assert_reconciled
+from tests.database import assert_reconciled, audit_events_about
 from tests.factories import FundedAccount, commit_funded_account, get_settlement_account
 
 pytestmark = pytest.mark.concurrency
@@ -102,6 +103,16 @@ async def test_concurrent_withdrawals_never_overdraw(
     assert await _balances(sessionmaker, [account.account_id]) == {account.account_id: 10}
     async with sessionmaker() as session:
         await assert_reconciled(session)
+        # Exactly one audit event per attempt: each success with its own committed transaction,
+        # each rejection recorded after its rollback (ADR 0011).
+        _funding, *events = await audit_events_about(session, account.account_id)
+    succeeded = [event for event in events if event.outcome == AuditOutcome.SUCCEEDED]
+    rejected = [event for event in events if event.outcome == AuditOutcome.REJECTED]
+    assert (len(succeeded), len(rejected), len(events)) == (3, 7, 10)
+    assert {event.transaction_id for event in succeeded} == {
+        result.transaction_id for result in results if isinstance(result, PostingResult)
+    }
+    assert {event.reason for event in rejected} == {"insufficient_funds"}
 
 
 async def test_opposite_transfers_do_not_deadlock(
@@ -150,6 +161,14 @@ async def test_random_concurrent_transfers_conserve_money(
         )
         assert posted == outcomes["PostingResult"]
         await assert_reconciled(session)
+        audited = await session.scalar(
+            select(func.count()).where(
+                AuditEvent.action == AuditAction.POSTING_TRANSFER,
+                AuditEvent.outcome == AuditOutcome.SUCCEEDED,
+                AuditEvent.actor_user_id.in_([account.owner_id for account in accounts]),
+            )
+        )
+        assert audited == outcomes["PostingResult"]
 
 
 async def test_concurrent_deposits_are_each_applied_exactly_once(
