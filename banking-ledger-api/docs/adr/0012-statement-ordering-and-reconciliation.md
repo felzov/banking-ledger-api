@@ -112,7 +112,8 @@ be disabled by a superuser or the owner, and the application role currently is o
 | `find_invalid_transactions` | ≥ 2 entries, sum zero, count = `entry_count` (the deferred trigger) |
 | `find_misplaced_entries` | An entry's account and transaction exist and share its ledger (the composite FKs) |
 | `find_posted_transactions_without_success_audit` | Each posted transaction has a succeeded `posting.<kind>` event |
-| `find_failed_events_for_committed_transactions` | Failed events whose attempted transaction committed after all |
+| `find_failed_events_for_committed_transactions` | Failed events whose attempted transaction committed after all. Only canonical UUID values are cast, so one malformed value cannot abort the check |
+| `find_malformed_attempted_transaction_ids` | Events whose `attempted_transaction_id` is not a canonical UUID string (JSON null, a number, any other text): reported, never silently skipped |
 
 Tests plant every inconsistency inside a rolled-back transaction on the disposable test
 database, using `session_replication_role = replica` where the schema itself would refuse it.

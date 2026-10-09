@@ -11,13 +11,18 @@ import uuid
 from collections.abc import Collection
 from dataclasses import dataclass
 
-from sqlalchemy import Select, and_, cast, func, literal, or_, select
+from sqlalchemy import ColumnElement, Select, and_, case, cast, func, literal, or_, select
 from sqlalchemy import Uuid as SqlUuid
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
 from ledger_api.data.models import Account, AuditEvent, LedgerEntry, Transaction
-from ledger_api.domain.audit import AuditOutcome
+from ledger_api.domain.audit import ATTEMPTED_TRANSACTION_ID, AuditOutcome
+
+# The canonical text form the audit writer stores (str(uuid.UUID)); case-insensitive. Other
+# spellings PostgreSQL would also accept (braces, no hyphens) are reported as malformed: the
+# writer never produces them.
+UUID_TEXT_PATTERN = "^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$"
 
 
 @dataclass(frozen=True, slots=True)
@@ -134,17 +139,50 @@ async def find_posted_transactions_without_success_audit(
     return list((await session.scalars(statement)).all())
 
 
+def _attempted_id_is_well_formed() -> ColumnElement[bool]:
+    """details.attempted_transaction_id is a JSON string holding a canonical UUID. NULL (not
+    false) when the key is absent or holds JSON null: callers decide what that means."""
+    value = AuditEvent.details[ATTEMPTED_TRANSACTION_ID]
+    return and_(
+        func.jsonb_typeof(value) == "string",
+        value.astext.regexp_match(UUID_TEXT_PATTERN, flags="i"),
+    )
+
+
 async def find_failed_events_for_committed_transactions(session: AsyncSession) -> list[int]:
     """Failed events whose attempted transaction exists after all: the COMMIT succeeded but the
     caller saw an error (e.g. the connection dropped during COMMIT). The posting stands and has
-    its succeeded event; the failed event records what the caller was told."""
-    attempted = cast(AuditEvent.details["attempted_transaction_id"].astext, SqlUuid)
+    its succeeded event; the failed event records what the caller was told.
+
+    Only well-formed ids are cast (CASE evaluates its result only when the condition holds),
+    so one malformed value cannot abort the check for every event. Malformed values are
+    reported separately: find_malformed_attempted_transaction_ids.
+    """
+    attempted = case(
+        (
+            _attempted_id_is_well_formed(),
+            cast(AuditEvent.details[ATTEMPTED_TRANSACTION_ID].astext, SqlUuid),
+        ),
+        else_=None,
+    )
     statement = (
         select(AuditEvent.id)
         .join(Transaction, Transaction.id == attempted)
+        .where(AuditEvent.outcome == AuditOutcome.FAILED)
+        .order_by(AuditEvent.id)
+    )
+    return list((await session.scalars(statement)).all())
+
+
+async def find_malformed_attempted_transaction_ids(session: AsyncSession) -> list[int]:
+    """Audit events (of any outcome) whose details.attempted_transaction_id is present but not
+    a canonical UUID string: JSON null, a number, an object, or text that is not a UUID. The
+    audit writer never produces these, so each one is corruption to investigate."""
+    statement = (
+        select(AuditEvent.id)
         .where(
-            AuditEvent.outcome == AuditOutcome.FAILED,
-            AuditEvent.details.has_key("attempted_transaction_id"),
+            AuditEvent.details.has_key(ATTEMPTED_TRANSACTION_ID),
+            func.coalesce(_attempted_id_is_well_formed(), False).is_(False),
         )
         .order_by(AuditEvent.id)
     )

@@ -186,7 +186,8 @@ every balance equals its entries; every ledger's entries and balances sum to zer
 settlement account mirrors the customers' money); every transaction has at least 2 entries
 summing to zero and exactly its declared count; every entry sits in its account's and
 transaction's ledger; every posted transaction has its succeeded audit event; and failed
-events whose transaction committed after all (a lost acknowledgement) are reported.
+events whose transaction committed after all (a lost acknowledgement) are reported, as are
+audit events whose attempted transaction id is malformed (which would otherwise hide them).
 
 ## Posting
 

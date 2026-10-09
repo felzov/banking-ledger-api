@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ledger_api.data.audit import insert_audit_event
 from ledger_api.data.errors import sqlstate, violated_constraint
 from ledger_api.domain.audit import (
+    ATTEMPTED_TRANSACTION_ID,
     INTERNAL_ERROR,
     AuditAction,
     AuditOutcome,
@@ -31,11 +32,6 @@ from ledger_api.domain.audit import (
 from ledger_api.domain.errors import DomainError, InternalError, UnavailableError
 
 logger = logging.getLogger(__name__)
-
-# Set on failed postings: the id the posting's transaction header was given before it failed.
-# If that id exists after all, the COMMIT succeeded and only its acknowledgement was lost
-# (reconciliation reports these: find_failed_events_for_committed_transactions).
-ATTEMPTED_TRANSACTION_ID = "attempted_transaction_id"
 
 
 @dataclass(slots=True)

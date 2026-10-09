@@ -49,6 +49,11 @@ MAX_DETAILS_BYTES = 2048
 # Added by the persistence layer when the claimed actor is not a known user (ADR 0011).
 REQUESTED_USER_ID = "requested_user_id"
 
+# Set on failed postings: the id the posting's transaction header was given before it failed.
+# If that id exists after all, the COMMIT succeeded and only its acknowledgement was lost
+# (reconciliation: find_failed_events_for_committed_transactions).
+ATTEMPTED_TRANSACTION_ID = "attempted_transaction_id"
+
 # JSON scalars only: no nested structures, no arbitrary objects, nothing that could smuggle in
 # an exception message or a request body. UUIDs are stored as their string form.
 type DetailValue = str | int | bool | uuid.UUID | None

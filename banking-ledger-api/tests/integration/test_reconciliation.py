@@ -18,6 +18,7 @@ from ledger_api.data.reconciliation import (
     find_failed_events_for_committed_transactions,
     find_invalid_transactions,
     find_ledgers_with_nonzero_balances,
+    find_malformed_attempted_transaction_ids,
     find_misplaced_entries,
     find_posted_transactions_without_success_audit,
     find_unbalanced_ledgers,
@@ -252,3 +253,61 @@ async def test_failed_event_whose_transaction_committed_is_reported(
 
     assert lost_ack in reported
     assert genuinely_failed not in reported
+
+
+async def _event_with_attempted_id(
+    session: AsyncSession, attempted: object, outcome: str = "failed"
+) -> int:
+    reason = None if outcome == "succeeded" else "internal_error"
+    event_id = await session.scalar(
+        insert(AuditEvent)
+        .values(
+            action="account.open",
+            outcome=outcome,
+            reason=reason,
+            details={"attempted_transaction_id": attempted},
+        )
+        .returning(AuditEvent.id)
+    )
+    assert isinstance(event_id, int)
+    return event_id
+
+
+async def test_malformed_attempted_ids_neither_abort_nor_hide_the_lost_ack_check(
+    db_session: AsyncSession,
+) -> None:
+    # Before the fix, one non-UUID value made the whole query fail with "invalid input syntax
+    # for type uuid", hiding every genuine lost acknowledgement behind it.
+    committed = await _posted_without_audit(db_session)
+    lost_ack = await _event_with_attempted_id(db_session, str(committed))
+    uppercase_lost_ack = await _event_with_attempted_id(db_session, str(committed).upper())
+    genuinely_failed = await _event_with_attempted_id(db_session, str(uuid.uuid7()))
+    malformed = [
+        await _event_with_attempted_id(db_session, "not-a-uuid"),
+        await _event_with_attempted_id(db_session, ""),
+        await _event_with_attempted_id(db_session, 12345),
+        await _event_with_attempted_id(db_session, None),  # JSON null
+        await _event_with_attempted_id(db_session, {"id": str(committed)}),
+        await _event_with_attempted_id(db_session, committed.hex),  # castable, not canonical
+        await _event_with_attempted_id(db_session, "x", outcome="rejected"),  # any outcome
+    ]
+
+    committed_after_all = await find_failed_events_for_committed_transactions(db_session)
+    reported_malformed = await find_malformed_attempted_transaction_ids(db_session)
+
+    assert lost_ack in committed_after_all
+    assert uppercase_lost_ack in committed_after_all
+    assert genuinely_failed not in committed_after_all
+    assert not set(malformed) & set(committed_after_all)
+    assert set(malformed) <= set(reported_malformed)  # reported, not silently dropped
+    assert not {lost_ack, uppercase_lost_ack, genuinely_failed} & set(reported_malformed)
+
+
+async def test_events_without_an_attempted_id_are_not_malformed(db_session: AsyncSession) -> None:
+    event_id = await db_session.scalar(
+        insert(AuditEvent)
+        .values(action="user.register", outcome="rejected", reason="email_already_registered")
+        .returning(AuditEvent.id)
+    )
+
+    assert event_id not in await find_malformed_attempted_transaction_ids(db_session)
