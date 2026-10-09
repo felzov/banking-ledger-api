@@ -4,7 +4,7 @@ from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
+from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from ledger_api.data.base import Base
@@ -104,6 +104,104 @@ async def test_downgrade_refuses_to_drop_audit_evidence() -> None:
         assert version == head
     finally:
         await engine.dispose()
+
+
+async def test_sequence_backfill_follows_id_order_and_new_entries_continue() -> None:
+    # Migration 0005 numbers pre-existing entries in UUIDv7 id order (best-effort history:
+    # no commit order was recorded before it), then hands out higher numbers.
+    server_url = configured_database_url()
+    url = disposable_database_url(server_url, "_sequence_backfill")
+    assert url.database is not None
+    await recreate_database(server_url, url.database)
+    engine = create_async_engine(url, poolclass=NullPool)
+    try:
+        await run_alembic(engine, lambda config: command.upgrade(config, "0004"))
+        async with engine.begin() as connection:
+            await _post_raw_deposit(connection, amount=100)
+            await _post_raw_deposit(connection, amount=200)
+
+        await run_alembic(engine, lambda config: command.upgrade(config, "head"))
+
+        async with engine.begin() as connection:
+            backfilled = (
+                (
+                    await connection.execute(
+                        text("SELECT sequence_number FROM ledger_entries ORDER BY id")
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert backfilled == [1, 2, 3, 4]
+            await _post_raw_deposit(connection, amount=300)
+            newest = (
+                (
+                    await connection.execute(
+                        text(
+                            "SELECT sequence_number FROM ledger_entries "
+                            "ORDER BY sequence_number DESC LIMIT 2"
+                        )
+                    )
+                )
+                .scalars()
+                .all()
+            )
+            assert sorted(newest) == [5, 6]
+        async with engine.connect() as connection:
+            # The backfill re-enabled the immutability trigger.
+            with pytest.raises(DBAPIError) as excinfo:
+                await connection.execute(text("UPDATE ledger_entries SET amount_minor = 1"))
+            assert sqlstate(excinfo.value) == "23001"  # restrict_violation
+    finally:
+        await engine.dispose()
+
+
+async def _post_raw_deposit(connection: AsyncConnection, *, amount: int) -> None:
+    """A balanced deposit written with plain SQL, as the schema of any revision accepts it."""
+    ledger_id, settlement_id = (
+        await connection.execute(
+            text(
+                "SELECT l.id, a.id FROM ledgers l JOIN accounts a "
+                "ON a.ledger_id = l.id AND a.kind = 'system' WHERE l.currency = 'GBP'"
+            )
+        )
+    ).one()
+    user_id = await connection.scalar(
+        text("INSERT INTO users (email) VALUES (:email) RETURNING id"),
+        {"email": f"raw-{amount}@example.com"},
+    )
+    account_id = await connection.scalar(
+        text(
+            "INSERT INTO accounts (ledger_id, user_id, kind, balance_minor) "
+            "VALUES (:ledger, :user, 'customer', :amount) RETURNING id"
+        ),
+        {"ledger": ledger_id, "user": user_id, "amount": amount},
+    )
+    await connection.execute(
+        text("UPDATE accounts SET balance_minor = balance_minor - :amount WHERE id = :id"),
+        {"amount": amount, "id": settlement_id},
+    )
+    transaction_id = await connection.scalar(
+        text(
+            "INSERT INTO transactions (ledger_id, kind, entry_count) "
+            "VALUES (:ledger, 'deposit', 2) RETURNING id"
+        ),
+        {"ledger": ledger_id},
+    )
+    await connection.execute(
+        text(
+            "INSERT INTO ledger_entries (transaction_id, account_id, ledger_id, amount_minor) "
+            "VALUES (:t, :s, :l, :debit), (:t, :a, :l, :credit)"
+        ),
+        {
+            "t": transaction_id,
+            "s": settlement_id,
+            "a": account_id,
+            "l": ledger_id,
+            "debit": -amount,
+            "credit": amount,
+        },
+    )
 
 
 async def test_models_match_migrations(engine: AsyncEngine) -> None:

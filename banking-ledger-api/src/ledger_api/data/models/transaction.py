@@ -1,10 +1,11 @@
 import uuid
 
 from sqlalchemy import (
+    BigInteger,
     CheckConstraint,
     ForeignKey,
     ForeignKeyConstraint,
-    Index,
+    Identity,
     SmallInteger,
     UniqueConstraint,
 )
@@ -39,7 +40,10 @@ class Transaction(Base):
 
 
 class LedgerEntry(Base):
-    """One signed movement on one account. Append-only."""
+    """One signed movement on one account. Append-only.
+
+    sequence_number orders an account's entries in commit order (ADR 0012, migration 0005).
+    """
 
     __tablename__ = "ledger_entries"
     __table_args__ = (
@@ -59,8 +63,9 @@ class LedgerEntry(Base):
         # An account appears at most once per transaction (this also rules out A -> A transfers).
         # Leading transaction_id doubles as the index for the balance trigger's SUM.
         UniqueConstraint("transaction_id", "account_id"),
-        # Account statements and reconciliation, paginated by the time-ordered UUIDv7 id.
-        Index("ix_ledger_entries_account_id_id", "account_id", "id"),
+        # Account statements, keyset pagination and reconciliation. Unique: an account's
+        # history is a total order.
+        UniqueConstraint("account_id", "sequence_number"),
     )
 
     id: Mapped[UUIDPrimaryKey]
@@ -68,3 +73,7 @@ class LedgerEntry(Base):
     account_id: Mapped[uuid.UUID]
     ledger_id: Mapped[uuid.UUID]
     amount_minor: Mapped[MinorUnits]
+    # Drawn while the posting holds the account's row lock, which it keeps until COMMIT: for
+    # one account, sequence order is commit order (not across accounts). CACHE 1 keeps values
+    # strictly increasing across sessions. Gaps are normal. Never exposed outside the service.
+    sequence_number: Mapped[int] = mapped_column(BigInteger, Identity(always=True, cache=1))
