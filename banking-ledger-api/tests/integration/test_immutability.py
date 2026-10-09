@@ -1,7 +1,7 @@
 """Posted ledger records are append-only (ADR 0004)."""
 
 import pytest
-from sqlalchemy import delete, select, update
+from sqlalchemy import delete, select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ledger_api.data.models import Account, LedgerEntry, Transaction
@@ -63,6 +63,16 @@ async def test_ledger_entry_cannot_be_deleted(
 
     async with raises_violation("ledger_entries_immutable"):
         await db_session.execute(delete(LedgerEntry).where(LedgerEntry.id == entries[0].id))
+
+
+@pytest.mark.parametrize("table", ["transactions", "ledger_entries"])
+async def test_ledger_tables_cannot_be_truncated(
+    db_session: AsyncSession, posted: tuple[Transaction, list[LedgerEntry]], table: str
+) -> None:
+    # TRUNCATE fires no row-level triggers; a statement-level trigger has to catch it.
+    # CASCADE: for transactions, the foreign key from ledger_entries must not be what stops it.
+    async with raises_violation(f"{table}_immutable"):
+        await db_session.execute(text(f"TRUNCATE {table} CASCADE"))
 
 
 async def test_account_balance_projection_remains_updatable(
