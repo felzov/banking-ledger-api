@@ -1,3 +1,5 @@
+import uuid
+
 import pytest
 from alembic import command
 from alembic.config import Config
@@ -108,31 +110,36 @@ async def test_downgrade_refuses_to_drop_audit_evidence() -> None:
 
 async def test_sequence_backfill_follows_id_order_and_new_entries_continue() -> None:
     # Migration 0005 numbers pre-existing entries in UUIDv7 id order (best-effort history:
-    # no commit order was recorded before it), then hands out higher numbers.
+    # no commit order was recorded before it), then hands out higher numbers. The rows are
+    # stored in an order that differs from id order, so a backfill that followed the physical
+    # order (or insertion order) instead would fail.
     server_url = configured_database_url()
     url = disposable_database_url(server_url, "_sequence_backfill")
     assert url.database is not None
     await recreate_database(server_url, url.database)
     engine = create_async_engine(url, poolclass=NullPool)
+    ids = [uuid.uuid7() for _ in range(4)]  # ascending: UUIDv7 is monotonic within a process
+    assert ids == sorted(ids)
     try:
         await run_alembic(engine, lambda config: command.upgrade(config, "0004"))
         async with engine.begin() as connection:
-            await _post_raw_deposit(connection, amount=100)
-            await _post_raw_deposit(connection, amount=200)
+            # The later ids are written first.
+            await _post_raw_deposit(connection, amount=100, entry_ids=(ids[3], ids[2]))
+            await _post_raw_deposit(connection, amount=200, entry_ids=(ids[1], ids[0]))
+        async with engine.connect() as connection:
+            physical = (
+                (await connection.execute(text("SELECT id FROM ledger_entries ORDER BY ctid")))
+                .scalars()
+                .all()
+            )
+        assert physical == [ids[3], ids[2], ids[1], ids[0]]  # the precondition really holds
 
         await run_alembic(engine, lambda config: command.upgrade(config, "head"))
 
         async with engine.begin() as connection:
-            backfilled = (
-                (
-                    await connection.execute(
-                        text("SELECT sequence_number FROM ledger_entries ORDER BY id")
-                    )
-                )
-                .scalars()
-                .all()
-            )
-            assert backfilled == [1, 2, 3, 4]
+            rows = await connection.execute(text("SELECT id, sequence_number FROM ledger_entries"))
+            numbered: dict[uuid.UUID, int] = {row.id: row.sequence_number for row in rows}
+            assert numbered == {ids[0]: 1, ids[1]: 2, ids[2]: 3, ids[3]: 4}
             await _post_raw_deposit(connection, amount=300)
             newest = (
                 (
@@ -156,8 +163,16 @@ async def test_sequence_backfill_follows_id_order_and_new_entries_continue() -> 
         await engine.dispose()
 
 
-async def _post_raw_deposit(connection: AsyncConnection, *, amount: int) -> None:
-    """A balanced deposit written with plain SQL, as the schema of any revision accepts it."""
+async def _post_raw_deposit(
+    connection: AsyncConnection,
+    *,
+    amount: int,
+    entry_ids: tuple[uuid.UUID, uuid.UUID] | None = None,
+) -> None:
+    """A balanced deposit written with plain SQL, as the schema of any revision accepts it.
+
+    entry_ids: (settlement entry, customer entry), inserted in that order; generated if None.
+    """
     ledger_id, settlement_id = (
         await connection.execute(
             text(
@@ -188,12 +203,16 @@ async def _post_raw_deposit(connection: AsyncConnection, *, amount: int) -> None
         ),
         {"ledger": ledger_id},
     )
+    settlement_entry_id, customer_entry_id = entry_ids or (uuid.uuid7(), uuid.uuid7())
     await connection.execute(
         text(
-            "INSERT INTO ledger_entries (transaction_id, account_id, ledger_id, amount_minor) "
-            "VALUES (:t, :s, :l, :debit), (:t, :a, :l, :credit)"
+            "INSERT INTO ledger_entries "
+            "(id, transaction_id, account_id, ledger_id, amount_minor) "
+            "VALUES (:se, :t, :s, :l, :debit), (:ce, :t, :a, :l, :credit)"
         ),
         {
+            "se": settlement_entry_id,
+            "ce": customer_entry_id,
             "t": transaction_id,
             "s": settlement_id,
             "a": account_id,
