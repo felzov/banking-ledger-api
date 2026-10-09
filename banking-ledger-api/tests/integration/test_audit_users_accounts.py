@@ -8,17 +8,23 @@ from httpx import AsyncClient
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ledger_api.data.models import AuditEvent
-from ledger_api.domain.audit import AuditAction, AuditOutcome
+from ledger_api.data.audit import insert_audit_event
+from ledger_api.data.models import Account, AuditEvent
+from ledger_api.domain.audit import AuditAction, AuditOutcome, AuditRecord
 from ledger_api.domain.currency import Currency
 from ledger_api.domain.errors import (
     AccountAlreadyExistsError,
     EmailAlreadyRegisteredError,
     UserNotFoundError,
 )
+from ledger_api.services import audit as audit_service
 from ledger_api.services.accounts import open_customer_account
 from ledger_api.services.users import register_user
 from tests.conftest import SessionFactory
+
+
+class InjectedAuditFailureError(Exception):
+    pass
 
 
 async def _latest_event_id(session: AsyncSession) -> int:
@@ -108,6 +114,36 @@ async def test_account_for_an_unknown_user_is_audited_without_an_actor(
     # No foreign-key violation: the unknown id is kept in details instead.
     assert event.actor_user_id is None
     assert event.details == {"currency": "GBP", "requested_user_id": str(stranger)}
+
+
+async def test_failed_account_opening_never_names_the_rolled_back_account(
+    db_session: AsyncSession, new_session: SessionFactory, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # The account row is flushed (it has an id), then the success audit write fails and the
+    # whole transaction rolls back. The failed event must not name that account: it never
+    # existed outside the rolled-back transaction.
+    user = await register_user(new_session(), email="unlucky@example.test")
+    injected = InjectedAuditFailureError()
+
+    async def fail_success_events(session: AsyncSession, record: AuditRecord) -> None:
+        if record.outcome == AuditOutcome.SUCCEEDED:
+            raise injected
+        await insert_audit_event(session, record)
+
+    monkeypatch.setattr(audit_service, "insert_audit_event", fail_success_events)
+    since = await _latest_event_id(db_session)
+
+    with pytest.raises(InjectedAuditFailureError):
+        await open_customer_account(new_session(), owner_id=user.id, currency=Currency.GBP)
+
+    [event] = await _events_since(db_session, since)
+    assert (event.outcome, event.reason) == (AuditOutcome.FAILED, "internal_error")
+    assert "account_id" not in event.details
+    assert event.details == {"currency": "GBP", "error_type": "InjectedAuditFailureError"}
+    accounts = await db_session.scalar(
+        select(func.count()).select_from(Account).where(Account.user_id == user.id)
+    )
+    assert accounts == 0
 
 
 # --- not audited -------------------------------------------------------------------------------

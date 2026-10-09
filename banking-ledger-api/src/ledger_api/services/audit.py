@@ -12,7 +12,7 @@ audited() applies the second rule to a whole service call.
 
 import logging
 import uuid
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
 from functools import partial
 
@@ -49,14 +49,22 @@ class AuditContext:
     attempted_transaction_id: uuid.UUID | None = None
 
     def succeeded(
-        self, *, actor_user_id: uuid.UUID | None = None, transaction_id: uuid.UUID | None = None
+        self,
+        *,
+        actor_user_id: uuid.UUID | None = None,
+        transaction_id: uuid.UUID | None = None,
+        created: Mapping[str, DetailValue] | None = None,
     ) -> AuditRecord:
+        """The success event. `created` adds facts known only once the operation's writes
+        exist (e.g. a new account's id): they belong to this event alone, never to the shared
+        context, so a later rejection or failure event cannot name a row that was rolled back.
+        """
         return AuditRecord(
             self.action,
             AuditOutcome.SUCCEEDED,
             actor_user_id=actor_user_id or self.actor_user_id,
             transaction_id=transaction_id,
-            details=self.details,
+            details={**self.details, **(created or {})},
         )
 
     def rejected(self, error: DomainError) -> AuditRecord:

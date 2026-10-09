@@ -43,8 +43,9 @@ async def open_customer_account(
                 account = Account(user_id=owner_id, kind=AccountKind.CUSTOMER, ledger=ledger)
                 session.add(account)
                 await session.flush()  # INSERT ... RETURNING id, balance_minor, created_at
-                context.details["account_id"] = account.id
-                await record_in_transaction(session, context.succeeded())
+                await record_in_transaction(
+                    session, context.succeeded(created={"account_id": account.id})
+                )
         except IntegrityError as error:
             # Only the known rules are translated; any other violation is a bug and propagates.
             constraint = violated_constraint(error)
