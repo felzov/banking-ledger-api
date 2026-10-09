@@ -42,6 +42,12 @@ async def _public_functions(engine: AsyncEngine) -> set[str]:
         return set(rows.scalars())
 
 
+SETTLEMENT_ACCOUNTS = text(
+    "SELECT l.currency, a.user_id, a.balance_minor FROM accounts a "
+    "JOIN ledgers l ON l.id = a.ledger_id WHERE a.kind = 'system'"
+)
+
+
 async def test_migrations_upgrade_downgrade_and_upgrade_again() -> None:
     # A database of its own: downgrading the shared test database would break other tests.
     server_url = configured_database_url()
@@ -52,6 +58,11 @@ async def test_migrations_upgrade_downgrade_and_upgrade_again() -> None:
     try:
         await run_alembic(engine, lambda config: command.upgrade(config, "head"))
         assert await _public_tables(engine) == LEDGER_TABLES | {"alembic_version"}
+        # Seeded, untouched: one settlement account per ledger, without an owner, at zero.
+        # Checked here, on a fresh database: the shared test database holds committed postings.
+        async with engine.connect() as connection:
+            settlement = (await connection.execute(SETTLEMENT_ACCOUNTS)).all()
+        assert sorted(settlement) == sorted((currency.value, None, 0) for currency in Currency)
 
         await run_alembic(engine, lambda config: command.downgrade(config, "base"))
         assert await _public_tables(engine) == {"alembic_version"}
@@ -135,21 +146,18 @@ async def test_seeded_ledgers_are_exactly_the_supported_currencies(
     assert sorted(currencies) == sorted(Currency)
 
 
-async def test_every_ledger_has_one_settlement_account_with_zero_balance(
+async def test_every_ledger_has_one_settlement_account_without_an_owner(
     db_session: AsyncSession,
 ) -> None:
+    # Balances are not asserted here: committed tests that ran earlier have posted against
+    # the settlement accounts. Their seeded zero balance is checked on a fresh database above.
     ledgers = (await db_session.scalars(select(Ledger))).all()
     system_accounts = (
         await db_session.scalars(select(Account).where(Account.kind == AccountKind.SYSTEM))
     ).all()
 
     assert len(system_accounts) == len(ledgers) == len(Currency)
-    rows = (
-        await db_session.execute(
-            text(
-                "SELECT l.currency, a.user_id, a.balance_minor FROM accounts a "
-                "JOIN ledgers l ON l.id = a.ledger_id WHERE a.kind = 'system'"
-            )
-        )
-    ).all()
-    assert sorted(rows) == sorted((currency.value, None, 0) for currency in Currency)
+    rows = (await db_session.execute(SETTLEMENT_ACCOUNTS)).all()
+    assert sorted((currency, owner) for currency, owner, _ in rows) == sorted(
+        (currency.value, None) for currency in Currency
+    )
