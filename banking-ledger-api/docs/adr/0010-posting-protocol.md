@@ -44,7 +44,9 @@ posted with. The deferred trigger additionally requires the actual count to equa
    (`destination_account_not_found`), one ledger (`currency_mismatch`), funds
    (`insufficient_funds`).
 6. **Write:** the sealed header, the entries, and relative balance updates
-   (`balance_minor = balance_minor + :delta ... RETURNING`).
+   (`balance_minor = balance_minor + :delta ... RETURNING`), then the succeeded audit event as
+   the last write (Phase 5, ADR 0011). Each entry draws its `sequence_number` here, under the
+   account locks, which makes it commit-ordered per account (ADR 0012).
 7. **COMMIT:** the deferred triggers check >= 2 entries, sum zero, and count = entry_count.
 
 Rules that make this correct:
@@ -102,3 +104,12 @@ timeout would post twice.
 - `balance_minor` is checked by reconciliation queries (balances against entries; every
   ledger's entries and balances sum to zero), not by a database constraint.
 - The settlement account is a hot row; sharded settlement accounts are the documented fix.
+
+## Amendment (Phase 5, 2026-10-10)
+
+- The succeeded audit event is written as step 6's last write; rejections and failures are
+  audited after the rollback, in their own transaction (ADR 0011).
+- Pre-validation (step 1) now runs inside the audited service call, so `invalid_amount` and
+  `same_account_transfer` produce rejected events too. It still runs before BEGIN.
+- `ledger_entries.sequence_number` is drawn while the account locks are held. This makes
+  lock-before-insert load-bearing for statement ordering as well (ADR 0012).
