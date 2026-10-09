@@ -28,7 +28,7 @@ from ledger_api.domain.audit import (
     AuditRecord,
     DetailValue,
 )
-from ledger_api.domain.errors import DomainError, UnavailableError
+from ledger_api.domain.errors import DomainError, InternalError, UnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -143,7 +143,7 @@ async def audited[T](
     try:
         return await operation()
     except DomainError as error:
-        if isinstance(error, UnavailableError):
+        if isinstance(error, UnavailableError | InternalError):  # system conditions
             await _record_after_rollback(session, partial(context.failed, error))
         else:
             await _record_after_rollback(session, partial(context.rejected, error))
