@@ -17,7 +17,9 @@ from ledger_api.data.errors import violated_constraint
 from ledger_api.data.models import AuditEvent
 from ledger_api.data.reconciliation import (
     find_balance_mismatches,
+    find_invalid_transactions,
     find_ledgers_with_nonzero_balances,
+    find_misplaced_entries,
     find_unbalanced_ledgers,
 )
 from ledger_api.domain.audit import POSTING_ACTIONS
@@ -127,10 +129,14 @@ async def bypass_triggers(session: AsyncSession) -> None:
 
 
 async def assert_reconciled(session: AsyncSession) -> None:
-    """Every balance equals its entries, and every ledger sums to zero (entries and balances).
+    """Every balance equals its entries, every ledger sums to zero (entries and balances), every
+    transaction is valid and every entry sits in its account's and transaction's ledger.
 
-    Global by design: tests that COMMIT must leave the shared test database reconciled.
+    Global by design: tests that COMMIT must leave the shared test database reconciled. Audit
+    coverage is checked per test instead (some schema tests commit transactions directly).
     """
     assert await find_balance_mismatches(session) == []
     assert await find_unbalanced_ledgers(session) == {}
     assert await find_ledgers_with_nonzero_balances(session) == {}
+    assert await find_invalid_transactions(session) == []
+    assert await find_misplaced_entries(session) == []
