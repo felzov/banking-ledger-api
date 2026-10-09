@@ -1,18 +1,20 @@
 """PostgreSQL helpers for the test suite: disposable databases, migrations, violation checks."""
 
 import os
+import uuid
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 
 import pytest
 from alembic.config import Config
-from sqlalchemy import URL, Connection, make_url, text
+from sqlalchemy import URL, Connection, make_url, select, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from ledger_api.data.errors import violated_constraint
+from ledger_api.data.models import AuditEvent
 from ledger_api.data.reconciliation import (
     find_balance_mismatches,
     find_ledgers_with_nonzero_balances,
@@ -87,6 +89,20 @@ async def check_deferred_constraints(session: AsyncSession) -> None:
     """Run COMMIT-time checks now. Test transactions are rolled back, so they never commit."""
     await session.flush()
     await session.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+
+
+async def audit_events_about(session: AsyncSession, account_id: uuid.UUID) -> list[AuditEvent]:
+    """Audit events whose details name `account_id` as their (source) account, oldest first.
+
+    Committed tests share the test database, so they always look at their own accounts' events,
+    never at global counts.
+    """
+    statement = (
+        select(AuditEvent)
+        .where(AuditEvent.details["account_id"].astext == str(account_id))
+        .order_by(AuditEvent.id)
+    )
+    return list((await session.scalars(statement)).all())
 
 
 async def bypass_triggers(session: AsyncSession) -> None:
