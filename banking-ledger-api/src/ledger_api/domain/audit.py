@@ -55,9 +55,9 @@ type DetailValue = str | int | bool | uuid.UUID | None
 
 
 def _json_scalar(value: DetailValue) -> str | int | bool | None:
-    if isinstance(value, uuid.UUID):
-        return str(value)
-    if value is None or type(value) in (str, int, bool):
+    if isinstance(value, uuid.UUID | str):
+        return str(value)  # str() also turns a StrEnum (e.g. Currency) into its plain value
+    if value is None or type(value) in (int, bool):
         return value
     raise ValueError(f"audit detail values must be JSON scalars, not {type(value).__name__}")
 

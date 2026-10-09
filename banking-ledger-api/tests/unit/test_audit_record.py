@@ -12,6 +12,7 @@ from ledger_api.domain.audit import (
     AuditRecord,
     DetailValue,
 )
+from ledger_api.domain.currency import Currency
 
 ACTOR = uuid.uuid7()
 TRANSACTION = uuid.uuid7()
@@ -88,11 +89,19 @@ def test_details_are_normalised_to_json_scalars_and_frozen() -> None:
         AuditAction.POSTING_WITHDRAWAL,
         AuditOutcome.REJECTED,
         reason="insufficient_funds",
-        details={"account_id": account_id, "amount_minor": 500, "retried": False, "x": None},
+        details={
+            "account_id": account_id,
+            "amount_minor": 500,
+            "retried": False,
+            "x": None,
+            "currency": Currency.GBP,
+        },
     )
 
+    assert type(record.details["currency"]) is str
     assert dict(record.details) == {
         "account_id": str(account_id),
+        "currency": "GBP",
         "amount_minor": 500,
         "retried": False,
         "x": None,

@@ -20,6 +20,7 @@ from ledger_api.data.reconciliation import (
     find_ledgers_with_nonzero_balances,
     find_unbalanced_ledgers,
 )
+from ledger_api.domain.audit import POSTING_ACTIONS
 
 ALEMBIC_INI = Path(__file__).resolve().parent.parent / "alembic.ini"
 
@@ -92,14 +93,18 @@ async def check_deferred_constraints(session: AsyncSession) -> None:
 
 
 async def audit_events_about(session: AsyncSession, account_id: uuid.UUID) -> list[AuditEvent]:
-    """Audit events whose details name `account_id` as their (source) account, oldest first.
+    """Posting audit events whose details name `account_id` as their (source) account, oldest
+    first.
 
     Committed tests share the test database, so they always look at their own accounts' events,
     never at global counts.
     """
     statement = (
         select(AuditEvent)
-        .where(AuditEvent.details["account_id"].astext == str(account_id))
+        .where(
+            AuditEvent.action.in_(POSTING_ACTIONS),
+            AuditEvent.details["account_id"].astext == str(account_id),
+        )
         .order_by(AuditEvent.id)
     )
     return list((await session.scalars(statement)).all())

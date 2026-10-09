@@ -8,12 +8,14 @@ from ledger_api.data.accounts import get_ledger_by_currency, get_owned_account, 
 from ledger_api.data.errors import violated_constraint
 from ledger_api.data.models import Account
 from ledger_api.domain.account import AccountKind
+from ledger_api.domain.audit import AuditAction
 from ledger_api.domain.currency import Currency
 from ledger_api.domain.errors import (
     AccountAlreadyExistsError,
     AccountNotFoundError,
     UserNotFoundError,
 )
+from ledger_api.services.audit import AuditContext, audited, record_in_transaction
 from ledger_api.services.users import get_user
 
 ONE_ACCOUNT_PER_CURRENCY = "uq_accounts_user_id_ledger_id"
@@ -29,22 +31,31 @@ async def open_customer_account(
     is ever taken from the caller. The database decides both failure cases, with no prior
     SELECT: a duplicate (user, currency) violates the unique constraint, and an unknown owner
     violates the foreign key.
+
+    Audited as account.open (ADR 0011), with the currency and, once opened, the account id.
     """
-    try:
-        async with session.begin():
-            ledger = await get_ledger_by_currency(session, currency)
-            account = Account(user_id=owner_id, kind=AccountKind.CUSTOMER, ledger=ledger)
-            session.add(account)
-            await session.flush()  # INSERT ... RETURNING id, balance_minor, created_at
-    except IntegrityError as error:
-        # Only the known rules are translated; any other violation is a bug and propagates.
-        constraint = violated_constraint(error)
-        if constraint == ONE_ACCOUNT_PER_CURRENCY:
-            raise AccountAlreadyExistsError from error
-        if constraint == OWNER_MUST_EXIST:
-            raise UserNotFoundError from error
-        raise
-    return account
+    context = AuditContext(AuditAction.ACCOUNT_OPEN, owner_id, {"currency": currency})
+
+    async def run() -> Account:
+        try:
+            async with session.begin():
+                ledger = await get_ledger_by_currency(session, currency)
+                account = Account(user_id=owner_id, kind=AccountKind.CUSTOMER, ledger=ledger)
+                session.add(account)
+                await session.flush()  # INSERT ... RETURNING id, balance_minor, created_at
+                context.details["account_id"] = account.id
+                await record_in_transaction(session, context.succeeded())
+        except IntegrityError as error:
+            # Only the known rules are translated; any other violation is a bug and propagates.
+            constraint = violated_constraint(error)
+            if constraint == ONE_ACCOUNT_PER_CURRENCY:
+                raise AccountAlreadyExistsError from error
+            if constraint == OWNER_MUST_EXIST:
+                raise UserNotFoundError from error
+            raise
+        return account
+
+    return await audited(session, context, run)
 
 
 async def get_customer_account(
