@@ -10,12 +10,16 @@ from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession, c
 from sqlalchemy.pool import NullPool
 
 from ledger_api.data.base import Base
+from ledger_api.data.engine import create_engine, create_sessionmaker
 from ledger_api.data.errors import sqlstate, violated_constraint
-from ledger_api.data.models import Account, Ledger
+from ledger_api.data.models import Account, IdempotencyKey, Ledger
 from ledger_api.domain.account import AccountKind
 from ledger_api.domain.currency import Currency
+from ledger_api.services.posting import withdraw
+from tests.conftest import settings_for
 from tests.database import (
     ALEMBIC_INI,
+    assert_reconciled,
     configured_database_url,
     disposable_database_url,
     posting_role_grants,
@@ -186,6 +190,93 @@ async def test_0010_downgrades_exactly_on_an_empty_table() -> None:
         assert await _public_tables(engine) == tables_0009
         assert await _public_functions(engine) == functions_0009
     finally:
+        await engine.dispose()
+
+
+# Every row a 0009 database can hold, in a stable order: compared before and after 0010.
+SNAPSHOT_0009 = {
+    "users": "SELECT id, email, created_at FROM users ORDER BY id",
+    "accounts": "SELECT id, user_id, kind, ledger_id, balance_minor FROM accounts ORDER BY id",
+    "transactions": "SELECT id, ledger_id, kind, entry_count, created_at FROM transactions "
+    "ORDER BY id",
+    "ledger_entries": "SELECT id, transaction_id, account_id, amount_minor, sequence_number "
+    "FROM ledger_entries ORDER BY id",
+    "audit_events": "SELECT id, action, outcome, reason, actor_user_id, idempotency_key, details "
+    "FROM audit_events ORDER BY id",
+}
+
+
+async def _snapshot(engine: AsyncEngine) -> dict[str, list[tuple[object, ...]]]:
+    async with engine.connect() as connection:
+        return {
+            table: [tuple(row) for row in await connection.execute(text(query))]
+            for table, query in SNAPSHOT_0009.items()
+        }
+
+
+async def test_0010_upgrades_a_populated_0009_database_and_keyed_postings_work() -> None:
+    # An existing database, not a fresh one: data written at 0009 survives 0010 unchanged, and
+    # the upgraded schema accepts keyed postings and replays through the real services.
+    server_url = configured_database_url()
+    url = disposable_database_url(server_url, "_populated_0009")
+    assert url.database is not None
+    await recreate_database(server_url, url.database)
+    engine = create_async_engine(url, poolclass=NullPool)
+    app_engine = create_engine(settings_for(url))
+    try:
+        await run_alembic(engine, lambda config: command.upgrade(config, "0009"))
+        async with engine.begin() as connection:
+            await _post_raw_deposit(connection, amount=2_500)
+            await connection.execute(
+                text(
+                    "INSERT INTO audit_events (action, outcome, reason) "
+                    "VALUES ('user.register', 'rejected', 'email_already_registered')"
+                )
+            )
+        before = await _snapshot(engine)
+        assert {table: len(rows) for table, rows in before.items()} == {
+            "users": 1,
+            "accounts": 1 + len(Currency),  # the customer and one settlement account per ledger
+            "transactions": 1,
+            "ledger_entries": 2,
+            "audit_events": 1,
+        }
+
+        await run_alembic(engine, lambda config: command.upgrade(config, "head"))
+
+        assert await _snapshot(engine) == before  # every pre-existing row, byte for byte
+        async with engine.connect() as connection:
+            assert await connection.scalar(text("SELECT count(*) FROM idempotency_keys")) == 0
+            owner_id, account_id = (
+                await connection.execute(
+                    text("SELECT user_id, id FROM accounts WHERE kind = 'customer'")
+                )
+            ).one()
+
+        sessionmaker = create_sessionmaker(app_engine)
+        results = []
+        for _ in range(2):  # the posting, then its retry with the same key
+            async with sessionmaker() as session:
+                results.append(
+                    await withdraw(
+                        session,
+                        owner_id=owner_id,
+                        account_id=account_id,
+                        amount_minor=1_000,
+                        idempotency_key="after-0010",
+                    )
+                )
+        posted, replayed = results
+        assert (posted.replayed, replayed.replayed) == (False, True)
+        assert replayed.transaction_id == posted.transaction_id
+        assert posted.balances == replayed.balances == {account_id: 1_500}
+        async with sessionmaker() as session:
+            key = await session.get(IdempotencyKey, (owner_id, "after-0010"))
+            assert key is not None
+            assert key.transaction_id == posted.transaction_id
+            await assert_reconciled(session)
+    finally:
+        await app_engine.dispose()
         await engine.dispose()
 
 
