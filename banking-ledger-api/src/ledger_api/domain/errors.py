@@ -110,6 +110,17 @@ class StatementInconsistencyError(InternalError):
     message = "Internal server error."
 
 
+class CommitOutcomeUnknownError(UnavailableError):
+    # The connection was lost (or the COMMIT failed in a way PostgreSQL did not report) after
+    # COMMIT was sent: the posting may or may not have been applied. Never claim it failed.
+    # The durable idempotency record decides, when the client retries with the same key.
+    code = "outcome_unknown"
+    message = (
+        "The outcome of the request is unknown: it may or may not have been applied. "
+        "Retry with the same Idempotency-Key to get the definitive result."
+    )
+
+
 class TemporarilyUnavailableError(UnavailableError):
     # Lock timeout, statement timeout or exhausted deadlock retries. Nothing was written.
     code = "temporarily_unavailable"

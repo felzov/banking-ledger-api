@@ -2,6 +2,7 @@ import pytest
 
 from ledger_api.api.errors import status_for
 from ledger_api.domain.errors import (
+    CommitOutcomeUnknownError,
     DomainError,
     IdempotencyKeyMismatchError,
     InsufficientFundsError,
@@ -29,6 +30,10 @@ def test_financial_errors_map_to_the_approved_statuses() -> None:
     assert status_for(InsufficientFundsError()) == 422
     assert status_for(IdempotencyKeyMismatchError()) == 422
     assert status_for(TemporarilyUnavailableError()) == 503
+    assert status_for(CommitOutcomeUnknownError()) == 503
+    # It must never read as a definite failure, and must point at the recovery path.
+    assert "may or may not" in CommitOutcomeUnknownError.message
+    assert "same Idempotency-Key" in CommitOutcomeUnknownError.message
     # A detected inconsistency looks exactly like any other internal error to the client.
     assert status_for(StatementInconsistencyError()) == 500
     assert StatementInconsistencyError.code == "internal_error"

@@ -24,6 +24,12 @@ or serialization failure up to MAX_ATTEMPTS in total, with jittered backoff. A l
 statement timeout is not retried (the caller already waited); it, and exhausted retries,
 become TemporarilyUnavailableError. Retrying is safe because a failed attempt committed
 nothing, its key claim included: rejected and failed postings never leave a key behind.
+
+A failure DURING COMMIT is different: unless PostgreSQL itself reported that the COMMIT failed
+(an integrity check, a rollback, a timeout), the posting may have been applied, e.g. when the
+connection dropped before the acknowledgement arrived. That is CommitOutcomeUnknownError
+(outcome_unknown): never retried here, never reported as a failure. The client retries with
+the same idempotency key; the claim then waits for, or finds, the durable record.
 """
 
 import asyncio
@@ -50,6 +56,7 @@ from ledger_api.domain.account import AccountKind
 from ledger_api.domain.audit import AuditAction, DetailValue
 from ledger_api.domain.errors import (
     AccountNotFoundError,
+    CommitOutcomeUnknownError,
     CurrencyMismatchError,
     DestinationAccountNotFoundError,
     IdempotencyKeyMismatchError,
@@ -77,6 +84,9 @@ RETRYABLE_SQLSTATES = frozenset({"40P01", "40001"})
 # lock_not_available (lock_timeout), query_canceled (statement_timeout): already waited.
 CONTENTION_SQLSTATES = frozenset({"55P03", "57014"})
 RETRY_BACKOFF_SECONDS = (0.01, 0.05)
+# SQLSTATE classes PostgreSQL reports for a COMMIT it refused, i.e. definitely rolled back:
+# integrity_constraint_violation (the deferred checks) and transaction_rollback.
+DEFINITE_COMMIT_FAILURE_CLASSES = frozenset({"23", "40"})
 # An idempotency key names a user that does not exist: no account of theirs can either.
 KEY_OWNER_MUST_EXIST = "fk_idempotency_keys_user_id_users"
 
@@ -292,14 +302,21 @@ async def _in_transaction(
     for number in range(1, MAX_ATTEMPTS + 1):
         context.attempted_transaction_id = None  # set by _post once this attempt's header exists
         transaction_id = uuid.uuid7()
+        committing = False
         try:
             async with session.begin():
+                result = None
                 if keyed is not None:
-                    replay = await _claim_or_replay(session, keyed, transaction_id)
-                    if replay is not None:
-                        return replay
-                return await attempt(transaction_id)
-        except DBAPIError as error:
+                    result = await _claim_or_replay(session, keyed, transaction_id)
+                if result is None:
+                    result = await attempt(transaction_id)
+                committing = True  # from here on, only the COMMIT itself can fail
+                return result
+        except Exception as error:
+            if committing and not _definitely_rolled_back(error):
+                raise CommitOutcomeUnknownError from error
+            if not isinstance(error, DBAPIError):
+                raise
             # session.begin() has rolled back: nothing of this attempt was committed.
             code = sqlstate(error)
             if code in CONTENTION_SQLSTATES:
@@ -313,6 +330,18 @@ async def _in_transaction(
             # Jitter, so that the transactions that collided do not collide again in lockstep.
             await asyncio.sleep(random.uniform(*RETRY_BACKOFF_SECONDS) * number)  # noqa: S311
     raise AssertionError("unreachable: the last attempt returns or raises")
+
+
+def _definitely_rolled_back(error: Exception) -> bool:
+    """Whether an error raised by COMMIT proves that nothing was committed: PostgreSQL itself
+    refused the COMMIT, on a live connection. Anything else (a lost connection, a driver or
+    network error) leaves the outcome unknown."""
+    if not isinstance(error, DBAPIError) or error.connection_invalidated:
+        return False
+    code = sqlstate(error)
+    return code is not None and (
+        code[:2] in DEFINITE_COMMIT_FAILURE_CLASSES or code in CONTENTION_SQLSTATES
+    )
 
 
 async def _claim_or_replay(
