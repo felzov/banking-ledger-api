@@ -46,6 +46,7 @@ from tests.database import (
     SEQUENCE_HELPER,
     assert_reconciled,
     audit_events_about,
+    check_deferred_constraints,
     posting_role_grants,
     raises_violation,
 )
@@ -212,6 +213,7 @@ async def test_posting_role_deposits_withdraws_and_transfers(
     assert deposited.balances == {payer.id: 1_500}
     assert withdrawn.balances == {payer.id: 1_300}
     assert moved.balances == {payer.id: 1_000}
+    await check_deferred_constraints(db_session)  # the COMMIT-time checks, run as the role
     await assert_reconciled(db_session)
     events = await audit_events_about(db_session, payer.id)
     assert [event.outcome for event in events] == [
@@ -394,6 +396,117 @@ async def test_role_without_execute_on_the_helper_fails_loudly(
     assert "ledger_entries_last_issued_sequence_number" in str(excinfo.value.orig)
 
 
+# --- the deferred double-entry check against temporary tables (migration 0009) -----------------
+
+
+async def _shadow_balance_check(
+    db_connection: AsyncConnection,
+    transaction_id: uuid.UUID,
+    *,
+    declared: int | None,
+    amounts: list[int],
+) -> None:
+    """Temporary "transactions" and "ledger_entries" holding what an attacker wants the
+    deferred check to see for `transaction_id`. Only the columns the check reads; no grant is
+    needed (PUBLIC has TEMP). Before migration 0009 the check read these instead of the real
+    tables, because the temporary schema is searched first for unqualified names."""
+    await db_connection.execute(
+        text("CREATE TEMP TABLE transactions (id uuid, entry_count smallint)")
+    )
+    await db_connection.execute(
+        text("CREATE TEMP TABLE ledger_entries (transaction_id uuid, amount_minor bigint)")
+    )
+    if declared is not None:
+        await db_connection.execute(
+            text("INSERT INTO pg_temp.transactions VALUES (:t, :declared)"),
+            {"t": transaction_id, "declared": declared},
+        )
+    for amount in amounts:
+        await db_connection.execute(
+            text("INSERT INTO pg_temp.ledger_entries VALUES (:t, :amount)"),
+            {"t": transaction_id, "amount": amount},
+        )
+
+
+async def _insert_raw_transaction(
+    db_connection: AsyncConnection, accounts: list[Account], *, declared: int, amounts: list[int]
+) -> uuid.UUID:
+    """A transaction written directly into the real tables, one entry per account."""
+    ledger_id = accounts[0].ledger_id
+    transaction_id = await db_connection.scalar(
+        text(
+            "INSERT INTO public.transactions (ledger_id, kind, entry_count) "
+            "VALUES (:l, 'transfer', :declared) RETURNING id"
+        ),
+        {"l": ledger_id, "declared": declared},
+    )
+    assert isinstance(transaction_id, uuid.UUID)
+    for account, amount in zip(accounts, amounts, strict=False):
+        await db_connection.execute(
+            text(
+                "INSERT INTO public.ledger_entries "
+                "(transaction_id, account_id, ledger_id, amount_minor) "
+                "VALUES (:t, :a, :l, :amount)"
+            ),
+            {"t": transaction_id, "a": account.id, "l": ledger_id, "amount": amount},
+        )
+    return transaction_id
+
+
+@pytest.mark.parametrize(
+    ("real_declared", "real_amounts", "shadow_declared", "shadow_amounts", "constraint"),
+    [
+        # Unbalanced; the shadow shows a balanced pair instead.
+        pytest.param(2, [-1, 2], 2, [-1, 1], "ck_transactions_balanced", id="misleading"),
+        # Unbalanced by a third entry the shadow leaves out (and declares only two).
+        pytest.param(3, [-1, 1, 5], 2, [-1, 1], "ck_transactions_balanced", id="incomplete"),
+        # One entry; the shadow invents its counterpart.
+        pytest.param(2, [-1], 2, [-1, 1], "ck_transactions_min_two_entries", id="single"),
+        # Balanced but not sealed: three entries, two declared; the shadow declares three.
+        pytest.param(2, [-2, 1, 1], 3, [-2, 1, 1], "ck_transactions_entry_count", id="unsealed"),
+    ],
+)
+async def test_temporary_tables_cannot_pass_an_invalid_transaction(
+    db_connection: AsyncConnection,
+    db_session: AsyncSession,
+    pair: tuple[Account, Account],
+    real_declared: int,
+    real_amounts: list[int],
+    shadow_declared: int,
+    shadow_amounts: list[int],
+    constraint: str,
+) -> None:
+    accounts = [*pair, await create_customer_account(db_session)]
+    await _switch_to_new_posting_role(db_connection)
+    transaction_id = await _insert_raw_transaction(
+        db_connection, accounts, declared=real_declared, amounts=real_amounts
+    )
+    await _shadow_balance_check(
+        db_connection, transaction_id, declared=shadow_declared, amounts=shadow_amounts
+    )
+
+    # Force the COMMIT-time check now: this transaction is the only one pending, so the check
+    # itself, on the real rows, is what must reject it. Against 0008 nothing was raised.
+    with pytest.raises(IntegrityError) as excinfo:
+        await db_connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+    assert violated_constraint(excinfo.value) == constraint
+    assert str(transaction_id) in str(excinfo.value.orig)
+
+
+async def test_temporary_tables_cannot_fail_a_valid_transaction(
+    db_connection: AsyncConnection, pair: tuple[Account, Account]
+) -> None:
+    # The converse: an empty shadow made the old check report "0 entries" for a valid
+    # transaction. Now the check reads the real, balanced and sealed rows.
+    await _switch_to_new_posting_role(db_connection)
+    transaction_id = await _insert_raw_transaction(
+        db_connection, list(pair), declared=2, amounts=[-1, 1]
+    )
+    await _shadow_balance_check(db_connection, transaction_id, declared=None, amounts=[])
+
+    await db_connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+
+
 # --- the helper's boundary -----------------------------------------------------------------------
 
 
@@ -432,6 +545,17 @@ async def test_helper_is_a_narrow_security_definer(db_session: AsyncSession) -> 
     ).one()
     assert trigger_definer is False
     assert trigger_config == ["search_path=pg_catalog, pg_temp"]
+    # So is the deferred double-entry check (0009).
+    check_definer, check_config = (
+        await db_session.execute(
+            text(
+                "SELECT prosecdef, proconfig FROM pg_proc "
+                "WHERE oid = 'public.assert_transaction_balanced'::regproc"
+            )
+        )
+    ).one()
+    assert check_definer is False
+    assert check_config == ["search_path=pg_catalog, pg_temp"]
 
 
 async def test_helper_cannot_be_used_to_read_other_sequences(
@@ -682,6 +806,43 @@ async def test_role_cannot_backdate_behind_an_uncommitted_posting(
         await raw
     assert violated_constraint(excinfo.value) == "ck_ledger_entries_sequence_monotonic"
     role_witness.assert_ran_as(posting_role.role, attempts=1, audits=1)  # the posting
+
+
+@pytest.mark.concurrency
+async def test_role_commits_valid_deposits_withdrawals_and_transfers(
+    engine: AsyncEngine, posting_role: RoleSessions, role_witness: RoleWitness
+) -> None:
+    # Real COMMITs: the deferred double-entry check runs as the role, on every posting.
+    superuser = create_sessionmaker(engine)
+    payer = await commit_funded_account(superuser, 1_000)
+    payee = await commit_funded_account(superuser, 1)
+    role_witness.forget_setup()
+
+    async with posting_role.sessionmaker() as session:
+        await deposit(
+            session, owner_id=payer.owner_id, account_id=payer.account_id, amount_minor=500
+        )
+    async with posting_role.sessionmaker() as session:
+        await withdraw(
+            session, owner_id=payer.owner_id, account_id=payer.account_id, amount_minor=200
+        )
+    async with posting_role.sessionmaker() as session:
+        moved = await transfer(
+            session,
+            owner_id=payer.owner_id,
+            source_account_id=payer.account_id,
+            destination_account_id=payee.account_id,
+            amount_minor=300,
+        )
+
+    assert moved.balances == {payer.account_id: 1_000}
+    role_witness.assert_ran_as(posting_role.role, attempts=3, audits=3)
+    async with superuser() as session:
+        balance = await session.scalar(
+            select(Account.balance_minor).where(Account.id == payee.account_id)
+        )
+        assert balance == 301
+        await assert_reconciled(session)
 
 
 # --- the role checks themselves ----------------------------------------------------------------

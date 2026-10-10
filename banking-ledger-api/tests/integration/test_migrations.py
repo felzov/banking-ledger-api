@@ -355,6 +355,111 @@ async def test_0008_pins_the_trigger_search_path_and_downgrades_exactly() -> Non
         await engine.dispose()
 
 
+BALANCE_CHECK_DEFINITION = text("SELECT pg_get_functiondef('assert_transaction_balanced'::regproc)")
+BALANCE_CHECK_CONFIG = text(
+    "SELECT proconfig FROM pg_proc WHERE oid = 'assert_transaction_balanced'::regproc"
+)
+
+
+async def _commit_check_unbalanced_behind_shadows(connection: AsyncConnection) -> None:
+    """In the caller's (rolled-back) transaction: a role with the posting privileges writes an
+    unbalanced transaction, shadows the tables the deferred check reads with a balanced
+    version, and forces the check."""
+    ledger_id, settlement_id = (
+        await connection.execute(
+            text(
+                "SELECT l.id, a.id FROM ledgers l JOIN accounts a "
+                "ON a.ledger_id = l.id AND a.kind = 'system' WHERE l.currency = 'GBP'"
+            )
+        )
+    ).one()
+    user_id = await connection.scalar(
+        text("INSERT INTO users (email) VALUES (:email) RETURNING id"),
+        {"email": f"shadow-{uuid.uuid7().hex}@example.com"},
+    )
+    account_id = await connection.scalar(
+        text(
+            "INSERT INTO accounts (ledger_id, user_id, kind) "
+            "VALUES (:ledger, :user, 'customer') RETURNING id"
+        ),
+        {"ledger": ledger_id, "user": user_id},
+    )
+    role = f"ledger_posting_{uuid.uuid7().hex}"
+    await connection.execute(text(f'CREATE ROLE "{role}" NOLOGIN'))
+    for grant in posting_role_grants(role):
+        await connection.execute(text(grant))
+    await connection.execute(text(f'SET LOCAL ROLE "{role}"'))
+    transaction_id = await connection.scalar(
+        text(
+            "INSERT INTO public.transactions (ledger_id, kind, entry_count) "
+            "VALUES (:ledger, 'deposit', 2) RETURNING id"
+        ),
+        {"ledger": ledger_id},
+    )
+    await connection.execute(
+        text(
+            "INSERT INTO public.ledger_entries (transaction_id, account_id, ledger_id, "
+            "amount_minor) VALUES (:t, :s, :l, -1), (:t, :a, :l, 1000)"
+        ),
+        {"t": transaction_id, "s": settlement_id, "a": account_id, "l": ledger_id},
+    )
+    await connection.execute(text("CREATE TEMP TABLE transactions (id uuid, entry_count int)"))
+    await connection.execute(
+        text("CREATE TEMP TABLE ledger_entries (transaction_id uuid, amount_minor bigint)")
+    )
+    await connection.execute(
+        text("INSERT INTO pg_temp.transactions VALUES (:t, 2)"), {"t": transaction_id}
+    )
+    await connection.execute(
+        text("INSERT INTO pg_temp.ledger_entries VALUES (:t, -1), (:t, 1)"),
+        {"t": transaction_id},
+    )
+    await connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+
+
+async def test_0009_pins_the_balance_check_search_path_and_downgrades_exactly() -> None:
+    server_url = configured_database_url()
+    url = disposable_database_url(server_url, "_balance_check_search_path")
+    assert url.database is not None
+    await recreate_database(server_url, url.database)
+    engine = create_async_engine(url, poolclass=NullPool)
+    try:
+        await run_alembic(engine, lambda config: command.upgrade(config, "0008"))
+        async with engine.connect() as connection:
+            definition_0008 = await connection.scalar(BALANCE_CHECK_DEFINITION)
+            assert await connection.scalar(BALANCE_CHECK_CONFIG) is None
+            # The vulnerability, reproduced at 0008: the check read the shadows and let an
+            # unbalanced transaction (-1, +1000) through.
+            await _commit_check_unbalanced_behind_shadows(connection)
+            await connection.rollback()
+
+        await run_alembic(engine, lambda config: command.upgrade(config, "head"))
+        async with engine.connect() as connection:
+            assert await connection.scalar(BALANCE_CHECK_CONFIG) == [
+                "search_path=pg_catalog, pg_temp"
+            ]
+            definition_0009 = await connection.scalar(BALANCE_CHECK_DEFINITION)
+            with pytest.raises(IntegrityError) as excinfo:
+                await _commit_check_unbalanced_behind_shadows(connection)
+            await connection.rollback()
+            assert violated_constraint(excinfo.value) == "ck_transactions_balanced"
+            await _insert_entries_as_new_role(connection, helper=True)  # still posts normally
+            await connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+            await connection.rollback()
+
+        await run_alembic(engine, lambda config: command.downgrade(config, "0008"))
+        async with engine.connect() as connection:
+            # 0008's (that is, 0002's) function, restored byte for byte, path unpinned.
+            assert await connection.scalar(BALANCE_CHECK_DEFINITION) == definition_0008
+            assert await connection.scalar(BALANCE_CHECK_CONFIG) is None
+
+        await run_alembic(engine, lambda config: command.upgrade(config, "head"))
+        async with engine.connect() as connection:
+            assert await connection.scalar(BALANCE_CHECK_DEFINITION) == definition_0009
+    finally:
+        await engine.dispose()
+
+
 async def test_models_match_migrations(engine: AsyncEngine) -> None:
     # Raises AutogenerateDiffsDetected if the models and the migrated schema have drifted
     # (tables, columns, types, nullability, foreign keys, unique constraints, indexes).

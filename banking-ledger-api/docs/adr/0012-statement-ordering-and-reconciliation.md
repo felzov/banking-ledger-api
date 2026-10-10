@@ -103,13 +103,24 @@ every role may create temporary tables (`TEMP` is granted to `PUBLIC`). A role c
 empty temporary `accounts` and `ledger_entries`: the trigger locked and read those, saw no
 history, and accepted a backdated `OVERRIDING` number. Since 0008 the function has
 `SET search_path = pg_catalog, pg_temp` and names `public.accounts`, `public.ledger_entries` and
-the helper explicitly; it stays `SECURITY INVOKER`. A regression test shadows all three tables
-(and mirrors their rows, so the commit-time checks pass) and expects the ordering violation.
+the helper explicitly; it stays `SECURITY INVOKER`. A regression test shadows `accounts`,
+`ledger_entries` and `transactions` (mirroring their rows, so the commit-time checks pass) and
+expects the ordering violation.
 
-The deferred commit-time check of 0001/0002 (`assert_transaction_balanced`: entry count, sum, seal)
-still uses unqualified names, so the same shadowing can mislead it; pinning it is future
-hardening work, together with revoking `TEMP` from `PUBLIC` for the application role (Phase 10).
-Neither matters while the application connects as a superuser.
+**The deferred double-entry check (migration 0009).** `assert_transaction_balanced()` (0001,
+sealed in 0002) had the same flaw, with a worse outcome: it counted, summed and compared rows
+of whatever `ledger_entries` and `transactions` the caller's `search_path` found first, so
+temporary tables holding a balanced, sealed version of a transaction let an unbalanced,
+single-entry or mis-sealed one commit. 0009 gives it the same pinned `search_path` and names
+`public.ledger_entries` and `public.transactions`; its logic is unchanged and it stays
+`SECURITY INVOKER`. Adversarial tests write each kind of invalid transaction as a restricted
+role behind misleading or incomplete temporary tables, force the deferred checks, and expect
+the exact constraint; against 0008 none of them raised. The two `forbid_*` trigger functions
+reference no relation, so they need no change.
+
+After 0009 every trigger function that reads a table resolves it explicitly. Revoking `TEMP`
+from `PUBLIC` for the application role remains Phase 10 hardening (defence in depth). None of
+this binds a superuser, which bypasses triggers altogether (ADR 0004).
 
 One PostgreSQL detail matters for testing: PL/pgSQL caches the evaluation state of simple
 expressions, including the `EXECUTE` check, for the rest of a transaction. A role switched in
