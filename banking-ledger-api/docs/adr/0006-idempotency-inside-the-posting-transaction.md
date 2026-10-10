@@ -108,3 +108,38 @@ Implemented in migration 0010, `domain/idempotency.py`, `data/idempotency.py` an
   more (ADR 0012's contract, asserted by tests).
 - **Audit.** Every audited posting event carries the key in `audit_events.idempotency_key`
   (ADR 0011).
+
+## Amendment (Phase 6 review, 2026-10-11): the key and its transaction reference each other
+
+Migration 0010's foreign key proved only that a key's transaction *existed*. A database client
+with `INSERT` on `idempotency_keys` (the posting role has it) could attach a new key to an
+unrelated, older transaction, or to another user's; a later legitimate request with that key
+would then "replay" it instead of posting. Migration 0011 closes this in the database:
+
+- `transactions.idempotency_user_id` and `transactions.idempotency_key` name the key the
+  transaction was posted under: both NULL (unkeyed postings, and every row from before 0011) or
+  both set (`ck_transactions_idempotency_key_pair`); at most one transaction per key
+  (`uq_transactions_idempotency_key`); the key exists (`fk_transactions_idempotency_keys`,
+  checked at COMMIT). `insert_posting` fills them from the claim.
+- `assert_idempotency_link()` runs at COMMIT from a constraint trigger on each side (every new
+  key; every new transaction that names a key). It requires that the key references exactly
+  this transaction and the transaction names exactly this key
+  (`ck_idempotency_keys_transaction_link`), and that the key's user owns the posting's own
+  customer account: credited by a deposit, debited by a withdrawal or a transfer
+  (`ck_idempotency_keys_transaction_owner`).
+- **Why it is sound:** transactions are append-only (trigger, and no `UPDATE` privilege), so an
+  existing transaction can never come to name a new key; a new transaction cannot name an
+  existing key either, because that key must point back at it. Neither `xmin` nor timestamps
+  are involved: `xmin` comparisons are not a proof across transaction-id wraparound and break
+  under savepoints (ADR 0010), and `created_at` is client-settable.
+- The function is `SECURITY INVOKER` (it reads only what a posting role already reads, so the
+  privilege contract is unchanged) with `search_path = pg_catalog, pg_temp` and schema-qualified
+  tables, so temporary tables cannot shadow what it reads (as in 0008 and 0009).
+- Keys committed under 0010 keep pointing at transactions that name nothing. The upgrade checks
+  no existing row, so they stay valid; they cannot be hijacked, because a new transaction
+  naming such a key fails the link check.
+- 0011's downgrade refuses while any transaction names a key: the columns are the proof of
+  which key a transaction was posted under.
+- What it does not stop: a role that can insert transactions can still insert a complete, new,
+  balanced posting with its own key, exactly as it could before; restricting that needs a
+  `SECURITY DEFINER` posting function (ADR 0010, Phase 10). A superuser can disable triggers.

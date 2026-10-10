@@ -93,7 +93,9 @@ Since 0007 the trigger reads it through `public.ledger_entries_last_issued_seque
 `tests/database.py:posting_role_grants`): `SELECT` on `users`, `ledgers`; `SELECT` on `accounts`
 and `UPDATE` on `accounts.balance_minor` **only**; `SELECT, INSERT` on `transactions`,
 `ledger_entries`, `audit_events` and (since migration 0010) `idempotency_keys`; `EXECUTE` on the
-helper. **Nothing** on any sequence, and never `UPDATE` or `DELETE` on `idempotency_keys`. Without
+helper. **Nothing** on any sequence, and never `UPDATE` or `DELETE` on `idempotency_keys`. The
+link check of migration 0011 runs as the invoker and reads only `idempotency_keys`,
+`transactions`, `ledger_entries` and `accounts`, so it needs no further privilege. Without
 the `EXECUTE` grant, an insert fails loudly with `42501 permission denied for function
 ledger_entries_last_issued_sequence_number`, never with a misleading check violation.
 

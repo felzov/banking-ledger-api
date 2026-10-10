@@ -166,7 +166,9 @@ lets that check work for a least-privilege role (a narrow `SECURITY DEFINER` seq
 [`0009`](migrations/versions/0009_pin_transaction_balance_check_search_path.py) pin the
 `search_path` of the ordering and double-entry checks so temporary tables cannot shadow the
 tables they read; [`0010`](migrations/versions/0010_add_idempotency_keys.py) adds the
-append-only idempotency keys.
+append-only idempotency keys and
+[`0011`](migrations/versions/0011_link_transactions_to_idempotency_keys.py) makes each keyed
+transaction and its key reference each other.
 
 ```
 users 1 ── 0..* accounts *── 1 ledgers 1 ── * transactions ── 0..1 audit_events (succeeded)
@@ -181,7 +183,7 @@ users 1 ── 0..* accounts *── 1 ledgers 1 ── * transactions ── 0.
 | `users` | Identity only (lowercase, unique email) |
 | `ledgers` | One per currency: the boundary money cannot cross |
 | `accounts` | `customer` (owned by a user, one per currency) or `system` (settlement, one per ledger). `balance_minor` is a cached projection of the entries |
-| `transactions` | A posted transaction: `deposit`, `withdrawal` or `transfer`, sealed with its `entry_count`. Append-only |
+| `transactions` | A posted transaction: `deposit`, `withdrawal` or `transfer`, sealed with its `entry_count`; a keyed posting also names its idempotency key. Append-only |
 | `ledger_entries` | One signed `amount_minor` on one account, with a `sequence_number` that orders each account's entries in commit order. Append-only |
 | `audit_events` | One row per audited attempt: action, outcome (`succeeded`, `rejected`, `failed`), reason code, idempotency key, safe JSON details. Append-only |
 | `idempotency_keys` | One row per key a user consumed with a **committed** posting: the request fingerprint and the transaction it produced. Append-only, kept indefinitely |
@@ -207,6 +209,7 @@ Invariants enforced by PostgreSQL itself, so every code path is bound by them:
 | Audit evidence is not dropped by a routine downgrade | Migration 0004 refuses to drop a non-empty `audit_events` |
 | A key is used once per user, by exactly one committed transaction, and never changes | Primary key `(user_id, key)`, unique `transaction_id` with a foreign key checked at `COMMIT`, append-only triggers; 0010's downgrade refuses a non-empty table |
 | A key is 1–255 visible ASCII characters; a fingerprint is 32 bytes | CHECK constraints |
+| A key and its transaction reference each other, and the transaction is the key owner's own posting: no key can be attached to an existing or another user's transaction | Columns on the immutable `transactions` row, unique and foreign-key constraints, and a link check at `COMMIT` on both tables (migration 0011) |
 
 Triggers bind ordinary sessions only. A superuser or the table owner can disable them, and the
 application currently connects as a superuser, so these rules guard against application bugs,

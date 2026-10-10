@@ -121,7 +121,8 @@ timeout would post twice.
   `INSERT ... ON CONFLICT DO NOTHING`, using a transaction id generated for this attempt. A
   committed key either replays the original result (no further steps) or is refused. Each
   retry attempt claims again; a rolled-back attempt takes its claim with it. The lock order is
-  now "key, then accounts (ascending id)", still free of cycles.
+  now "key, then accounts (ascending id)", still free of cycles. A keyed header names its key
+  in return (migration 0011): at COMMIT the two must reference each other (ADR 0006).
 - **HTTP endpoints** for deposits, withdrawals and transfers exist (ADR 0006).
 - **Failures during COMMIT** are split. A non-fatal `ERROR` that PostgreSQL itself sent for the
   COMMIT, on a connection that is still open, is a definite rollback and keeps the table above,
