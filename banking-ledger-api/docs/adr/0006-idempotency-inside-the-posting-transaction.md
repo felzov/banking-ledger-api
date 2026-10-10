@@ -83,9 +83,15 @@ Implemented in migration 0010, `domain/idempotency.py`, `data/idempotency.py` an
 - **Unknown COMMIT outcome.** If COMMIT fails without PostgreSQL reporting why (a lost
   connection, a driver or network error), the posting may have been applied. The service
   responds `503 outcome_unknown` and tells the client to retry with the **same** key. It never
-  says the request failed, and never retries by itself. Errors PostgreSQL returns for a COMMIT
-  (SQLSTATE classes 23 and 40, lock and statement timeouts) are definite rollbacks and keep
-  their handling. Recovery consults the durable record through the claim, never through a plain
+  says the request failed, and never retries by itself. A COMMIT is a **definite rollback**
+  only if PostgreSQL itself answered it with severity `ERROR` (not `FATAL` or `PANIC`) on a
+  connection that is still open: the server then aborted the transaction and kept the session.
+  This holds whatever the SQLSTATE, except `40003` (statement_completion_unknown), `08007`
+  (transaction_resolution_unknown) and class `08`, which stay unknown. The SQLSTATE alone is not
+  enough: asyncpg's client-side errors carry class-level codes (a connection closed mid-COMMIT
+  reports `08003`) but no server severity. Definite rollbacks keep their handling (a deadlock is
+  retried, a timeout is `503 temporarily_unavailable`, anything else is `500`).
+  Recovery consults the durable record through the claim, never through a plain
   `SELECT`. While the original backend is still inside its COMMIT, its row is invisible: a
   `SELECT` would find nothing and wrongly conclude "not posted". The retry's `INSERT` instead
   waits for that transaction to end, then replays it, or runs if that COMMIT failed. The wait is

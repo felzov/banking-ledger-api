@@ -25,11 +25,12 @@ statement timeout is not retried (the caller already waited); it, and exhausted 
 become TemporarilyUnavailableError. Retrying is safe because a failed attempt committed
 nothing, its key claim included: rejected and failed postings never leave a key behind.
 
-A failure DURING COMMIT is different: unless PostgreSQL itself reported that the COMMIT failed
-(an integrity check, a rollback, a timeout), the posting may have been applied, e.g. when the
-connection dropped before the acknowledgement arrived. That is CommitOutcomeUnknownError
-(outcome_unknown): never retried here, never reported as a failure. The client retries with
-the same idempotency key; the claim then waits for, or finds, the durable record.
+A failure DURING COMMIT is different: unless PostgreSQL itself answered the COMMIT with a
+non-fatal ERROR on a connection that is still open, the posting may have been applied, e.g.
+when the connection dropped before the acknowledgement arrived. That is
+CommitOutcomeUnknownError (outcome_unknown): never retried here, never reported as a failure.
+The client retries with the same idempotency key; the claim then waits for, or finds, the
+durable record.
 """
 
 import asyncio
@@ -43,7 +44,7 @@ from datetime import datetime
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ledger_api.data.errors import sqlstate, violated_constraint
+from ledger_api.data.errors import server_severity, sqlstate, violated_constraint
 from ledger_api.data.idempotency import claim_idempotency_key, find_posted_entry
 from ledger_api.data.posting import (
     LockedAccount,
@@ -84,9 +85,11 @@ RETRYABLE_SQLSTATES = frozenset({"40P01", "40001"})
 # lock_not_available (lock_timeout), query_canceled (statement_timeout): already waited.
 CONTENTION_SQLSTATES = frozenset({"55P03", "57014"})
 RETRY_BACKOFF_SECONDS = (0.01, 0.05)
-# SQLSTATE classes PostgreSQL reports for a COMMIT it refused, i.e. definitely rolled back:
-# integrity_constraint_violation (the deferred checks) and transaction_rollback.
-DEFINITE_COMMIT_FAILURE_CLASSES = frozenset({"23", "40"})
+# SQLSTATEs that leave a COMMIT's outcome unknown even when PostgreSQL reports them as a
+# non-fatal ERROR on a live connection: statement_completion_unknown and
+# transaction_resolution_unknown. Class 08 (connection_exception) is treated the same way.
+UNKNOWN_OUTCOME_SQLSTATES = frozenset({"40003", "08007"})
+CONNECTION_EXCEPTION_CLASS = "08"
 # An idempotency key names a user that does not exist: no account of theirs can either.
 KEY_OWNER_MUST_EXIST = "fk_idempotency_keys_user_id_users"
 
@@ -333,14 +336,25 @@ async def _in_transaction(
 
 
 def _definitely_rolled_back(error: Exception) -> bool:
-    """Whether an error raised by COMMIT proves that nothing was committed: PostgreSQL itself
-    refused the COMMIT, on a live connection. Anything else (a lost connection, a driver or
-    network error) leaves the outcome unknown."""
+    """Whether an error raised by COMMIT proves that nothing was committed.
+
+    Only if PostgreSQL itself answered with an ERROR (not FATAL or PANIC) on a connection that
+    is still open: the server then aborted the transaction, and the session goes on. That holds
+    whatever the SQLSTATE (a deferred check, a permission or data error, a deadlock), except
+    the codes that themselves mean "outcome unknown". Everything else leaves the outcome
+    unknown: an invalidated connection, a client-side driver or network error (no server
+    severity, even when it carries a class-level SQLSTATE such as 08003), a FATAL or PANIC
+    (the session ended, possibly after the commit), and anything that is not a DBAPIError.
+    """
     if not isinstance(error, DBAPIError) or error.connection_invalidated:
         return False
+    if server_severity(error) != "ERROR":
+        return False
     code = sqlstate(error)
-    return code is not None and (
-        code[:2] in DEFINITE_COMMIT_FAILURE_CLASSES or code in CONTENTION_SQLSTATES
+    return (
+        code is not None
+        and code not in UNKNOWN_OUTCOME_SQLSTATES
+        and not code.startswith(CONNECTION_EXCEPTION_CLASS)
     )
 
 

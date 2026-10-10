@@ -235,6 +235,112 @@ async def test_a_commit_refused_by_postgresql_is_not_reported_as_unknown(
     assert (failed.outcome, failed.reason) == (AuditOutcome.FAILED, "internal_error")
 
 
+async def _reject_commit_with(session: AsyncSession, code: str) -> None:
+    """Make PostgreSQL itself refuse this transaction's COMMIT with SQLSTATE `code`.
+
+    A deferred constraint trigger on a temporary table, all of it private to the transaction
+    (ON COMMIT DROP; rolled back with it), fires during COMMIT processing and raises.
+    """
+    await session.execute(text("CREATE TEMP TABLE commit_probe (x int) ON COMMIT DROP"))
+    await session.execute(
+        text(
+            "CREATE FUNCTION pg_temp.commit_probe_fail() RETURNS trigger LANGUAGE plpgsql AS $$ "
+            f"BEGIN RAISE EXCEPTION 'test: COMMIT refused' USING ERRCODE = '{code}'; END $$"
+        )
+    )
+    await session.execute(
+        text(
+            "CREATE CONSTRAINT TRIGGER commit_probe AFTER INSERT ON commit_probe "
+            "DEFERRABLE INITIALLY DEFERRED FOR EACH ROW "
+            "EXECUTE FUNCTION pg_temp.commit_probe_fail()"
+        )
+    )
+    await session.execute(text("INSERT INTO commit_probe VALUES (1)"))
+
+
+def _refuse_the_next_commit(monkeypatch: pytest.MonkeyPatch, code: str) -> None:
+    real_record = audit_service.record_in_transaction
+    armed = True
+
+    async def record_then_arm(session: AsyncSession, record: AuditRecord) -> None:
+        nonlocal armed
+        await real_record(session, record)
+        if armed:  # the first posting attempt only; its retry commits normally
+            armed = False
+            await _reject_commit_with(session, code)
+
+    monkeypatch.setattr(posting_service, "record_in_transaction", record_then_arm)
+
+
+@pytest.mark.parametrize("code", ["42501", "P0001", "22003", "53100", "XX000", "23514"])
+async def test_a_commit_postgresql_refused_on_a_live_connection_is_a_definite_failure(
+    sessionmaker: Maker, funded: FundedAccount, monkeypatch: pytest.MonkeyPatch, code: str
+) -> None:
+    # Whatever the SQLSTATE: the server answered COMMIT with an ERROR and kept the session, so
+    # it rolled back. Reported as the failure it is (500), never as outcome_unknown.
+    _refuse_the_next_commit(monkeypatch, code)
+    key = f"refused-{code}-{uuid.uuid7().hex}"
+
+    with pytest.raises(DBAPIError) as excinfo:
+        await _withdraw(sessionmaker, funded, key)
+
+    error = excinfo.value
+    assert not isinstance(error, CommitOutcomeUnknownError)
+    driver_error = error.orig.__cause__ if error.orig is not None else None
+    assert (
+        getattr(driver_error, "sqlstate", None),
+        getattr(driver_error, "severity_en", None),
+    ) == (
+        code,
+        "ERROR",
+    )
+    assert not error.connection_invalidated
+    # The persisted truth agrees: nothing committed.
+    assert await _key_row(sessionmaker, funded, key) is None
+    assert await _balance(sessionmaker, funded) == FUNDED
+    [failed] = await _withdrawal_events(sessionmaker, funded)
+    assert (failed.outcome, failed.reason) == (AuditOutcome.FAILED, "internal_error")
+    assert failed.details["sqlstate"] == code
+    assert not await _transaction_exists(
+        sessionmaker, uuid.UUID(failed.details["attempted_transaction_id"])
+    )
+
+    retried = await _withdraw(sessionmaker, funded, key)  # the trigger is armed only once
+
+    assert not retried.replayed
+    assert await _balance(sessionmaker, funded) == FUNDED - AMOUNT
+    await _assert_reconciled(sessionmaker)
+
+
+async def test_statement_completion_unknown_at_commit_is_outcome_unknown(
+    sessionmaker: Maker, funded: FundedAccount, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # 40003 says, by definition, that the outcome is unknown: never a definite rollback, even
+    # as a non-fatal ERROR on a live connection. (Here the server did roll back; the caller is
+    # told the truth it has, and the durable record settles it on retry.)
+    _refuse_the_next_commit(monkeypatch, "40003")
+    key = f"completion-unknown-{uuid.uuid7().hex}"
+
+    with pytest.raises(CommitOutcomeUnknownError) as excinfo:
+        await _withdraw(sessionmaker, funded, key)
+
+    cause = excinfo.value.__cause__
+    assert isinstance(cause, DBAPIError)
+    assert cause.orig is not None
+    assert getattr(cause.orig.__cause__, "sqlstate", None) == "40003"
+    assert not cause.connection_invalidated
+    assert await _key_row(sessionmaker, funded, key) is None
+    [unknown] = await _withdrawal_events(sessionmaker, funded)
+    assert (unknown.outcome, unknown.reason) == (AuditOutcome.FAILED, "outcome_unknown")
+    assert unknown.details["sqlstate"] == "40003"
+
+    retried = await _withdraw(sessionmaker, funded, key)
+
+    assert not retried.replayed  # nothing had committed: the retry runs, once
+    assert await _balance(sessionmaker, funded) == FUNDED - AMOUNT
+    await _assert_reconciled(sessionmaker)
+
+
 # --- c. a retry while the original is still committing -------------------------------------------
 
 SLOW_COMMIT_PREFIX = "slow-commit-"

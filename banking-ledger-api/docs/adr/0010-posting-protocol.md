@@ -123,8 +123,9 @@ timeout would post twice.
   retry attempt claims again; a rolled-back attempt takes its claim with it. The lock order is
   now "key, then accounts (ascending id)", still free of cycles.
 - **HTTP endpoints** for deposits, withdrawals and transfers exist (ADR 0006).
-- **Failures during COMMIT** are split. Errors PostgreSQL reports for the COMMIT (classes 23 and
-  40, `55P03`, `57014`) are definite rollbacks and keep the table above. Anything else (a lost
-  connection, a driver or network error) is `outcome_unknown` (503): never retried in-process,
-  never reported as a failure. The known limitation above ("the client cannot know whether the
+- **Failures during COMMIT** are split. A non-fatal `ERROR` that PostgreSQL itself sent for the
+  COMMIT, on a connection that is still open, is a definite rollback and keeps the table above,
+  whatever its SQLSTATE except `40003`, `08007` and class `08` (ADR 0006). Anything else (an
+  invalidated connection, a client-side driver or network error, a `FATAL` or `PANIC`) is
+  `outcome_unknown` (503): never retried in-process, never reported as a failure. The known limitation above ("the client cannot know whether the
   posting committed") is resolved by retrying with the same key.
