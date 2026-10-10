@@ -96,6 +96,21 @@ Since 0007 the trigger reads it through `public.ledger_entries_last_issued_seque
 the `EXECUTE` grant, an insert fails loudly with `42501 permission denied for function
 ledger_entries_last_issued_sequence_number`, never with a misleading check violation.
 
+**Name resolution (migration 0008).** Until 0008 the trigger function named `accounts` and
+`ledger_entries` without a schema and used the caller's `search_path`. For unqualified relation
+names PostgreSQL searches the session's temporary schema first unless `pg_temp` is listed, and
+every role may create temporary tables (`TEMP` is granted to `PUBLIC`). A role could create
+empty temporary `accounts` and `ledger_entries`: the trigger locked and read those, saw no
+history, and accepted a backdated `OVERRIDING` number. Since 0008 the function has
+`SET search_path = pg_catalog, pg_temp` and names `public.accounts`, `public.ledger_entries` and
+the helper explicitly; it stays `SECURITY INVOKER`. A regression test shadows all three tables
+(and mirrors their rows, so the commit-time checks pass) and expects the ordering violation.
+
+The deferred commit-time check of 0001/0002 (`assert_transaction_balanced`: entry count, sum, seal)
+still uses unqualified names, so the same shadowing can mislead it; pinning it is future
+hardening work, together with revoking `TEMP` from `PUBLIC` for the application role (Phase 10).
+Neither matters while the application connects as a superuser.
+
 One PostgreSQL detail matters for testing: PL/pgSQL caches the evaluation state of simple
 expressions, including the `EXECUTE` check, for the rest of a transaction. A role switched in
 mid-transaction after another role fired the trigger inherits that check. Application

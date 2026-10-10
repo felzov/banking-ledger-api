@@ -137,7 +137,9 @@ ledger tables, [`0004`](migrations/versions/0004_add_audit_events.py) adds the a
 [`0005`](migrations/versions/0005_order_ledger_entries.py) gives entries a commit-ordered
 sequence number, [`0006`](migrations/versions/0006_enforce_entry_sequence_order.py) rejects
 entries numbered out of order, and [`0007`](migrations/versions/0007_read_entry_sequence_as_definer.py)
-lets that check work for a least-privilege role (a narrow `SECURITY DEFINER` sequence read).
+lets that check work for a least-privilege role (a narrow `SECURITY DEFINER` sequence read);
+[`0008`](migrations/versions/0008_pin_entry_sequence_trigger_search_path.py) pins the check's
+`search_path` so temporary tables cannot shadow the tables it reads.
 
 ```
 users 1 ── 0..* accounts *── 1 ledgers 1 ── * transactions ── 0..1 audit_events (succeeded)

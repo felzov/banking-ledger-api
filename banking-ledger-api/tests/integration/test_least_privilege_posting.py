@@ -208,6 +208,116 @@ async def test_backdated_and_unissued_numbers_stay_rejected_for_the_role(
         )
 
 
+async def _shadow_protected_tables(db_connection: AsyncConnection) -> None:
+    """Temporary tables named like the ones the ordering trigger reads. Temporary tables need
+    no grant (PUBLIC has TEMP) and, for unqualified names, the temporary schema is searched
+    first, so before migration 0008 the trigger locked and read these instead."""
+    await db_connection.execute(text("CREATE TEMP TABLE accounts (LIKE public.accounts)"))
+    await db_connection.execute(
+        text("CREATE TEMP TABLE ledger_entries (LIKE public.ledger_entries)")
+    )
+    await db_connection.execute(text("CREATE TEMP TABLE transactions (LIKE public.transactions)"))
+
+
+async def _mirror_into_shadows(db_connection: AsyncConnection) -> None:
+    """Copy the real rows into the shadows, so that commit-time checks reading the shadows
+    (the deferred checks of migrations 0001/0002 are not pinned) find every pending
+    transaction valid: what is left to reject a bad entry is the ordering trigger alone."""
+    for table in ("accounts", "ledger_entries", "transactions"):
+        await db_connection.execute(
+            text(f"INSERT INTO pg_temp.{table} SELECT * FROM public.{table}")  # noqa: S608
+        )
+
+
+_INSERT_HEADER_QUALIFIED = text(
+    "INSERT INTO public.transactions (ledger_id, kind, entry_count) "
+    "VALUES (:ledger, 'transfer', 2) RETURNING id"
+)
+
+
+async def test_temporary_tables_cannot_hide_an_accounts_history(
+    db_connection: AsyncConnection,
+    db_session: AsyncSession,
+    new_session: SessionFactory,
+    pair: tuple[Account, Account],
+) -> None:
+    # Before 0008 the trigger saw the empty shadow tables, found no history for the payer and
+    # accepted the backdated entry; the commit-time checks passed too (on the mirrored rows).
+    payer, payee = pair
+    newcomer = await create_customer_account(db_session)  # no entries: any number is "after"
+    await _switch_to_new_posting_role(db_connection)
+    await _fund(new_session, payee, 100)  # numbers below the payer's...
+    await _fund(new_session, payer, 100)  # ...latest one, unused on the payer's account
+    backdated = await db_connection.scalar(
+        text("SELECT min(sequence_number) FROM public.ledger_entries WHERE account_id = :a"),
+        {"a": payee.id},
+    )
+    latest = await db_connection.scalar(
+        text("SELECT max(sequence_number) FROM public.ledger_entries WHERE account_id = :a"),
+        {"a": payer.id},
+    )
+    assert backdated < latest
+    await _shadow_protected_tables(db_connection)
+
+    async with raises_violation("ck_ledger_entries_sequence_monotonic"):
+        transaction_id = await db_session.scalar(
+            _INSERT_HEADER_QUALIFIED, {"ledger": payer.ledger_id}
+        )
+        await db_session.execute(
+            text(
+                "INSERT INTO public.ledger_entries "
+                "(transaction_id, account_id, ledger_id, amount_minor, sequence_number) "
+                "OVERRIDING SYSTEM VALUE VALUES "
+                "(:t, :payer, :l, -1, :number), (:t, :newcomer, :l, 1, :number)"
+            ),
+            {
+                "t": transaction_id,
+                "payer": payer.id,
+                "newcomer": newcomer.id,
+                "l": payer.ledger_id,
+                "number": backdated,
+            },
+        )
+        # Reached only if the trigger accepted the entry: force the commit-time checks, so
+        # that the test fails (nothing raised) rather than passing on a deferred error.
+        await _mirror_into_shadows(db_connection)
+        await db_connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+
+
+async def test_temporary_tables_do_not_block_a_valid_entry(
+    db_connection: AsyncConnection,
+    db_session: AsyncSession,
+    new_session: SessionFactory,
+    pair: tuple[Account, Account],
+) -> None:
+    payer, payee = pair
+    await _switch_to_new_posting_role(db_connection)
+    await _fund(new_session, payer, 100)
+    await _shadow_protected_tables(db_connection)
+
+    transaction_id = await db_session.scalar(_INSERT_HEADER_QUALIFIED, {"ledger": payer.ledger_id})
+    await db_session.execute(
+        text(
+            "INSERT INTO public.ledger_entries "
+            "(transaction_id, account_id, ledger_id, amount_minor) "
+            "VALUES (:t, :payer, :l, -1), (:t, :payee, :l, 1)"
+        ),
+        {"t": transaction_id, "payer": payer.id, "payee": payee.id, "l": payer.ledger_id},
+    )
+    await _mirror_into_shadows(db_connection)
+    await db_connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+
+    numbers = await db_connection.scalars(
+        text(
+            "SELECT sequence_number FROM public.ledger_entries "
+            "WHERE account_id = :a ORDER BY sequence_number"
+        ),
+        {"a": payer.id},
+    )
+    funding, new = numbers.all()
+    assert new > funding  # numbered by the identity, after the account's history
+
+
 async def test_role_without_execute_on_the_helper_fails_loudly(
     db_connection: AsyncConnection,
     new_session: SessionFactory,
@@ -252,11 +362,18 @@ async def test_helper_is_a_narrow_security_definer(db_session: AsyncSession) -> 
     assert config == ["search_path=pg_catalog, pg_temp"]
     assert owner == table_owner  # the definer owns the sequence it reads
     assert public_can_execute is False
-    # The trigger function itself stays SECURITY INVOKER: locks and reads run as the caller.
-    invoker = await db_session.scalar(
-        text("SELECT NOT prosecdef FROM pg_proc WHERE proname = 'assert_entry_sequence_order'")
-    )
-    assert invoker is True
+    # The trigger function itself stays SECURITY INVOKER (locks and reads run as the caller),
+    # with its search_path pinned so temporary tables cannot shadow its tables (0008).
+    trigger_definer, trigger_config = (
+        await db_session.execute(
+            text(
+                "SELECT prosecdef, proconfig FROM pg_proc "
+                "WHERE oid = 'public.assert_entry_sequence_order'::regproc"
+            )
+        )
+    ).one()
+    assert trigger_definer is False
+    assert trigger_config == ["search_path=pg_catalog, pg_temp"]
 
 
 async def test_helper_cannot_be_used_to_read_other_sequences(
