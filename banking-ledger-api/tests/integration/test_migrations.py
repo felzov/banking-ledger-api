@@ -23,7 +23,15 @@ from tests.database import (
     run_alembic,
 )
 
-LEDGER_TABLES = {"users", "ledgers", "accounts", "transactions", "ledger_entries", "audit_events"}
+LEDGER_TABLES = {
+    "users",
+    "ledgers",
+    "accounts",
+    "transactions",
+    "ledger_entries",
+    "audit_events",
+    "idempotency_keys",
+}
 
 
 async def _public_tables(engine: AsyncEngine) -> set[str]:
@@ -105,6 +113,78 @@ async def test_downgrade_refuses_to_drop_audit_evidence() -> None:
             version = await connection.scalar(text("SELECT version_num FROM alembic_version"))
         head = ScriptDirectory.from_config(Config(str(ALEMBIC_INI))).get_current_head()
         assert version == head
+    finally:
+        await engine.dispose()
+
+
+# A committed deposit that consumed an idempotency key, in raw SQL: a frozen snapshot, like the
+# migrations themselves. Every deferred check passes at COMMIT.
+COMMITTED_KEYED_DEPOSIT = [
+    "INSERT INTO users (id, email) VALUES ('{user}', 'keyed-{user}@example.test')",
+    "INSERT INTO accounts (id, ledger_id, user_id, kind) "
+    "SELECT '{account}', id, '{user}', 'customer' FROM ledgers WHERE currency = 'GBP'",
+    "INSERT INTO transactions (id, ledger_id, kind, entry_count) "
+    "SELECT '{transaction}', id, 'deposit', 2 FROM ledgers WHERE currency = 'GBP'",
+    "INSERT INTO ledger_entries (transaction_id, account_id, ledger_id, amount_minor) "
+    "SELECT '{transaction}', a.id, a.ledger_id, CASE a.kind WHEN 'system' THEN -100 ELSE 100 END "
+    "FROM accounts a JOIN ledgers l ON l.id = a.ledger_id "
+    "WHERE l.currency = 'GBP' AND (a.kind = 'system' OR a.id = '{account}')",
+    "UPDATE accounts SET balance_minor = balance_minor + CASE kind WHEN 'system' THEN -100 "
+    "ELSE 100 END WHERE id = '{account}' OR (kind = 'system' AND ledger_id = "
+    "(SELECT id FROM ledgers WHERE currency = 'GBP'))",
+    "INSERT INTO idempotency_keys (user_id, key, request_fingerprint, transaction_id) "
+    "VALUES ('{user}', 'key-1', decode(repeat('ab', 32), 'hex'), '{transaction}')",
+]
+
+
+async def test_downgrade_refuses_to_drop_consumed_idempotency_keys() -> None:
+    # Phase 6: dropping idempotency_keys would let retried requests run a second time. The
+    # refusal aborts the downgrade (one transaction): the schema stays at head, keys intact.
+    server_url = configured_database_url()
+    url = disposable_database_url(server_url, "_idempotency_guard")
+    assert url.database is not None
+    await recreate_database(server_url, url.database)
+    engine = create_async_engine(url, poolclass=NullPool)
+    ids = {"user": uuid.uuid7(), "account": uuid.uuid7(), "transaction": uuid.uuid7()}
+    try:
+        await run_alembic(engine, lambda config: command.upgrade(config, "head"))
+        async with engine.begin() as connection:
+            for statement in COMMITTED_KEYED_DEPOSIT:
+                await connection.execute(text(statement.format(**ids)))
+
+        with pytest.raises(DBAPIError) as excinfo:
+            await run_alembic(engine, lambda config: command.downgrade(config, "0009"))
+
+        assert sqlstate(excinfo.value) == "2BP01"  # dependent_objects_still_exist
+        assert "idempotency_keys" in await _public_tables(engine)
+        async with engine.connect() as connection:
+            assert await connection.scalar(text("SELECT count(*) FROM idempotency_keys")) == 1
+            assert await connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+                "0010"
+            )
+    finally:
+        await engine.dispose()
+
+
+async def test_0010_downgrades_exactly_on_an_empty_table() -> None:
+    server_url = configured_database_url()
+    url = disposable_database_url(server_url, "_idempotency_round_trip")
+    assert url.database is not None
+    await recreate_database(server_url, url.database)
+    engine = create_async_engine(url, poolclass=NullPool)
+    try:
+        await run_alembic(engine, lambda config: command.upgrade(config, "0009"))
+        tables_0009, functions_0009 = await _public_tables(engine), await _public_functions(engine)
+
+        await run_alembic(engine, lambda config: command.upgrade(config, "head"))
+        assert await _public_tables(engine) == tables_0009 | {"idempotency_keys"}
+        assert await _public_functions(engine) == functions_0009 | {
+            "forbid_idempotency_key_mutation"
+        }
+
+        await run_alembic(engine, lambda config: command.downgrade(config, "0009"))
+        assert await _public_tables(engine) == tables_0009
+        assert await _public_functions(engine) == functions_0009
     finally:
         await engine.dispose()
 
