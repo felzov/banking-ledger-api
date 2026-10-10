@@ -43,4 +43,5 @@ rails. The MVP has neither.
   application bugs and mistakes, **not against that role**. Least-privilege roles (a migration
   owner; an application role with `INSERT`/`SELECT` only on these tables, no `TRUNCATE`) are
   future hardening work (Phase 10). Reconciliation re-checks the invariants independently
-  (ADR 0012).
+  (ADR 0012). The exact privileges a posting role needs, including `EXECUTE` on the sequence
+  helper of migration 0007, are pinned by a test (ADR 0012, "Security boundary").

@@ -68,6 +68,39 @@ Residual capability, by design: `OVERRIDING` may still pick a number that is aft
 account's latest and already issued (e.g. one used by another account). Ordering is preserved.
 The trigger, like all triggers, does not bind a superuser or the table owner (ADR 0004).
 
+### Security boundary of the issued-value check (migration 0007)
+
+The trigger function is `SECURITY INVOKER`: its account lock and its maximum query run as,
+and in the transaction of, the inserting role. That is required for the lock to serialize the
+caller's own transaction, and keeps the trigger from granting anything the caller lacks.
+
+Reading the sequence is the one exception. Inserting into an identity column needs no
+privilege on its sequence, but reading it does, and `pg_sequence_last_value()` returns NULL
+(not an error) for a role without `SELECT`/`USAGE` on it. In 0006 the trigger read it
+directly, so a least-privilege role would have had every entry, legitimate ones included,
+rejected as "never issued". Hidden while the application connects as a superuser.
+
+Since 0007 the trigger reads it through `public.ledger_entries_last_issued_sequence_number()`:
+
+| Property | Why |
+|---|---|
+| `SECURITY DEFINER`, owned by the owner of `public.ledger_entries` | The owner owns the identity sequence; only this one read runs with its privileges |
+| No arguments; the sequence is named inside the function | It cannot be pointed at any other sequence |
+| `SET search_path = pg_catalog, pg_temp`; every object schema-qualified | A caller cannot substitute objects (`pg_temp` last); definer functions are never inlined |
+| `EXECUTE` revoked from `PUBLIC` | The value reveals global entry volume. The owner keeps it |
+
+**Privilege contract of a least-privilege posting role** (asserted by
+`tests/database.py:posting_role_grants`): `SELECT` on `users`, `ledgers`; `SELECT, UPDATE` on
+`accounts` (balances and `FOR UPDATE` locks); `SELECT, INSERT` on `transactions`,
+`ledger_entries`, `audit_events`; `EXECUTE` on the helper. **Nothing** on any sequence. Without
+the `EXECUTE` grant, an insert fails loudly with `42501 permission denied for function
+ledger_entries_last_issued_sequence_number`, never with a misleading check violation.
+
+One PostgreSQL detail matters for testing: PL/pgSQL caches the evaluation state of simple
+expressions, including the `EXECUTE` check, for the rest of a transaction. A role switched in
+mid-transaction after another role fired the trigger inherits that check. Application
+connections never switch roles mid-transaction; the tests switch before the first entry.
+
 **Existing rows** are backfilled in UUIDv7 id order. That historical order is best-effort; the
 commit-order guarantee holds for entries written after migration 0005.
 

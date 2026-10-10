@@ -5,12 +5,12 @@ from alembic import command
 from alembic.config import Config
 from alembic.script import ScriptDirectory
 from sqlalchemy import select, text
-from sqlalchemy.exc import DBAPIError
+from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncConnection, AsyncEngine, AsyncSession, create_async_engine
 from sqlalchemy.pool import NullPool
 
 from ledger_api.data.base import Base
-from ledger_api.data.errors import sqlstate
+from ledger_api.data.errors import sqlstate, violated_constraint
 from ledger_api.data.models import Account, Ledger
 from ledger_api.domain.account import AccountKind
 from ledger_api.domain.currency import Currency
@@ -18,6 +18,7 @@ from tests.database import (
     ALEMBIC_INI,
     configured_database_url,
     disposable_database_url,
+    posting_role_grants,
     recreate_database,
     run_alembic,
 )
@@ -221,6 +222,96 @@ async def _post_raw_deposit(
             "credit": amount,
         },
     )
+
+
+TRIGGER_FUNCTION_DEFINITION = text(
+    "SELECT pg_get_functiondef('assert_entry_sequence_order'::regproc)"
+)
+HELPER_EXISTS = text(
+    "SELECT to_regprocedure('public.ledger_entries_last_issued_sequence_number()') IS NOT NULL"
+)
+
+
+async def _insert_entries_as_new_role(connection: AsyncConnection, *, helper: bool) -> None:
+    """In the caller's (rolled-back) transaction: a role with the posting privileges but none
+    on the sequence inserts a normally numbered pair of entries."""
+    ledger_id, settlement_id = (
+        await connection.execute(
+            text(
+                "SELECT l.id, a.id FROM ledgers l JOIN accounts a "
+                "ON a.ledger_id = l.id AND a.kind = 'system' WHERE l.currency = 'GBP'"
+            )
+        )
+    ).one()
+    user_id = await connection.scalar(
+        text("INSERT INTO users (email) VALUES (:email) RETURNING id"),
+        {"email": f"role-{uuid.uuid7().hex}@example.com"},
+    )
+    account_id = await connection.scalar(
+        text(
+            "INSERT INTO accounts (ledger_id, user_id, kind) "
+            "VALUES (:ledger, :user, 'customer') RETURNING id"
+        ),
+        {"ledger": ledger_id, "user": user_id},
+    )
+    role = f"ledger_posting_{uuid.uuid7().hex}"
+    await connection.execute(text(f'CREATE ROLE "{role}" NOLOGIN'))
+    for grant in posting_role_grants(role, helper=helper):
+        await connection.execute(text(grant))
+    await connection.execute(text(f'SET LOCAL ROLE "{role}"'))
+    transaction_id = await connection.scalar(
+        text(
+            "INSERT INTO transactions (ledger_id, kind, entry_count) "
+            "VALUES (:ledger, 'deposit', 2) RETURNING id"
+        ),
+        {"ledger": ledger_id},
+    )
+    await connection.execute(
+        text(
+            "INSERT INTO ledger_entries (transaction_id, account_id, ledger_id, amount_minor) "
+            "VALUES (:t, :s, :l, -1), (:t, :a, :l, 1)"
+        ),
+        {"t": transaction_id, "s": settlement_id, "a": account_id, "l": ledger_id},
+    )
+
+
+async def test_0007_lets_a_least_privilege_role_post_and_downgrades_exactly() -> None:
+    server_url = configured_database_url()
+    url = disposable_database_url(server_url, "_sequence_privileges")
+    assert url.database is not None
+    await recreate_database(server_url, url.database)
+    engine = create_async_engine(url, poolclass=NullPool)
+    try:
+        await run_alembic(engine, lambda config: command.upgrade(config, "0006"))
+        async with engine.connect() as connection:
+            definition_0006 = await connection.scalar(TRIGGER_FUNCTION_DEFINITION)
+
+        # The bug, reproduced at 0006: the role cannot read the sequence, the trigger reads
+        # NULL and rejects a perfectly normal entry as "never issued".
+        async with engine.connect() as connection:
+            with pytest.raises(IntegrityError) as excinfo:
+                await _insert_entries_as_new_role(connection, helper=False)
+            await connection.rollback()
+        assert violated_constraint(excinfo.value) == "ck_ledger_entries_sequence_issued"
+
+        await run_alembic(engine, lambda config: command.upgrade(config, "head"))
+        async with engine.connect() as connection:
+            await _insert_entries_as_new_role(connection, helper=True)  # accepted now
+            await connection.rollback()
+            assert await connection.scalar(HELPER_EXISTS) is True
+            assert await connection.scalar(TRIGGER_FUNCTION_DEFINITION) != definition_0006
+
+        await run_alembic(engine, lambda config: command.downgrade(config, "0006"))
+        async with engine.connect() as connection:
+            # 0006's function, restored byte for byte; nothing of 0007 left behind.
+            assert await connection.scalar(TRIGGER_FUNCTION_DEFINITION) == definition_0006
+            assert await connection.scalar(HELPER_EXISTS) is False
+
+        await run_alembic(engine, lambda config: command.upgrade(config, "head"))
+        async with engine.connect() as connection:
+            assert await connection.scalar(HELPER_EXISTS) is True
+    finally:
+        await engine.dispose()
 
 
 async def test_models_match_migrations(engine: AsyncEngine) -> None:

@@ -77,5 +77,8 @@ class LedgerEntry(Base):
     # one account, sequence order is commit order (not across accounts). CACHE 1 keeps values
     # strictly increasing across sessions. Gaps are normal. Never exposed outside the service.
     # GENERATED ALWAYS can be overridden (OVERRIDING SYSTEM VALUE); a trigger (migration 0006)
-    # rejects any number not after the account's latest or never issued by the sequence.
+    # rejects any number not after the account's latest or never issued by the sequence. The
+    # trigger runs as the inserting role; only the sequence read is elevated, through a narrow
+    # SECURITY DEFINER helper (migration 0007), so a role needs EXECUTE on that helper and no
+    # privilege on the sequence itself.
     sequence_number: Mapped[int] = mapped_column(BigInteger, Identity(always=True, cache=1))

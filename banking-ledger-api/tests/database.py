@@ -112,6 +112,26 @@ async def audit_events_about(session: AsyncSession, account_id: uuid.UUID) -> li
     return list((await session.scalars(statement)).all())
 
 
+SEQUENCE_HELPER = "public.ledger_entries_last_issued_sequence_number()"
+
+
+def posting_role_grants(role: str, *, helper: bool = True) -> list[str]:
+    """The privileges a least-privilege role needs to run the posting services (ADR 0012):
+    table privileges, plus EXECUTE on the sequence helper (migration 0007). Deliberately no
+    privilege on any sequence: inserting into an identity column does not need one.
+    """
+    grants = [
+        f'GRANT SELECT ON users, ledgers TO "{role}"',
+        # UPDATE: balance updates, and the FOR UPDATE row locks (protocol and trigger).
+        f'GRANT SELECT, UPDATE ON accounts TO "{role}"',
+        # SELECT: RETURNING clauses and the deferred COMMIT-time checks.
+        f'GRANT SELECT, INSERT ON transactions, ledger_entries, audit_events TO "{role}"',
+    ]
+    if helper:
+        grants.append(f'GRANT EXECUTE ON FUNCTION {SEQUENCE_HELPER} TO "{role}"')
+    return grants
+
+
 async def bypass_triggers(session: AsyncSession) -> None:
     """Disable every trigger (immutability, deferred checks, foreign keys) for the rest of the
     current transaction. TEST-ONLY, and only inside a transaction that is rolled back.
