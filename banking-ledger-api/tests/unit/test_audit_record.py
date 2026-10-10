@@ -3,6 +3,7 @@
 import uuid
 
 import pytest
+from sqlalchemy.exc import DBAPIError
 
 from ledger_api.domain.audit import (
     MAX_DETAILS_BYTES,
@@ -13,7 +14,11 @@ from ledger_api.domain.audit import (
     DetailValue,
 )
 from ledger_api.domain.currency import Currency
-from ledger_api.domain.errors import InsufficientFundsError
+from ledger_api.domain.errors import (
+    CommitOutcomeUnknownError,
+    InsufficientFundsError,
+    TemporarilyUnavailableError,
+)
 from ledger_api.services.audit import AuditContext
 
 ACTOR = uuid.uuid7()
@@ -180,3 +185,46 @@ def test_an_audit_context_records_its_key_on_every_outcome() -> None:
     ]
 
     assert [record.idempotency_key for record in records] == ["deposit-7"] * 3
+
+
+CONNECTION_DETAILS = "connection to 10.0.0.9:5432 as ledger_app reset by peer"
+
+
+def _caused(error: Exception, cause: BaseException) -> Exception:
+    error.__cause__ = cause
+    return error
+
+
+def test_an_unknown_outcome_keeps_the_type_of_a_non_database_cause() -> None:
+    context = AuditContext(AuditAction.POSTING_WITHDRAWAL, ACTOR, idempotency_key="k-1")
+    error = _caused(CommitOutcomeUnknownError(), ConnectionResetError(CONNECTION_DETAILS))
+
+    record = context.failed(error)
+
+    assert record.reason == "outcome_unknown"
+    assert record.details["error_type"] == "CommitOutcomeUnknownError"
+    assert record.details["cause_type"] == "ConnectionResetError"
+    assert "sqlstate" not in record.details  # nothing database-specific is invented
+    # The class name only: never the message, which can quote connection details.
+    assert all(CONNECTION_DETAILS not in str(value) for value in record.details.values())
+
+
+def test_a_contention_error_records_its_database_cause_type_and_sqlstate() -> None:
+    class _DriverError(Exception):
+        sqlstate = "55P03"
+
+    cause = DBAPIError("INSERT ...", None, _DriverError(CONNECTION_DETAILS))
+    context = AuditContext(AuditAction.POSTING_DEPOSIT, ACTOR)
+
+    record = context.failed(_caused(TemporarilyUnavailableError(), cause))
+
+    assert record.details["cause_type"] == "DBAPIError"
+    assert record.details["sqlstate"] == "55P03"
+    assert all(CONNECTION_DETAILS not in str(value) for value in record.details.values())
+
+
+def test_errors_without_a_cause_record_no_cause_type() -> None:
+    context = AuditContext(AuditAction.POSTING_DEPOSIT, ACTOR)
+
+    assert "cause_type" not in context.failed(RuntimeError(CONNECTION_DETAILS)).details
+    assert "cause_type" not in context.failed(TemporarilyUnavailableError()).details

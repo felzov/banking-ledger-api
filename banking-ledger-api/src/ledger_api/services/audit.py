@@ -94,7 +94,11 @@ class AuditContext:
 def _failure_details(error: Exception) -> dict[str, DetailValue]:
     """Identifies the failure without its message: messages can quote data."""
     details: dict[str, DetailValue] = {"error_type": type(error).__name__}
-    # A TemporarilyUnavailableError wraps the database error that caused it.
+    # A TemporarilyUnavailableError or CommitOutcomeUnknownError wraps what caused it. Its type is
+    # kept even when that is not a database error (a connection reset, a driver failure): the
+    # class name only, never its message, which can quote connection details.
+    if isinstance(error, UnavailableError) and error.__cause__ is not None:
+        details["cause_type"] = type(error.__cause__).__name__
     database_error = error.__cause__ if isinstance(error, UnavailableError) else error
     if isinstance(database_error, DBAPIError):
         details["sqlstate"] = sqlstate(database_error)

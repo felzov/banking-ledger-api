@@ -130,3 +130,7 @@ future hardening work for Phase 10 and are not part of Phase 5.
   check. The fallback ERROR log line includes it; a validated key cannot break the line.
 - New reasons: `idempotency_key_mismatch` (rejected) and `outcome_unknown` (failed), see
   ADR 0006 and ADR 0007.
+- Failed events for `temporarily_unavailable` and `outcome_unknown` also carry `cause_type`,
+  the class name of the underlying error, including when it is not a database error (e.g.
+  `ConnectionResetError` during COMMIT). The class name only, never its message, which can
+  quote connection details.

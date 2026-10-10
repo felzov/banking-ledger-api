@@ -14,6 +14,7 @@ Every test checks the persisted state from fresh sessions, not only what the cal
 """
 
 import asyncio
+import logging
 import time
 import uuid
 from collections.abc import AsyncIterator
@@ -158,6 +159,50 @@ async def test_lost_acknowledgement_is_outcome_unknown_and_the_retry_replays(
     assert retried.transaction_id == row.transaction_id
     assert retried.balances == {funded.account_id: FUNDED - AMOUNT}
     assert await _balance(sessionmaker, funded) == FUNDED - AMOUNT  # applied exactly once
+    await _assert_reconciled(sessionmaker)
+
+
+async def test_a_non_database_error_at_commit_is_unknown_and_audited_with_its_type_only(
+    sessionmaker: Maker,
+    funded: FundedAccount,
+    monkeypatch: pytest.MonkeyPatch,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # A raw socket error from the COMMIT path (no DBAPIError around it): the outcome is unknown,
+    # and the audit keeps what caused it by class name, never by message.
+    connection_details = "connection to 10.0.0.9:5432 as ledger_app reset by peer"
+    key = f"reset-{uuid.uuid7().hex}"
+    real_commit = SessionTransaction.commit
+
+    async with sessionmaker() as session:
+        target = session.sync_session
+
+        def reset_instead_of_committing(self: SessionTransaction, *args: Any) -> None:
+            if self.session is target and self.parent is None:
+                monkeypatch.setattr(SessionTransaction, "commit", real_commit)  # once
+                raise ConnectionResetError(connection_details)  # COMMIT never reached the server
+            real_commit(self, *args)
+
+        monkeypatch.setattr(SessionTransaction, "commit", reset_instead_of_committing)
+        with caplog.at_level(logging.DEBUG), pytest.raises(CommitOutcomeUnknownError) as excinfo:
+            await _withdraw(sessionmaker, funded, key, session)
+
+    assert isinstance(excinfo.value.__cause__, ConnectionResetError)
+    # Nothing committed (the session rolled back), and the record says what the caller saw.
+    assert await _key_row(sessionmaker, funded, key) is None
+    assert await _balance(sessionmaker, funded) == FUNDED
+    [unknown] = await _withdrawal_events(sessionmaker, funded)
+    assert (unknown.outcome, unknown.reason) == (AuditOutcome.FAILED, "outcome_unknown")
+    assert unknown.details["error_type"] == "CommitOutcomeUnknownError"
+    assert unknown.details["cause_type"] == "ConnectionResetError"
+    assert "sqlstate" not in unknown.details
+    assert connection_details not in str(unknown.details)
+    assert connection_details not in caplog.text
+
+    retried = await _withdraw(sessionmaker, funded, key)
+
+    assert not retried.replayed
+    assert await _balance(sessionmaker, funded) == FUNDED - AMOUNT
     await _assert_reconciled(sessionmaker)
 
 
