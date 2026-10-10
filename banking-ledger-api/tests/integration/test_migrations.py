@@ -336,7 +336,8 @@ async def _insert_entries_as_new_role(connection: AsyncConnection, *, helper: bo
     )
     role = f"ledger_posting_{uuid.uuid7().hex}"
     await connection.execute(text(f'CREATE ROLE "{role}" NOLOGIN'))
-    for grant in posting_role_grants(role, helper=helper):
+    # idempotency=False: the schema under test may predate 0010; raw inserts never use keys.
+    for grant in posting_role_grants(role, helper=helper, idempotency=False):
         await connection.execute(text(grant))
     await connection.execute(text(f'SET LOCAL ROLE "{role}"'))
     transaction_id = await connection.scalar(
@@ -466,7 +467,8 @@ async def _commit_check_unbalanced_behind_shadows(connection: AsyncConnection) -
     )
     role = f"ledger_posting_{uuid.uuid7().hex}"
     await connection.execute(text(f'CREATE ROLE "{role}" NOLOGIN'))
-    for grant in posting_role_grants(role):
+    # idempotency=False: the schema under test may predate 0010; raw inserts never use keys.
+    for grant in posting_role_grants(role, idempotency=False):
         await connection.execute(text(grant))
     await connection.execute(text(f'SET LOCAL ROLE "{role}"'))
     transaction_id = await connection.scalar(
