@@ -14,9 +14,11 @@ from collections.abc import Awaitable, Callable, Collection
 
 import pytest
 from sqlalchemy import func, select, text
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from ledger_api.data.engine import LOCK_TIMEOUT_MS, create_sessionmaker
+from ledger_api.data.errors import sqlstate
 from ledger_api.data.models import Account, IdempotencyKey, LedgerEntry
 from ledger_api.data.posting import LockedAccount, lock_accounts
 from ledger_api.domain.audit import AuditOutcome
@@ -253,14 +255,16 @@ async def test_a_holder_beyond_lock_timeout_makes_the_waiter_unavailable_then_re
     account = await commit_funded_account(sessionmaker, 5_000)
     key = _key()
     claimed = asyncio.Event()
-    calls = 0
+    # lock_accounts calls per session: the holder's and the waiter's are counted apart.
+    lock_calls: Counter[int] = Counter()
+    holder_session: list[int] = []
 
     async def slow_first_holder(
         session: AsyncSession, account_ids: Collection[uuid.UUID]
     ) -> dict[uuid.UUID, LockedAccount]:
-        nonlocal calls
-        calls += 1
-        if calls == 1:  # holds its claim (uncommitted) longer than lock_timeout
+        lock_calls[id(session)] += 1
+        if not holder_session:  # the holder: it has claimed the key; keep the claim open
+            holder_session.append(id(session))
             claimed.set()
             await asyncio.sleep(LOCK_TIMEOUT_MS / 1000 + 0.5)
         return await lock_accounts(session, account_ids)
@@ -275,21 +279,37 @@ async def test_a_holder_beyond_lock_timeout_makes_the_waiter_unavailable_then_re
     await claimed.wait()
 
     # The waiter gives up after lock_timeout: 503, nothing written, no key of its own.
-    with pytest.raises(TemporarilyUnavailableError):
-        await run(_withdrawal(account, 700, key))
+    async with sessionmaker() as waiter_session:
+        with pytest.raises(TemporarilyUnavailableError) as excinfo:
+            await _withdrawal(account, 700, key)(waiter_session)
+        # It timed out in the key claim, before ever trying to lock an account...
+        assert lock_calls[id(waiter_session)] == 0
+    assert not first.done()  # ...while the holder still held its claim open
+    timeout = excinfo.value.__cause__
+    assert isinstance(timeout, DBAPIError)
+    assert sqlstate(timeout) == "55P03"  # lock_not_available: lock_timeout
+    assert "INSERT INTO idempotency_keys" in str(timeout.statement)  # the claim itself
+
     original = await first
     replayed = await run(_withdrawal(account, 700, key))  # the client's retry
 
     assert not original.replayed
     assert replayed.replayed
     assert replayed.transaction_id == original.transaction_id
+    assert lock_calls[holder_session[0]] == 1
     assert await _balance(sessionmaker, account) == 4_300
+    # The waiter's own audit event: this account, this key, failed. Exactly one exists, and it
+    # cannot be the holder's (succeeded, with a transaction) or the funding deposit's (no key).
     async with sessionmaker() as session:
-        _funding, *events = await audit_events_about(session, account.account_id)
-    assert Counter((event.outcome, event.reason) for event in events) == {
-        (AuditOutcome.FAILED, "temporarily_unavailable"): 1,
-        (AuditOutcome.SUCCEEDED, None): 1,
-    }
+        events = await audit_events_about(session, account.account_id)
+    keyed = [event for event in events if event.idempotency_key == key]
+    [waiter_event] = [event for event in keyed if event.outcome == AuditOutcome.FAILED]
+    assert waiter_event.reason == "temporarily_unavailable"
+    assert waiter_event.details["sqlstate"] == "55P03"
+    assert "attempted_transaction_id" not in waiter_event.details  # it never built a header
+    assert [
+        (event.outcome, event.transaction_id) for event in keyed if event is not waiter_event
+    ] == [(AuditOutcome.SUCCEEDED, original.transaction_id)]
     await _assert_reconciled(sessionmaker)
 
 
