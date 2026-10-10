@@ -227,8 +227,11 @@ async def test_failed_rejection_audit_preserves_the_business_error_and_logs_it(
     message = log.getMessage()
     assert "action=posting.withdrawal outcome=rejected reason=insufficient_funds" in message
     assert str(funded.account_id) in message  # the log is the fallback audit sink
-    assert test_database_url.password is not None
-    assert test_database_url.password not in caplog.text
+    # No connection details in the fallback log: neither the URL nor, when set, its password.
+    # (CI connects without a password: trust auth keeps every credential out of git.)
+    assert test_database_url.render_as_string(hide_password=False) not in caplog.text
+    if test_database_url.password is not None:
+        assert str(test_database_url.password) not in caplog.text
 
 
 async def test_failed_success_audit_rolls_back_the_posting(
