@@ -35,6 +35,7 @@ async def insert_audit_event(session: AsyncSession, record: AuditRecord) -> None
             actor_user_id=actor_user_id,
             reason=record.reason,
             transaction_id=record.transaction_id,
+            idempotency_key=record.idempotency_key,
             details=stored_details,
         )
     )

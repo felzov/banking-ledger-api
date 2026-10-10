@@ -13,6 +13,8 @@ from ledger_api.domain.audit import (
     DetailValue,
 )
 from ledger_api.domain.currency import Currency
+from ledger_api.domain.errors import InsufficientFundsError
+from ledger_api.services.audit import AuditContext
 
 ACTOR = uuid.uuid7()
 TRANSACTION = uuid.uuid7()
@@ -135,3 +137,46 @@ def test_details_are_size_limited() -> None:
             reason="x",
             details={"blob": "x" * MAX_DETAILS_BYTES},
         )
+
+
+# --- idempotency keys (ADR 0006) ---------------------------------------------------------------
+
+
+@pytest.mark.parametrize("key", ["k", "K" * 255, "order:42/retry#1"])
+def test_a_valid_idempotency_key_is_kept(key: str) -> None:
+    record = AuditRecord(
+        AuditAction.POSTING_DEPOSIT,
+        AuditOutcome.REJECTED,
+        actor_user_id=ACTOR,
+        reason="insufficient_funds",
+        idempotency_key=key,
+    )
+
+    assert record.idempotency_key == key
+    assert "idempotency_key" not in record.details
+
+
+@pytest.mark.parametrize(
+    "key", ["", "K" * 256, "with space", "caf\N{LATIN SMALL LETTER E WITH ACUTE}"]
+)
+def test_an_invalid_idempotency_key_is_a_programming_error(key: str) -> None:
+    with pytest.raises(ValueError, match="idempotency key"):
+        AuditRecord(
+            AuditAction.POSTING_DEPOSIT,
+            AuditOutcome.REJECTED,
+            actor_user_id=ACTOR,
+            reason="insufficient_funds",
+            idempotency_key=key,
+        )
+
+
+def test_an_audit_context_records_its_key_on_every_outcome() -> None:
+    context = AuditContext(AuditAction.POSTING_DEPOSIT, ACTOR, idempotency_key="deposit-7")
+
+    records = [
+        context.succeeded(transaction_id=TRANSACTION),
+        context.rejected(InsufficientFundsError()),
+        context.failed(RuntimeError("boom")),
+    ]
+
+    assert [record.idempotency_key for record in records] == ["deposit-7"] * 3
