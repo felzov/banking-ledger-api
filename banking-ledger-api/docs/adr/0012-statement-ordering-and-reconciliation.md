@@ -90,11 +90,19 @@ Since 0007 the trigger reads it through `public.ledger_entries_last_issued_seque
 | `EXECUTE` revoked from `PUBLIC` | The value reveals global entry volume. The owner keeps it |
 
 **Privilege contract of a least-privilege posting role** (asserted by
-`tests/database.py:posting_role_grants`): `SELECT` on `users`, `ledgers`; `SELECT, UPDATE` on
-`accounts` (balances and `FOR UPDATE` locks); `SELECT, INSERT` on `transactions`,
+`tests/database.py:posting_role_grants`): `SELECT` on `users`, `ledgers`; `SELECT` on `accounts`
+and `UPDATE` on `accounts.balance_minor` **only**; `SELECT, INSERT` on `transactions`,
 `ledger_entries`, `audit_events`; `EXECUTE` on the helper. **Nothing** on any sequence. Without
 the `EXECUTE` grant, an insert fails loudly with `42501 permission denied for function
 ledger_entries_last_issued_sequence_number`, never with a misleading check violation.
+
+The column-level `UPDATE` is all posting needs: `apply_balance_deltas` writes `balance_minor`
+and nothing else, and `SELECT ... FOR UPDATE` (the protocol's lock and the ordering trigger's)
+requires `UPDATE` on at least one column of the table, not on all of them. A table-wide
+`UPDATE` would also let the role rewrite `user_id`, `kind` or `ledger_id`, e.g. reassign a
+customer's account to another user, with no ledger entry, no audit event and nothing for
+reconciliation to find. Tests run the posting services under the narrowed grant and show that
+each of those columns is refused (`42501`).
 
 **Name resolution (migration 0008).** Until 0008 the trigger function named `accounts` and
 `ledger_entries` without a schema and used the caller's `search_path`. For unqualified relation

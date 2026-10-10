@@ -37,6 +37,7 @@ from ledger_api.data.engine import create_sessionmaker
 from ledger_api.data.errors import sqlstate, violated_constraint
 from ledger_api.data.models import Account, AuditEvent, LedgerEntry
 from ledger_api.domain.audit import AuditOutcome
+from ledger_api.domain.currency import Currency
 from ledger_api.domain.errors import InsufficientFundsError
 from ledger_api.services import audit as audit_service
 from ledger_api.services import posting as posting_service
@@ -505,6 +506,120 @@ async def test_temporary_tables_cannot_fail_a_valid_transaction(
     await _shadow_balance_check(db_connection, transaction_id, declared=None, amounts=[])
 
     await db_connection.execute(text("SET CONSTRAINTS ALL IMMEDIATE"))
+
+
+# --- the accounts columns the role may write (UPDATE on balance_minor only) ---------------------
+
+
+async def _running_as(db_connection: AsyncConnection, role: str) -> None:
+    """Asserted in the transaction of the statement that follows, not once at setup."""
+    user, superuser = (
+        await db_connection.execute(
+            text("SELECT current_user, current_setting('is_superuser') = 'on'")
+        )
+    ).one()
+    assert (user, superuser) == (role, False)
+
+
+async def _refused(db_connection: AsyncConnection, statement: str, **params: Any) -> str | None:
+    """Run `statement` in a savepoint and return its SQLSTATE (None if it succeeded)."""
+    nested = await db_connection.begin_nested()
+    try:
+        await db_connection.execute(text(statement), params)
+    except DBAPIError as error:
+        await nested.rollback()
+        return sqlstate(error)
+    await nested.rollback()
+    return None
+
+
+async def test_role_may_update_only_the_balance_of_an_account(
+    db_connection: AsyncConnection, pair: tuple[Account, Account]
+) -> None:
+    role = await _switch_to_new_posting_role(db_connection)
+    privileges = (
+        await db_connection.execute(
+            text(
+                "SELECT has_table_privilege(:r, 'public.accounts', 'SELECT'), "
+                "has_table_privilege(:r, 'public.accounts', 'UPDATE'), "
+                "has_column_privilege(:r, 'public.accounts', 'balance_minor', 'UPDATE'), "
+                "has_any_column_privilege(:r, 'public.accounts', 'UPDATE') "
+                "AND NOT has_column_privilege(:r, 'public.accounts', 'user_id', 'UPDATE') "
+                "AND NOT has_column_privilege(:r, 'public.accounts', 'kind', 'UPDATE') "
+                "AND NOT has_column_privilege(:r, 'public.accounts', 'ledger_id', 'UPDATE')"
+            ),
+            {"r": role},
+        )
+    ).one()
+    assert tuple(privileges) == (True, False, True, True)
+
+    # What posting does to accounts, as the role: lock rows (FOR UPDATE needs UPDATE on some
+    # column, not on all of them), then a relative balance update returning the new balance.
+    await _running_as(db_connection, role)
+    locked = await db_connection.scalar(
+        text("SELECT count(*) FROM (SELECT 1 FROM public.accounts WHERE id = :a FOR UPDATE) l"),
+        {"a": pair[0].id},
+    )
+    balance = await db_connection.scalar(
+        text(
+            "UPDATE public.accounts SET balance_minor = balance_minor + 0 "
+            "WHERE id = :a RETURNING balance_minor"
+        ),
+        {"a": pair[0].id},
+    )
+    assert (locked, balance) == (1, 0)
+
+
+@pytest.mark.parametrize("column", ["user_id", "kind", "ledger_id"])
+async def test_role_cannot_change_an_accounts_identity(
+    db_connection: AsyncConnection,
+    db_session: AsyncSession,
+    pair: tuple[Account, Account],
+    column: str,
+) -> None:
+    account = pair[0]
+    other = await create_customer_account(db_session, Currency.EUR)  # another user and ledger
+    role = await _switch_to_new_posting_role(db_connection)
+    new_value = {"user_id": other.user_id, "kind": "system", "ledger_id": other.ledger_id}[column]
+
+    await _running_as(db_connection, role)
+    refused = await _refused(
+        db_connection,
+        f"UPDATE public.accounts SET {column} = :value WHERE id = :a",  # noqa: S608
+        value=new_value,
+        a=account.id,
+    )
+
+    assert refused == "42501"  # insufficient_privilege, before any constraint is consulted
+
+
+async def test_role_cannot_reassign_a_customers_account(
+    db_connection: AsyncConnection,
+    db_session: AsyncSession,
+    new_session: SessionFactory,
+    pair: tuple[Account, Account],
+) -> None:
+    # The M1 scenario: with table-wide UPDATE this succeeded. The new owner has no GBP account,
+    # so no constraint would have stopped it; only the missing privilege does.
+    victim, _ = pair
+    thief = await create_customer_account(db_session, Currency.EUR)
+    role = await _switch_to_new_posting_role(db_connection)
+    await _fund(new_session, victim, 500)  # the role can post to the account...
+
+    await _running_as(db_connection, role)
+    refused = await _refused(
+        db_connection,
+        "UPDATE public.accounts SET user_id = :thief WHERE id = :victim",
+        thief=thief.user_id,
+        victim=victim.id,
+    )
+
+    assert refused == "42501"  # ...but not take it over
+    owner = await db_connection.scalar(
+        text("SELECT user_id FROM public.accounts WHERE id = :a"), {"a": victim.id}
+    )
+    assert owner == victim.user_id
+    await check_deferred_constraints(db_session)  # the funding still passes, as the role
 
 
 # --- the helper's boundary -----------------------------------------------------------------------

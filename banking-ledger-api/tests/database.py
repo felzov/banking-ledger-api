@@ -122,8 +122,12 @@ def posting_role_grants(role: str, *, helper: bool = True) -> list[str]:
     """
     grants = [
         f'GRANT SELECT ON users, ledgers TO "{role}"',
-        # UPDATE: balance updates, and the FOR UPDATE row locks (protocol and trigger).
-        f'GRANT SELECT, UPDATE ON accounts TO "{role}"',
+        # UPDATE on balance_minor only: the balance updates, and the FOR UPDATE row locks
+        # (protocol and trigger), which need UPDATE on at least one column. Never on user_id,
+        # kind or ledger_id: ownership and account identity are not the posting role's to
+        # change, and such a change would leave no ledger entry or audit event.
+        f'GRANT SELECT ON accounts TO "{role}"',
+        f'GRANT UPDATE (balance_minor) ON accounts TO "{role}"',
         # SELECT: RETURNING clauses and the deferred COMMIT-time checks.
         f'GRANT SELECT, INSERT ON transactions, ledger_entries, audit_events TO "{role}"',
     ]
