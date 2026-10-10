@@ -323,6 +323,7 @@ async def _timed(coroutine: Any) -> tuple[Any, float]:
     return result, time.monotonic()
 
 
+@pytest.mark.concurrency
 @pytest.mark.usefixtures("slow_commits")
 async def test_a_retry_waits_for_a_commit_in_progress_and_replays_it(
     sessionmaker: Maker, engine: AsyncEngine, funded: FundedAccount
@@ -351,6 +352,7 @@ async def test_a_retry_waits_for_a_commit_in_progress_and_replays_it(
     await _assert_reconciled(sessionmaker)
 
 
+@pytest.mark.concurrency
 @pytest.mark.usefixtures("slow_commits")
 async def test_a_retry_waits_for_a_commit_in_progress_and_runs_if_that_commit_fails(
     sessionmaker: Maker,
