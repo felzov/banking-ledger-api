@@ -1,6 +1,6 @@
 """Maps errors to HTTP responses. Every error body has the shape {"code", "detail"}."""
 
-from typing import Any, Literal
+from typing import Any, ClassVar, Literal
 
 from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
@@ -30,6 +30,33 @@ STATUS_BY_CATEGORY: dict[type[DomainError], int] = {
 SAFE_VALIDATION_FIELDS = ("type", "loc", "msg")
 
 
+class ApiError(Exception):
+    """A request the HTTP layer refuses before any service runs (so it is never audited).
+
+    Unlike DomainError, these are about HTTP itself (headers), so they carry their status.
+    """
+
+    status_code: ClassVar[int]
+    code: ClassVar[str]
+    message: ClassVar[str]
+
+    def __init__(self) -> None:
+        super().__init__(self.message)
+
+
+class IdempotencyKeyRequiredError(ApiError):
+    status_code = status.HTTP_428_PRECONDITION_REQUIRED
+    code = "idempotency_key_required"
+    message = "This request requires an Idempotency-Key header."
+
+
+class InvalidIdempotencyKeyError(ApiError):
+    # The submitted value is never echoed back.
+    status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
+    code = "invalid_idempotency_key"
+    message = "The Idempotency-Key header must be one value of 1-255 visible ASCII characters."
+
+
 class ErrorResponse(BaseModel):
     code: str
     detail: str
@@ -53,6 +80,13 @@ async def _domain_error(request: Request, exc: Exception) -> JSONResponse:
         raise exc
     body = ErrorResponse(code=exc.code, detail=exc.message)
     return JSONResponse(status_code=status_for(exc), content=body.model_dump())
+
+
+async def _api_error(request: Request, exc: Exception) -> JSONResponse:
+    if not isinstance(exc, ApiError):  # registered for ApiError only
+        raise exc
+    body = ErrorResponse(code=exc.code, detail=exc.message)
+    return JSONResponse(status_code=exc.status_code, content=body.model_dump())
 
 
 async def _validation_error(request: Request, exc: Exception) -> JSONResponse:
@@ -79,6 +113,7 @@ async def _unexpected_error(request: Request, exc: Exception) -> JSONResponse:
 
 def register_error_handlers(app: FastAPI) -> None:
     app.add_exception_handler(DomainError, _domain_error)
+    app.add_exception_handler(ApiError, _api_error)
     app.add_exception_handler(RequestValidationError, _validation_error)
     app.add_exception_handler(Exception, _unexpected_error)
 
