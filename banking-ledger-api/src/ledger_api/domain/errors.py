@@ -85,6 +85,13 @@ class InsufficientFundsError(RuleViolationError):
     message = "The account balance is insufficient."
 
 
+class IdempotencyKeyMismatchError(RuleViolationError):
+    # The key was already consumed by a different request of the same user (ADR 0006). Keys are
+    # scoped per user, so this reveals nothing about anyone else's keys.
+    code = "idempotency_key_mismatch"
+    message = "This Idempotency-Key was already used for a different request."
+
+
 class InvalidStatementLimitError(RuleViolationError):
     code = "invalid_statement_limit"
     message = "The page size must be a whole number within the allowed range."

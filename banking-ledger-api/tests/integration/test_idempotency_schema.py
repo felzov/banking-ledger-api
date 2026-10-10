@@ -84,8 +84,8 @@ async def test_the_same_key_may_be_used_by_different_users(db_session: AsyncSess
         "with space",
         "tab\tkey",
         "del\x7fkey",
-        "café",  # é: not ASCII
-        "İ",  # İ
+        "caf\N{LATIN SMALL LETTER E WITH ACUTE}",
+        "\N{LATIN CAPITAL LETTER I WITH DOT ABOVE}",
         "line\nbreak",
     ],
 )
