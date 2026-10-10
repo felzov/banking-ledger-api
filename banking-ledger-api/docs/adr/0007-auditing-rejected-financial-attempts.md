@@ -67,3 +67,18 @@ Implemented as described in [ADR 0011](0011-audit-trail.md), with these correcti
   so there is no "inactive account" rejection.
 - **Scope** also covers `user.register` and `account.open` (ADR 0011).
 - **Idempotency mismatch** (`idempotency_key_mismatch`) arrives with Phase 6.
+
+## Amendment (Phase 6, 2026-10-10)
+
+- **Idempotency mismatch** is implemented: the same key with a different request is
+  `rejected` with reason `idempotency_key_mismatch`, written after the (empty) transaction
+  rolls back, like any rejection.
+- **Idempotent replays** write nothing and remain unaudited (logs only: an INFO line with the
+  user and transaction ids, not the key).
+- **Unknown COMMIT outcome** is `failed` with reason `outcome_unknown` (ADR 0006). If the COMMIT
+  did happen, the posting's own `succeeded` event committed with it, and
+  `find_failed_events_for_committed_transactions` reports the pair.
+- Every posting event, whatever its outcome, records the request's `Idempotency-Key` in
+  `audit_events.idempotency_key`.
+- A missing or malformed `Idempotency-Key` header is refused by the API before any service
+  runs (428, 422) and is not audited, like a malformed body.

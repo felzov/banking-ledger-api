@@ -113,3 +113,18 @@ timeout would post twice.
   `same_account_transfer` produce rejected events too. It still runs before BEGIN.
 - `ledger_entries.sequence_number` is drawn while the account locks are held. This makes
   lock-before-insert load-bearing for statement ordering as well (ADR 0012).
+
+## Amendment (Phase 6, 2026-10-10)
+
+- **Step 2a, the idempotency claim** (ADR 0006): right after `BEGIN`, before the settlement
+  lookup and the account lock, a keyed posting claims its key with
+  `INSERT ... ON CONFLICT DO NOTHING`, using a transaction id generated for this attempt. A
+  committed key either replays the original result (no further steps) or is refused. Each
+  retry attempt claims again; a rolled-back attempt takes its claim with it. The lock order is
+  now "key, then accounts (ascending id)", still free of cycles.
+- **HTTP endpoints** for deposits, withdrawals and transfers exist (ADR 0006).
+- **Failures during COMMIT** are split. Errors PostgreSQL reports for the COMMIT (classes 23 and
+  40, `55P03`, `57014`) are definite rollbacks and keep the table above. Anything else (a lost
+  connection, a driver or network error) is `outcome_unknown` (503): never retried in-process,
+  never reported as a failure. The known limitation above ("the client cannot know whether the
+  posting committed") is resolved by retrying with the same key.
