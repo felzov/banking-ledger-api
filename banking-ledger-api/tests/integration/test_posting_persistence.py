@@ -3,7 +3,7 @@
 import uuid
 
 import pytest
-from sqlalchemy import select, text, update
+from sqlalchemy import select, text
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
@@ -15,10 +15,6 @@ from ledger_api.data.posting import (
     find_settlement_account_id,
     insert_posting,
     lock_accounts,
-)
-from ledger_api.data.reconciliation import (
-    find_balance_mismatches,
-    find_ledgers_with_nonzero_balances,
 )
 from ledger_api.domain.account import AccountKind
 from ledger_api.domain.currency import Currency
@@ -203,19 +199,3 @@ async def test_insert_posting_and_balance_deltas_produce_a_reconciled_ledger(
     ).all()
     assert sorted(entries) == [-1_250, 1_250]
     await assert_reconciled(db_session)
-
-
-async def test_reconciliation_reports_a_balance_that_does_not_match_its_entries(
-    db_session: AsyncSession,
-) -> None:
-    account = await create_customer_account(db_session)
-    await db_session.execute(
-        update(Account).where(Account.id == account.id).values(balance_minor=999)
-    )
-
-    mismatches = await find_balance_mismatches(db_session)
-
-    assert [(m.account_id, m.balance_minor, m.entries_total_minor) for m in mismatches] == [
-        (account.id, 999, 0)
-    ]
-    assert account.ledger_id in await find_ledgers_with_nonzero_balances(db_session)

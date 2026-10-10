@@ -7,11 +7,14 @@ Lifecycle of every posting, inside ONE database transaction:
   3. resolve immutable facts (the settlement account of an account's ledger)
   4. lock every account of the posting: one statement, ascending id, FOR UPDATE OF accounts
   5. validate against the locked rows only: ownership, counterparty, currency, funds
-  6. write: transaction header (sealed with entry_count), entries, relative balance updates
+  6. write: transaction header (sealed with entry_count), entries, relative balance updates,
+     and, last, the succeeded audit event (ADR 0011)
   7. COMMIT: deferred triggers check >= 2 entries, sum zero, count = entry_count
 
-Any error rolls back everything, releasing the locks: nothing partial is ever committed.
-No I/O other than this session happens between BEGIN and COMMIT.
+Any error rolls back everything, the success audit event included, releasing the locks:
+nothing partial is ever committed. No I/O other than this session happens between BEGIN and
+COMMIT. A rejected or failed posting is audited after the rollback, in a transaction of its
+own (services.audit.audited), and its original error is re-raised unchanged.
 
 Transient failures retry the WHOLE transaction (steps 2-7), never a part of it: a deadlock
 or serialization failure up to MAX_ATTEMPTS in total, with jittered backoff. A lock or
@@ -40,6 +43,7 @@ from ledger_api.data.posting import (
     lock_accounts,
 )
 from ledger_api.domain.account import AccountKind
+from ledger_api.domain.audit import AuditAction, DetailValue
 from ledger_api.domain.errors import (
     AccountNotFoundError,
     CurrencyMismatchError,
@@ -55,6 +59,7 @@ from ledger_api.domain.posting import (
     withdrawal_posting,
 )
 from ledger_api.domain.transaction import TransactionKind
+from ledger_api.services.audit import AuditContext, audited, record_in_transaction
 
 logger = logging.getLogger(__name__)
 
@@ -81,32 +86,54 @@ async def deposit(
     session: AsyncSession, *, owner_id: uuid.UUID, account_id: uuid.UUID, amount_minor: int
 ) -> PostingResult:
     """Credit owner_id's account with money arriving from outside (the settlement account)."""
-    validate_amount(amount_minor)
+    context = AuditContext(
+        AuditAction.POSTING_DEPOSIT,
+        owner_id,
+        {"account_id": account_id, "amount_minor": _amount_detail(amount_minor)},
+    )
 
-    async def attempt() -> PostingResult:
-        settlement_id = await _settlement_account_of(session, account_id)
-        posting = deposit_posting(
-            account_id=account_id, settlement_account_id=settlement_id, amount_minor=amount_minor
-        )
-        return await _post(session, posting, owner_id=owner_id, owned={account_id})
+    async def run() -> PostingResult:
+        validate_amount(amount_minor)
 
-    return await _in_transaction(session, attempt)
+        async def attempt() -> PostingResult:
+            settlement_id = await _settlement_account_of(session, account_id)
+            posting = deposit_posting(
+                account_id=account_id,
+                settlement_account_id=settlement_id,
+                amount_minor=amount_minor,
+            )
+            return await _post(session, posting, context, owner_id=owner_id, owned={account_id})
+
+        return await _in_transaction(session, context, attempt)
+
+    return await audited(session, context, run)
 
 
 async def withdraw(
     session: AsyncSession, *, owner_id: uuid.UUID, account_id: uuid.UUID, amount_minor: int
 ) -> PostingResult:
     """Debit owner_id's account with money leaving to outside (the settlement account)."""
-    validate_amount(amount_minor)
+    context = AuditContext(
+        AuditAction.POSTING_WITHDRAWAL,
+        owner_id,
+        {"account_id": account_id, "amount_minor": _amount_detail(amount_minor)},
+    )
 
-    async def attempt() -> PostingResult:
-        settlement_id = await _settlement_account_of(session, account_id)
-        posting = withdrawal_posting(
-            account_id=account_id, settlement_account_id=settlement_id, amount_minor=amount_minor
-        )
-        return await _post(session, posting, owner_id=owner_id, owned={account_id})
+    async def run() -> PostingResult:
+        validate_amount(amount_minor)
 
-    return await _in_transaction(session, attempt)
+        async def attempt() -> PostingResult:
+            settlement_id = await _settlement_account_of(session, account_id)
+            posting = withdrawal_posting(
+                account_id=account_id,
+                settlement_account_id=settlement_id,
+                amount_minor=amount_minor,
+            )
+            return await _post(session, posting, context, owner_id=owner_id, owned={account_id})
+
+        return await _in_transaction(session, context, attempt)
+
+    return await audited(session, context, run)
 
 
 async def transfer(
@@ -118,29 +145,50 @@ async def transfer(
     amount_minor: int,
 ) -> PostingResult:
     """Move money from owner_id's account to any customer account in the same currency."""
-    posting = transfer_posting(
-        source_account_id=source_account_id,
-        destination_account_id=destination_account_id,
-        amount_minor=amount_minor,
+    context = AuditContext(
+        AuditAction.POSTING_TRANSFER,
+        owner_id,
+        {
+            "account_id": source_account_id,
+            "destination_account_id": destination_account_id,
+            "amount_minor": _amount_detail(amount_minor),
+        },
     )
 
-    async def attempt() -> PostingResult:
-        return await _post(
-            session,
-            posting,
-            owner_id=owner_id,
-            owned={source_account_id},
-            counterparty=destination_account_id,
+    async def run() -> PostingResult:
+        posting = transfer_posting(
+            source_account_id=source_account_id,
+            destination_account_id=destination_account_id,
+            amount_minor=amount_minor,
         )
 
-    return await _in_transaction(session, attempt)
+        async def attempt() -> PostingResult:
+            return await _post(
+                session,
+                posting,
+                context,
+                owner_id=owner_id,
+                owned={source_account_id},
+                counterparty=destination_account_id,
+            )
+
+        return await _in_transaction(session, context, attempt)
+
+    return await audited(session, context, run)
+
+
+def _amount_detail(amount_minor: object) -> DetailValue:
+    # The requested amount, for the audit trail. Only a real int is recorded: anything else is
+    # invalid_amount, and must not turn into a second error while building the audit record.
+    return amount_minor if type(amount_minor) is int else None
 
 
 async def _in_transaction(
-    session: AsyncSession, attempt: Callable[[], Awaitable[PostingResult]]
+    session: AsyncSession, context: AuditContext, attempt: Callable[[], Awaitable[PostingResult]]
 ) -> PostingResult:
     """Run `attempt` in its own transaction, retrying the whole of it on transient failures."""
     for number in range(1, MAX_ATTEMPTS + 1):
+        context.attempted_transaction_id = None  # set by _post once this attempt's header exists
         try:
             async with session.begin():
                 return await attempt()
@@ -170,6 +218,7 @@ async def _settlement_account_of(session: AsyncSession, account_id: uuid.UUID) -
 async def _post(
     session: AsyncSession,
     posting: Posting,
+    context: AuditContext,
     *,
     owner_id: uuid.UUID,
     owned: Collection[uuid.UUID],
@@ -181,9 +230,12 @@ async def _post(
     # Every line's account is locked and validated: only now may anything be written.
     ledger_id = locked[posting.lines[0].account_id].ledger_id
     transaction = await insert_posting(session, posting, ledger_id=ledger_id)
+    context.attempted_transaction_id = transaction.id
     balances = await apply_balance_deltas(
         session, {line.account_id: line.amount_minor for line in posting.lines}
     )
+    # Last write: the success event commits with the posting, or not at all (ADR 0011).
+    await record_in_transaction(session, context.succeeded(transaction_id=transaction.id))
     return PostingResult(
         transaction_id=transaction.id,
         kind=posting.kind,

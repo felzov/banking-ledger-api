@@ -29,6 +29,11 @@ class UnavailableError(DomainError):
     """A transient condition (contention): nothing happened, and retrying may succeed."""
 
 
+class InternalError(DomainError):
+    """The service detected that its own data is inconsistent. Fails closed: the caller gets
+    no result rather than a possibly wrong one, and no detail about what was found."""
+
+
 class UserNotFoundError(NotFoundError):
     code = "user_not_found"
     message = "User not found."
@@ -78,6 +83,24 @@ class CurrencyMismatchError(RuleViolationError):
 class InsufficientFundsError(RuleViolationError):
     code = "insufficient_funds"
     message = "The account balance is insufficient."
+
+
+class InvalidStatementLimitError(RuleViolationError):
+    code = "invalid_statement_limit"
+    message = "The page size must be a whole number within the allowed range."
+
+
+class InvalidStatementCursorError(RuleViolationError):
+    # Unknown, or an entry of another account: indistinguishable.
+    code = "invalid_statement_cursor"
+    message = "The statement cursor is not valid for this account."
+
+
+class StatementInconsistencyError(InternalError):
+    # The account's balance differs from the sum of its entries (ADR 0012). Same code and
+    # message as any unexpected error: what was detected stays in the server log.
+    code = "internal_error"
+    message = "Internal server error."
 
 
 class TemporarilyUnavailableError(UnavailableError):

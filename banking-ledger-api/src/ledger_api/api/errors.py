@@ -10,6 +10,7 @@ from pydantic import BaseModel
 from ledger_api.domain.errors import (
     ConflictError,
     DomainError,
+    InternalError,
     NotFoundError,
     RuleViolationError,
     UnavailableError,
@@ -21,6 +22,7 @@ STATUS_BY_CATEGORY: dict[type[DomainError], int] = {
     ConflictError: status.HTTP_409_CONFLICT,
     RuleViolationError: status.HTTP_422_UNPROCESSABLE_CONTENT,
     UnavailableError: status.HTTP_503_SERVICE_UNAVAILABLE,
+    InternalError: status.HTTP_500_INTERNAL_SERVER_ERROR,
 }
 
 # Fields of a validation error that are safe to return. Pydantic's "input" echoes the

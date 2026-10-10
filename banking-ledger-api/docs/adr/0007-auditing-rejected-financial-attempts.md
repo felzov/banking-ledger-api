@@ -53,3 +53,17 @@ What gets a database audit row:
   observability, not in ledger correctness.
 - The audit session is opened only after the main session is released. Acquiring a second
   connection while holding the first can deadlock the pool under load.
+
+## Amendment (Phase 5, 2026-10-10)
+
+Implemented as described in [ADR 0011](0011-audit-trail.md), with these corrections:
+
+- **Same session, new transaction.** Services receive a caller-owned session, not a
+  sessionmaker. Once the business transaction has rolled back, its connection is back in the
+  pool, so the audit write opens a new transaction **on the same session**. The invariant this
+  ADR cares about (never hold two connections) is kept, and tested with a one-connection pool.
+- **Reason codes** are the codes the services actually raise: a foreign or system account is
+  `account_not_found` (ADR 0009), not `account_not_accessible`. There is no account status,
+  so there is no "inactive account" rejection.
+- **Scope** also covers `user.register` and `account.open` (ADR 0011).
+- **Idempotency mismatch** (`idempotency_key_mismatch`) arrives with Phase 6.

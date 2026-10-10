@@ -3,15 +3,20 @@
 A production-oriented banking backend built around a **double-entry ledger**: ACID money
 movement, concurrency control, idempotent APIs, and an append-only audit trail.
 
-> **Status: Phase 4 of 10. Ledger and transaction posting.**
+> **Status: Phase 5 of 10. Audit trail, statements and reconciliation.**
 > Users can be registered and customer accounts opened and read. A concurrency-safe posting
-> engine moves money (deposits, withdrawals, transfers) at the service layer; HTTP endpoints
-> for it arrive in Phase 6 together with idempotency keys. The full design is documented in
-> the [ADRs](docs/adr/).
+> engine moves money (deposits, withdrawals, transfers) at the service layer, every attempt is
+> recorded in an append-only audit trail, and account statements with running balances are
+> available at the service layer. HTTP endpoints for money movement and statements arrive in
+> Phases 6 and 7. The full design is documented in the [ADRs](docs/adr/).
 
 > [!WARNING]
 > **The API is unauthenticated until Phase 8.** Anyone who knows a user ID can act as that
 > user. Do not expose it to untrusted clients. See [ADR 0009](docs/adr/0009-owner-scoped-access-and-error-responses.md).
+>
+> **The application connects to PostgreSQL as a superuser** (the Compose bootstrap role). The
+> append-only triggers protect against application bugs, not against that role, which can
+> disable them. Least-privilege database roles are planned hardening (Phase 10).
 
 All data is synthetic. No real financial information, credentials or personal data are used.
 
@@ -127,11 +132,22 @@ Every error body is `{"code": "...", "detail": ...}`:
 seeds one ledger per supported currency (GBP, EUR), each with its external settlement account.
 [`0002_seal_transactions_with_entry_count`](migrations/versions/0002_seal_transactions_with_entry_count.py)
 seals every transaction with its declared number of entries.
+[`0003`](migrations/versions/0003_forbid_truncating_ledger_tables.py) forbids TRUNCATE on the
+ledger tables, [`0004`](migrations/versions/0004_add_audit_events.py) adds the audit trail and
+[`0005`](migrations/versions/0005_order_ledger_entries.py) gives entries a commit-ordered
+sequence number, [`0006`](migrations/versions/0006_enforce_entry_sequence_order.py) rejects
+entries numbered out of order, and [`0007`](migrations/versions/0007_read_entry_sequence_as_definer.py)
+lets that check work for a least-privilege role (a narrow `SECURITY DEFINER` sequence read);
+[`0008`](migrations/versions/0008_pin_entry_sequence_trigger_search_path.py) and
+[`0009`](migrations/versions/0009_pin_transaction_balance_check_search_path.py) pin the
+`search_path` of the ordering and double-entry checks so temporary tables cannot shadow the
+tables they read.
 
 ```
-users 1 ── 0..* accounts *── 1 ledgers 1 ── * transactions
-                  │                              │
-                  └──── * ledger_entries * ──────┘
+users 1 ── 0..* accounts *── 1 ledgers 1 ── * transactions ── 0..1 audit_events (succeeded)
+  │               │                              │
+  │               └──── * ledger_entries * ──────┘
+  └── 0..* audit_events (actor)
 ```
 
 | Table | Purpose |
@@ -140,10 +156,12 @@ users 1 ── 0..* accounts *── 1 ledgers 1 ── * transactions
 | `ledgers` | One per currency: the boundary money cannot cross |
 | `accounts` | `customer` (owned by a user, one per currency) or `system` (settlement, one per ledger). `balance_minor` is a cached projection of the entries |
 | `transactions` | A posted transaction: `deposit`, `withdrawal` or `transfer`, sealed with its `entry_count`. Append-only |
-| `ledger_entries` | One signed `amount_minor` on one account. Append-only |
+| `ledger_entries` | One signed `amount_minor` on one account, with a `sequence_number` that orders each account's entries in commit order. Append-only |
+| `audit_events` | One row per audited attempt: action, outcome (`succeeded`, `rejected`, `failed`), reason code, safe JSON details. Append-only |
 
-Conventions: UUIDv7 primary keys; money is `BIGINT` minor units named `*_minor`; timestamps
-are `timestamptz`; every foreign key is `ON DELETE RESTRICT`; constraint names follow a fixed
+Conventions: UUIDv7 primary keys (exception: `audit_events.id` is a `BIGINT` identity, never
+exposed; its values have gaps); money is `BIGINT` minor units named `*_minor`; timestamps are
+`timestamptz`; every foreign key is `ON DELETE RESTRICT`; constraint names follow a fixed
 convention (`ck_`, `uq_`, `fk_`, `ix_`, `pk_`).
 
 Invariants enforced by PostgreSQL itself, so every code path is bound by them:
@@ -152,16 +170,29 @@ Invariants enforced by PostgreSQL itself, so every code path is bound by them:
 |---|---|
 | Every transaction has at least 2 entries summing to 0 | Deferred constraint triggers, checked at `COMMIT` |
 | A posted transaction can never gain entries, even balanced ones | `entry_count` in the immutable header, checked by the same trigger |
-| Posted transactions and entries are never updated or deleted | `BEFORE UPDATE OR DELETE` triggers |
+| Posted transactions, entries and audit events are never updated, deleted or truncated | `BEFORE UPDATE OR DELETE` (row) and `BEFORE TRUNCATE` (statement) triggers |
 | An entry, its transaction and its account share one ledger (no cross-currency postings) | Composite foreign keys on `(…, ledger_id)` |
 | Customer balances never go negative; settlement balances may | `CHECK (kind = 'system' OR balance_minor >= 0)` |
 | One account per user per currency, one settlement account per ledger | Unique constraint, partial unique index |
 | An account appears at most once per transaction | Unique `(transaction_id, account_id)` |
+| An account's history is a total order, and can only be appended to | Unique `(account_id, sequence_number)`, `GENERATED ALWAYS AS IDENTITY (CACHE 1)`, and a `BEFORE INSERT` trigger rejecting a number not after the account's latest or never issued by the sequence. `GENERATED ALWAYS` alone is not enough: `OVERRIDING SYSTEM VALUE` bypasses it |
+| An audit event is well-formed: reason exactly when not succeeded, a transaction exactly for successful postings (at most one event per transaction), an actor for every success, details a JSON object of at most 2048 bytes | CHECK and unique constraints on `audit_events` |
+| Audit evidence is not dropped by a routine downgrade | Migration 0004 refuses to drop a non-empty `audit_events` |
+
+Triggers bind ordinary sessions only. A superuser or the table owner can disable them, and the
+application currently connects as a superuser, so these rules guard against application bugs,
+not against that role ([ADR 0004](docs/adr/0004-immutable-transactions-without-status.md)).
 
 `balance_minor` is maintained by the application inside the posting transaction, not by a
 constraint. Reconciliation queries ([`data/reconciliation.py`](src/ledger_api/data/reconciliation.py))
-verify that every balance equals its entries and that every ledger's entries and balances
-sum to zero (so the settlement account mirrors the customers' money).
+recompute every invariant from the raw rows, without trusting the triggers and foreign keys
+that normally enforce it ([ADR 0012](docs/adr/0012-statement-ordering-and-reconciliation.md)):
+every balance equals its entries; every ledger's entries and balances sum to zero (so the
+settlement account mirrors the customers' money); every transaction has at least 2 entries
+summing to zero and exactly its declared count; every entry sits in its account's and
+transaction's ledger; every posted transaction has its succeeded audit event; and failed
+events whose transaction committed after all (a lost acknowledgement) are reported, as are
+audit events whose attempted transaction id is malformed (which would otherwise hide them).
 
 ## Posting
 
@@ -173,12 +204,54 @@ each run in one database transaction ([ADR 0010](docs/adr/0010-posting-protocol.
    (`ORDER BY id FOR UPDATE OF accounts`): all postings take locks in the same order, so they
    cannot deadlock, and no ledger row is ever locked.
 3. Check ownership, currency and funds against the locked rows only.
-4. Write the transaction, its entries and relative balance updates; `COMMIT` runs the
-   deferred checks. Any failure rolls back everything.
+4. Write the transaction, its entries and relative balance updates, then the succeeded audit
+   event; `COMMIT` runs the deferred checks. Any failure rolls back everything, the audit
+   event included.
 
 Deadlocks and serialization failures retry the whole transaction (3 attempts at most); lock
 or statement timeouts and exhausted retries report `temporarily_unavailable`. Amounts are
 limited to 100,000,000 minor units per transaction.
+
+## Audit trail
+
+User registration, account opening and every posting attempt are recorded in `audit_events`
+([ADR 0011](docs/adr/0011-audit-trail.md)):
+
+- **Succeeded** events are the last write of the business transaction: they commit with it or
+  not at all, even when a deferred check rejects the transaction at `COMMIT`. If the audit
+  write fails, the operation fails.
+- **Rejected** (a business rule, with the error code as `reason`) and **failed** (contention
+  or an unexpected error) events are written *after* the business transaction has rolled back
+  and released its connection, in a new transaction on the same session. One operation never
+  holds two connections.
+- The audit writer never raises. If it cannot write, it logs an ERROR with the event (the log
+  is the fallback sink), and the caller still gets its original error. Rejected and failed
+  events are therefore best-effort.
+- Details hold ids, amounts, currencies and error identifiers only: never an email address, an
+  exception message or a request body. A claimed user that does not exist is stored as a NULL
+  actor, with its id in `details.requested_user_id`.
+- Reads, health checks and malformed requests are not audited.
+
+Under connection-pool exhaustion the post-rollback audit write waits for a connection (up to
+the pool timeout) before giving up, which delays the error response. This is accepted for now.
+
+## Statements
+
+`services.statements.get_statement` returns an owner's account history, newest first, with the
+balance after each entry ([ADR 0012](docs/adr/0012-statement-ordering-and-reconciliation.md)).
+There is no HTTP endpoint yet (Phase 7).
+
+- Entries are ordered by `sequence_number`. It is drawn while the posting holds the account's
+  row lock, which it keeps until `COMMIT`, so for one account sequence order is commit order.
+  `created_at` is not used: it is the transaction's start time. Entries written before
+  migration 0005 were numbered in UUIDv7 id order (best-effort history).
+- Running balances are computed by the query, never stored. A page, its running balances and
+  the current balance come from one SQL statement (one snapshot).
+- Keyset pagination with the last entry id as cursor, 1–100 entries per page. Postings made
+  between page requests only appear on a fresh first page; following the cursor never repeats
+  or skips an entry.
+- No counterparty is shown. If the balance does not equal the sum of the entries, the service
+  refuses (`internal_error`) and logs an ERROR instead of returning a possibly wrong statement.
 
 ## Testing
 
@@ -207,7 +280,27 @@ Posting is tested at every level:
   never deadlock, random concurrent transfers conserve money.
 - **Property-based** ([Hypothesis](https://hypothesis.readthedocs.io/)): posting rules hold for
   generated inputs, and random sequences of postings match a pure-Python model step by step.
-- **Reconciliation** after every posting test: balances equal entries, ledgers sum to zero.
+- **Reconciliation** after every posting test: balances equal entries, ledgers sum to zero,
+  transactions and entries are valid. Each reconciliation check also has a test that plants
+  the inconsistency it must find, inside a rolled-back transaction (using
+  `session_replication_role = replica` where the schema itself would refuse it).
+
+Audit and statement tests:
+
+- **Audit protocol** with real commits: insufficient funds leaves the ledger untouched and
+  exactly one rejected event; a failure after the entries, or a deferred-trigger failure at
+  `COMMIT`, leaves no succeeded event and one failed event; a failing audit write preserves
+  the original exception and logs an ERROR without secrets; a failing success write rolls the
+  posting back.
+- **One connection per operation**: success, rejection and failures run on a pool of exactly
+  one connection, so needing a second one would time out.
+- **Concurrency**: 10 racing withdrawals produce 3 succeeded and 7 rejected events with
+  consistent balances. A two-session test shows `sequence_number` following lock (commit)
+  order while `created_at` follows transaction start.
+- **Append-only**: UPDATE, DELETE and TRUNCATE are rejected on every append-only table; a test
+  documents that a superuser can bypass the triggers.
+- **Migrations**: up/down/up on an empty database; the downgrade refuses to drop a non-empty
+  `audit_events`; the sequence backfill on its own database.
 
 CI runs the same suite against a PostgreSQL service container and smoke-tests the Compose
 stack.
@@ -226,6 +319,8 @@ stack.
 | [0008](docs/adr/0008-redis-only-for-rate-limiting.md) | Redis only for distributed rate limiting |
 | [0009](docs/adr/0009-owner-scoped-access-and-error-responses.md) | Owner-scoped account access and `{code, detail}` error responses |
 | [0010](docs/adr/0010-posting-protocol.md) | Posting protocol: sealed transactions, one sorted lock, whole-transaction retries |
+| [0011](docs/adr/0011-audit-trail.md) | Audit trail: schema, write protocol, scope and the limits of trigger protection |
+| [0012](docs/adr/0012-statement-ordering-and-reconciliation.md) | Commit-ordered entries, statements with computed running balances, independent reconciliation |
 
 ## Roadmap
 
@@ -233,9 +328,9 @@ stack.
 2. ✅ Database and domain models
 3. ✅ Users and accounts
 4. ✅ Ledger and transaction posting
-5. Audit
+5. ✅ Audit trail, statements (service layer) and reconciliation
 6. Idempotency and concurrency hardening
-7. REST API and statements
+7. REST API, including the statement endpoint
 8. Authentication and authorization
 9. Reliability
-10. Security and observability
+10. Security and observability (including least-privilege database roles)
