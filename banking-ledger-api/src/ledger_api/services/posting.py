@@ -152,7 +152,13 @@ async def deposit(
                 amount_minor=amount_minor,
             )
             return await _post(
-                session, posting, context, transaction_id, owner_id=owner_id, owned={account_id}
+                session,
+                posting,
+                context,
+                transaction_id,
+                owner_id=owner_id,
+                owned={account_id},
+                link=_link(keyed),
             )
 
         return await _in_transaction(session, context, attempt, keyed)
@@ -195,7 +201,13 @@ async def withdraw(
                 amount_minor=amount_minor,
             )
             return await _post(
-                session, posting, context, transaction_id, owner_id=owner_id, owned={account_id}
+                session,
+                posting,
+                context,
+                transaction_id,
+                owner_id=owner_id,
+                owned={account_id},
+                link=_link(keyed),
             )
 
         return await _in_transaction(session, context, attempt, keyed)
@@ -249,6 +261,7 @@ async def transfer(
                 owner_id=owner_id,
                 owned={source_account_id},
                 counterparty=destination_account_id,
+                link=_link(keyed),
             )
 
         return await _in_transaction(session, context, attempt, keyed)
@@ -289,6 +302,11 @@ def _keyed_request(
         amount_minor=amount_minor,
     )
     return _KeyedRequest(owner_id, account_id, idempotency_key, fingerprint)
+
+
+def _link(keyed: _KeyedRequest | None) -> tuple[uuid.UUID, str] | None:
+    """The (user_id, key) a keyed posting's header names (migration 0011), or None."""
+    return None if keyed is None else (keyed.owner_id, keyed.key)
 
 
 async def _in_transaction(
@@ -416,14 +434,16 @@ async def _post(
     owner_id: uuid.UUID,
     owned: Collection[uuid.UUID],
     counterparty: uuid.UUID | None = None,
+    link: tuple[uuid.UUID, str] | None = None,
 ) -> PostingResult:
     locked = await lock_accounts(session, posting.account_ids)
     _validate(posting, locked, owner_id=owner_id, owned=owned, counterparty=counterparty)
 
     # Every line's account is locked and validated: only now may anything be written.
     ledger_id = locked[posting.lines[0].account_id].ledger_id
+    # A keyed header names its key, which already references transaction_id (the claim).
     transaction = await insert_posting(
-        session, posting, ledger_id=ledger_id, transaction_id=transaction_id
+        session, posting, ledger_id=ledger_id, transaction_id=transaction_id, idempotency_key=link
     )
     context.attempted_transaction_id = transaction.id
     balances = await apply_balance_deltas(

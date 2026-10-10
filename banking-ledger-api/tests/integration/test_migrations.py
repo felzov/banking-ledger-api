@@ -143,7 +143,8 @@ COMMITTED_KEYED_DEPOSIT = [
 
 async def test_downgrade_refuses_to_drop_consumed_idempotency_keys() -> None:
     # Phase 6: dropping idempotency_keys would let retried requests run a second time. The
-    # refusal aborts the downgrade (one transaction): the schema stays at head, keys intact.
+    # refusal aborts the downgrade (one transaction): the schema stays at 0010, keys intact.
+    # At 0010 itself: from head, 0011's own guard would refuse first (its links exist).
     server_url = configured_database_url()
     url = disposable_database_url(server_url, "_idempotency_guard")
     assert url.database is not None
@@ -151,7 +152,7 @@ async def test_downgrade_refuses_to_drop_consumed_idempotency_keys() -> None:
     engine = create_async_engine(url, poolclass=NullPool)
     ids = {"user": uuid.uuid7(), "account": uuid.uuid7(), "transaction": uuid.uuid7()}
     try:
-        await run_alembic(engine, lambda config: command.upgrade(config, "head"))
+        await run_alembic(engine, lambda config: command.upgrade(config, "0010"))
         async with engine.begin() as connection:
             for statement in COMMITTED_KEYED_DEPOSIT:
                 await connection.execute(text(statement.format(**ids)))
@@ -180,7 +181,7 @@ async def test_0010_downgrades_exactly_on_an_empty_table() -> None:
         await run_alembic(engine, lambda config: command.upgrade(config, "0009"))
         tables_0009, functions_0009 = await _public_tables(engine), await _public_functions(engine)
 
-        await run_alembic(engine, lambda config: command.upgrade(config, "head"))
+        await run_alembic(engine, lambda config: command.upgrade(config, "0010"))
         assert await _public_tables(engine) == tables_0009 | {"idempotency_keys"}
         assert await _public_functions(engine) == functions_0009 | {
             "forbid_idempotency_key_mutation"
@@ -189,6 +190,158 @@ async def test_0010_downgrades_exactly_on_an_empty_table() -> None:
         await run_alembic(engine, lambda config: command.downgrade(config, "0009"))
         assert await _public_tables(engine) == tables_0009
         assert await _public_functions(engine) == functions_0009
+    finally:
+        await engine.dispose()
+
+
+# The same committed keyed deposit at 0011: the header names its key (both directions).
+COMMITTED_LINKED_KEYED_DEPOSIT = [
+    statement.replace(
+        "INSERT INTO transactions (id, ledger_id, kind, entry_count) "
+        "SELECT '{transaction}', id, 'deposit', 2 FROM ledgers WHERE currency = 'GBP'",
+        "INSERT INTO transactions "
+        "(id, ledger_id, kind, entry_count, idempotency_user_id, idempotency_key) "
+        "SELECT '{transaction}', id, 'deposit', 2, '{user}', 'key-1' "
+        "FROM ledgers WHERE currency = 'GBP'",
+    )
+    for statement in COMMITTED_KEYED_DEPOSIT
+]
+assert COMMITTED_LINKED_KEYED_DEPOSIT != COMMITTED_KEYED_DEPOSIT
+
+TRANSACTION_COLUMNS = text(
+    "SELECT column_name FROM information_schema.columns "
+    "WHERE table_schema = 'public' AND table_name = 'transactions' ORDER BY column_name"
+)
+TRANSACTION_CONSTRAINTS = text(
+    "SELECT conname FROM pg_constraint WHERE conrelid = 'public.transactions'::regclass "
+    "AND contype <> 'n' ORDER BY conname"
+)
+
+
+async def test_0011_round_trips_exactly_on_an_empty_database() -> None:
+    server_url = configured_database_url()
+    url = disposable_database_url(server_url, "_link_round_trip")
+    assert url.database is not None
+    await recreate_database(server_url, url.database)
+    engine = create_async_engine(url, poolclass=NullPool)
+    try:
+        await run_alembic(engine, lambda config: command.upgrade(config, "0010"))
+        functions_0010 = await _public_functions(engine)
+        async with engine.connect() as connection:
+            columns_0010 = list((await connection.execute(TRANSACTION_COLUMNS)).scalars())
+            constraints_0010 = list((await connection.execute(TRANSACTION_CONSTRAINTS)).scalars())
+
+        await run_alembic(engine, lambda config: command.upgrade(config, "0011"))
+        assert await _public_functions(engine) == functions_0010 | {"assert_idempotency_link"}
+        async with engine.connect() as connection:
+            columns = set((await connection.execute(TRANSACTION_COLUMNS)).scalars())
+            constraints = set((await connection.execute(TRANSACTION_CONSTRAINTS)).scalars())
+        assert columns == set(columns_0010) | {"idempotency_user_id", "idempotency_key"}
+        assert constraints == set(constraints_0010) | {
+            "ck_transactions_idempotency_key_pair",
+            "uq_transactions_idempotency_key",
+            "fk_transactions_idempotency_keys",
+            "transactions_idempotency_linked",  # a constraint trigger is listed here too
+        }
+
+        await run_alembic(engine, lambda config: command.downgrade(config, "0010"))
+        assert await _public_functions(engine) == functions_0010
+        async with engine.connect() as connection:
+            assert list((await connection.execute(TRANSACTION_COLUMNS)).scalars()) == columns_0010
+            assert (
+                list((await connection.execute(TRANSACTION_CONSTRAINTS)).scalars())
+                == constraints_0010
+            )
+    finally:
+        await engine.dispose()
+
+
+async def test_0011_downgrade_refuses_to_drop_idempotency_links() -> None:
+    server_url = configured_database_url()
+    url = disposable_database_url(server_url, "_link_guard")
+    assert url.database is not None
+    await recreate_database(server_url, url.database)
+    engine = create_async_engine(url, poolclass=NullPool)
+    ids = {"user": uuid.uuid7(), "account": uuid.uuid7(), "transaction": uuid.uuid7()}
+    try:
+        await run_alembic(engine, lambda config: command.upgrade(config, "0011"))
+        async with engine.begin() as connection:
+            for statement in COMMITTED_LINKED_KEYED_DEPOSIT:
+                await connection.execute(text(statement.format(**ids)))
+
+        with pytest.raises(DBAPIError) as excinfo:
+            await run_alembic(engine, lambda config: command.downgrade(config, "0010"))
+
+        assert sqlstate(excinfo.value) == "2BP01"  # dependent_objects_still_exist
+        async with engine.connect() as connection:
+            assert await connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+                "0011"
+            )
+            linked = await connection.scalar(
+                text("SELECT idempotency_key FROM transactions WHERE id = :t"),
+                {"t": ids["transaction"]},
+            )
+            assert linked == "key-1"
+    finally:
+        await engine.dispose()
+
+
+async def test_0011_keeps_0010_keys_valid_and_unhijackable() -> None:
+    # A key committed at 0010 points at its transaction, which names nothing (the column did
+    # not exist). The upgrade validates no existing row, so it stays valid; and a new
+    # transaction cannot take the key over, because the key does not point back at it.
+    server_url = configured_database_url()
+    url = disposable_database_url(server_url, "_link_legacy")
+    assert url.database is not None
+    await recreate_database(server_url, url.database)
+    engine = create_async_engine(url, poolclass=NullPool)
+    ids = {"user": uuid.uuid7(), "account": uuid.uuid7(), "transaction": uuid.uuid7()}
+    try:
+        await run_alembic(engine, lambda config: command.upgrade(config, "0010"))
+        async with engine.begin() as connection:
+            for statement in COMMITTED_KEYED_DEPOSIT:
+                await connection.execute(text(statement.format(**ids)))
+        before = await _snapshot(engine)
+
+        await run_alembic(engine, lambda config: command.upgrade(config, "head"))
+
+        assert await _snapshot(engine) == before  # legacy rows untouched...
+        async with engine.connect() as connection:
+            legacy = (
+                await connection.execute(
+                    text(
+                        "SELECT k.transaction_id, t.idempotency_user_id, t.idempotency_key "
+                        "FROM idempotency_keys k JOIN transactions t ON t.id = k.transaction_id"
+                    )
+                )
+            ).one()
+        assert tuple(legacy) == (ids["transaction"], None, None)  # ...and still unlinked
+
+        # Hijack attempt: a new, balanced transaction naming the legacy key.
+        hijack = uuid.uuid7()
+        async with engine.connect() as connection:
+            await connection.begin()
+            await connection.execute(
+                text(
+                    "INSERT INTO transactions "
+                    "(id, ledger_id, kind, entry_count, idempotency_user_id, idempotency_key) "
+                    "SELECT :t, id, 'deposit', 2, :u, 'key-1' FROM ledgers WHERE currency = 'GBP'"
+                ),
+                {"t": hijack, "u": ids["user"]},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO ledger_entries "
+                    "(transaction_id, account_id, ledger_id, amount_minor) "
+                    "SELECT :t, a.id, a.ledger_id, CASE a.kind WHEN 'system' THEN -1 ELSE 1 END "
+                    "FROM accounts a JOIN ledgers l ON l.id = a.ledger_id "
+                    "WHERE l.currency = 'GBP' AND (a.kind = 'system' OR a.id = :a)"
+                ),
+                {"t": hijack, "a": ids["account"]},
+            )
+            with pytest.raises(IntegrityError) as excinfo:
+                await connection.commit()
+        assert violated_constraint(excinfo.value) == "ck_idempotency_keys_transaction_link"
     finally:
         await engine.dispose()
 

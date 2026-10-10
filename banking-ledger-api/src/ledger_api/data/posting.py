@@ -83,18 +83,22 @@ async def insert_posting(
     *,
     ledger_id: uuid.UUID,
     transaction_id: uuid.UUID | None = None,
+    idempotency_key: tuple[uuid.UUID, str] | None = None,
 ) -> Transaction:
     """Insert the transaction header, sealed with its entry count, and its entries.
 
     `transaction_id` is the id an idempotency key already references (ADR 0006); without one,
-    the model generates it. The balance and entry-count checks run at COMMIT (deferred
-    triggers).
+    the model generates it. `idempotency_key` is that key, as (user_id, key): the header names
+    it in return, and at COMMIT the two must reference each other (migration 0011). The
+    balance, entry-count and link checks run at COMMIT (deferred triggers).
     """
     transaction = Transaction(
         ledger_id=ledger_id, kind=posting.kind, entry_count=len(posting.lines)
     )
     if transaction_id is not None:
         transaction.id = transaction_id
+    if idempotency_key is not None:
+        transaction.idempotency_user_id, transaction.idempotency_key = idempotency_key
     session.add(transaction)
     await session.flush()  # the header must exist before entries reference it
     await session.execute(

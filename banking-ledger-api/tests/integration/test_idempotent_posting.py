@@ -164,7 +164,24 @@ async def test_a_keyed_posting_commits_its_key_with_it(
     assert event.outcome == AuditOutcome.SUCCEEDED
     assert event.transaction_id == result.transaction_id
     assert event.idempotency_key == key
+    # ...and the committed header names the key in return (migration 0011).
+    async with sessionmaker() as session:
+        header = await session.get(Transaction, result.transaction_id)
+    assert header is not None
+    assert (header.idempotency_user_id, header.idempotency_key) == (empty.owner_id, key)
     await _assert_reconciled(sessionmaker)
+
+
+async def test_an_unkeyed_posting_names_no_key(sessionmaker: Maker, empty: FundedAccount) -> None:
+    async with sessionmaker() as session:
+        result = await deposit(
+            session, owner_id=empty.owner_id, account_id=empty.account_id, amount_minor=10
+        )
+
+    async with sessionmaker() as session:
+        header = await session.get(Transaction, result.transaction_id)
+    assert header is not None
+    assert (header.idempotency_user_id, header.idempotency_key) == (None, None)
 
 
 # --- duplicates ---------------------------------------------------------------------------------

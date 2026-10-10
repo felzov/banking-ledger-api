@@ -706,6 +706,32 @@ async def test_posting_role_cannot_rewrite_or_remove_keys(
     assert await _refused(db_connection, statement) == "42501"
 
 
+async def test_posting_role_cannot_attach_a_key_to_an_existing_transaction(
+    db_connection: AsyncConnection,
+    db_session: AsyncSession,
+    new_session: SessionFactory,
+    pair: tuple[Account, Account],
+) -> None:
+    # The role may INSERT into both tables, but the reciprocal link (migration 0011) still
+    # binds it: an existing transaction names no key, and can never be made to.
+    payer, _ = pair
+    assert payer.user_id is not None
+    role = await _switch_to_new_posting_role(db_connection)
+    existing = await _fund(new_session, payer, 100)  # an ordinary, unkeyed posting
+
+    await _running_as(db_connection, role)
+    await db_connection.execute(
+        text(
+            "INSERT INTO public.idempotency_keys (user_id, key, request_fingerprint, "
+            "transaction_id) VALUES (:u, 'forged', decode(repeat('ab', 32), 'hex'), :t)"
+        ),
+        {"u": payer.user_id, "t": existing.transaction_id},
+    )
+
+    async with raises_violation("ck_idempotency_keys_transaction_link"):
+        await check_deferred_constraints(db_session)  # as the role
+
+
 async def test_role_without_idempotency_grants_fails_loudly_on_a_keyed_posting(
     db_connection: AsyncConnection,
     new_session: SessionFactory,
