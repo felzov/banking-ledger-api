@@ -8,16 +8,21 @@ every entry.
 
 Roles are cluster-wide. The rolled-back tests create theirs inside the test transaction; the
 concurrent tests commit one and drop it afterwards.
+
+Every test checks, from inside the transactions under test, that they ran as the role and not
+as the superuser (role_witness): a test that silently fell back to the superuser would pass
+whatever the privileges, because a superuser bypasses them all.
 """
 
 import asyncio
 import uuid
 from collections import Counter
 from collections.abc import AsyncIterator, Awaitable, Callable
+from dataclasses import dataclass, field
 from typing import Any
 
 import pytest
-from sqlalchemy import URL, event, func, select, text
+from sqlalchemy import URL, Connection, event, func, select, text
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import (
     AsyncConnection,
@@ -33,6 +38,7 @@ from ledger_api.data.errors import sqlstate, violated_constraint
 from ledger_api.data.models import Account, AuditEvent, LedgerEntry
 from ledger_api.domain.audit import AuditOutcome
 from ledger_api.domain.errors import InsufficientFundsError
+from ledger_api.services import audit as audit_service
 from ledger_api.services import posting as posting_service
 from ledger_api.services.posting import PostingResult, deposit, transfer, withdraw
 from tests.conftest import SessionFactory
@@ -57,6 +63,56 @@ async def _create_role(connection: AsyncConnection, role: str, *, helper: bool =
     await connection.execute(text(f'CREATE ROLE "{role}" NOLOGIN'))
     for grant in posting_role_grants(role, helper=helper):
         await connection.execute(text(grant))
+
+
+# --- who actually ran it --------------------------------------------------------------------------
+
+
+@dataclass
+class RoleWitness:
+    """current_user and is_superuser, read inside every posting attempt (when it locks its
+    accounts) and every audit write, in the same transaction as the work."""
+
+    seen: list[tuple[str, str, bool]] = field(default_factory=list)
+
+    def forget_setup(self) -> None:
+        """Drop what test setup recorded (it posts as the superuser, by design)."""
+        self.seen.clear()
+
+    def assert_ran_as(self, role: str, *, attempts: int, audits: int) -> None:
+        steps = Counter(step for step, _, _ in self.seen)
+        assert steps == {"attempt": attempts, "audit": audits}, steps
+        assert {(user, superuser) for _, user, superuser in self.seen} == {(role, False)}
+
+
+@pytest.fixture
+def role_witness(monkeypatch: pytest.MonkeyPatch) -> RoleWitness:
+    witness = RoleWitness()
+
+    def watch(module: Any, name: str, step: str) -> None:
+        real = getattr(module, name)
+
+        async def watched(session: AsyncSession, *args: Any, **kwargs: Any) -> Any:
+            user, superuser = (
+                await session.execute(
+                    text("SELECT current_user, current_setting('is_superuser') = 'on'")
+                )
+            ).one()
+            witness.seen.append((step, user, superuser))
+            return await real(session, *args, **kwargs)
+
+        monkeypatch.setattr(module, name, watched)
+
+    watch(posting_service, "lock_accounts", "attempt")  # first step of every posting attempt
+    watch(audit_service, "insert_audit_event", "audit")  # success, rejected and failed events
+    return witness
+
+
+async def _current_role(session: AsyncSession) -> tuple[str, bool]:
+    user, superuser = (
+        await session.execute(text("SELECT current_user, current_setting('is_superuser') = 'on'"))
+    ).one()
+    return user, superuser
 
 
 # --- rolled back: one connection, the role switched on it ---------------------------------------
@@ -127,10 +183,11 @@ async def test_posting_role_deposits_withdraws_and_transfers(
     db_session: AsyncSession,
     new_session: SessionFactory,
     pair: tuple[Account, Account],
+    role_witness: RoleWitness,
 ) -> None:
     payer, payee = pair
     assert payer.user_id is not None
-    await _switch_to_new_posting_role(db_connection)
+    role = await _switch_to_new_posting_role(db_connection)
     await _fund(new_session, payer, 1_000)
 
     deposited = await deposit(
@@ -151,6 +208,7 @@ async def test_posting_role_deposits_withdraws_and_transfers(
             new_session(), owner_id=payer.user_id, account_id=payer.id, amount_minor=10_000
         )
 
+    role_witness.assert_ran_as(role, attempts=5, audits=5)
     assert deposited.balances == {payer.id: 1_500}
     assert withdrawn.balances == {payer.id: 1_300}
     assert moved.balances == {payer.id: 1_000}
@@ -402,29 +460,43 @@ async def test_helper_cannot_be_used_to_read_other_sequences(
 # --- concurrent: committed postings as the role --------------------------------------------------
 
 
+@dataclass(frozen=True)
+class RoleSessions:
+    role: str
+    sessionmaker: async_sessionmaker[AsyncSession]
+
+
 @pytest.fixture
-async def posting_role_sessionmaker(
-    engine: AsyncEngine, test_database_url: URL
-) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
-    """Sessions that run as a committed least-privilege role (dropped afterwards)."""
+async def posting_role(engine: AsyncEngine, test_database_url: URL) -> AsyncIterator[RoleSessions]:
+    """Sessions whose every transaction runs as a committed least-privilege role.
+
+    The role is set per transaction (SET LOCAL ROLE when it begins), never once per pooled
+    connection: the asyncpg adapter runs a connect-time SET inside a transaction that the
+    pool's rollback-on-return undoes, so a reused connection was back to the superuser.
+    """
     role = _role_name()
-    async with engine.begin() as connection:
-        await _create_role(connection, role)
     role_engine = create_async_engine(test_database_url)
 
-    @event.listens_for(role_engine.sync_engine, "connect")
-    def become_role(dbapi_connection: Any, _record: Any) -> None:
-        cursor = dbapi_connection.cursor()
-        cursor.execute(f'SET ROLE "{role}"')
-        cursor.close()
+    @event.listens_for(role_engine.sync_engine, "begin")
+    def become_role(connection: Connection) -> None:
+        # Lasts exactly this transaction: neither pooling nor a rollback can carry another
+        # role into, or this role out of, it.
+        connection.exec_driver_sql(f'SET LOCAL ROLE "{role}"')
 
     try:
-        yield create_sessionmaker(role_engine)
-    finally:
-        await role_engine.dispose()
         async with engine.begin() as connection:
-            await connection.execute(text(f'DROP OWNED BY "{role}"'))  # its grants
-            await connection.execute(text(f'DROP ROLE "{role}"'))
+            await _create_role(connection, role)
+        yield RoleSessions(role, create_sessionmaker(role_engine))
+    finally:
+        try:
+            await role_engine.dispose()
+        finally:
+            async with engine.begin() as connection:
+                if await connection.scalar(
+                    text("SELECT 1 FROM pg_roles WHERE rolname = :role"), {"role": role}
+                ):
+                    await connection.execute(text(f'DROP OWNED BY "{role}"'))  # its grants
+                    await connection.execute(text(f'DROP ROLE "{role}"'))
 
 
 @pytest.fixture
@@ -454,18 +526,21 @@ async def _race(
 @pytest.mark.concurrency
 @pytest.mark.usefixtures("no_retries")
 async def test_concurrent_withdrawals_as_the_role(
-    engine: AsyncEngine, posting_role_sessionmaker: async_sessionmaker[AsyncSession]
+    engine: AsyncEngine, posting_role: RoleSessions, role_witness: RoleWitness
 ) -> None:
     superuser = create_sessionmaker(engine)
     account = await commit_funded_account(superuser, 100)  # setup needs INSERT on users
+    role_witness.forget_setup()
 
     async def withdraw_30(session: AsyncSession) -> PostingResult:
         return await withdraw(
             session, owner_id=account.owner_id, account_id=account.account_id, amount_minor=30
         )
 
-    results = await _race(posting_role_sessionmaker, [withdraw_30] * 10)
+    results = await _race(posting_role.sessionmaker, [withdraw_30] * 10)
 
+    # Ten attempts; three success events and seven rejected ones, each written as the role.
+    role_witness.assert_ran_as(posting_role.role, attempts=10, audits=10)
     assert Counter(type(r).__name__ for r in results) == {
         "PostingResult": 3,
         "InsufficientFundsError": 7,
@@ -486,12 +561,13 @@ async def test_concurrent_withdrawals_as_the_role(
 @pytest.mark.concurrency
 @pytest.mark.usefixtures("no_retries")
 async def test_opposite_transfers_as_the_role_do_not_deadlock(
-    engine: AsyncEngine, posting_role_sessionmaker: async_sessionmaker[AsyncSession]
+    engine: AsyncEngine, posting_role: RoleSessions, role_witness: RoleWitness
 ) -> None:
     # The trigger's lock is a re-acquisition inside the protocol: no new lock order.
     superuser = create_sessionmaker(engine)
     first = await commit_funded_account(superuser, 10_000)
     second = await commit_funded_account(superuser, 10_000)
+    role_witness.forget_setup()
 
     def send(source: Any, destination: Any) -> Operation:
         async def operation(session: AsyncSession) -> PostingResult:
@@ -506,10 +582,12 @@ async def test_opposite_transfers_as_the_role_do_not_deadlock(
         return operation
 
     results = await _race(
-        posting_role_sessionmaker, [send(first, second), send(second, first)] * 20
+        posting_role.sessionmaker, [send(first, second), send(second, first)] * 20
     )
 
     assert Counter(type(r).__name__ for r in results) == {"PostingResult": 40}
+    # Forty sessions, more than the pool holds: connections are reused, still as the role.
+    role_witness.assert_ran_as(posting_role.role, attempts=40, audits=40)
     async with superuser() as session:
         await assert_reconciled(session)
         transfers = await session.scalar(
@@ -526,7 +604,8 @@ async def test_opposite_transfers_as_the_role_do_not_deadlock(
 @pytest.mark.usefixtures("no_retries")
 async def test_role_cannot_backdate_behind_an_uncommitted_posting(
     engine: AsyncEngine,
-    posting_role_sessionmaker: async_sessionmaker[AsyncSession],
+    posting_role: RoleSessions,
+    role_witness: RoleWitness,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The F1 race, with the raw writer running as the least-privilege role: it waits on the
@@ -546,6 +625,7 @@ async def test_role_cannot_backdate_behind_an_uncommitted_posting(
         counterparty = await create_customer_account(session)
         await session.commit()
     assert latest is not None
+    role_witness.forget_setup()
 
     wrote, go = asyncio.Event(), asyncio.Event()
     real_apply = data_posting.apply_balance_deltas
@@ -561,13 +641,15 @@ async def test_role_cannot_backdate_behind_an_uncommitted_posting(
     monkeypatch.setattr(posting_service, "apply_balance_deltas", pause_after_entries)
 
     async def run_posting() -> PostingResult:
-        async with posting_role_sessionmaker() as session:
+        async with posting_role.sessionmaker() as session:
             return await deposit(
                 session, owner_id=account.owner_id, account_id=account.account_id, amount_minor=7
             )
 
     async def backdate() -> None:
-        async with posting_role_sessionmaker() as session:
+        async with posting_role.sessionmaker() as session:
+            # Same transaction as the insert below: the raw writer is the role, not the superuser.
+            assert await _current_role(session) == (posting_role.role, False)
             transaction_id = await session.scalar(_INSERT_HEADER, {"ledger": ledger_id})
             await session.execute(
                 _INSERT_NUMBERED,
@@ -599,3 +681,38 @@ async def test_role_cannot_backdate_behind_an_uncommitted_posting(
     with pytest.raises(IntegrityError) as excinfo:
         await raw
     assert violated_constraint(excinfo.value) == "ck_ledger_entries_sequence_monotonic"
+    role_witness.assert_ran_as(posting_role.role, attempts=1, audits=1)  # the posting
+
+
+# --- the role checks themselves ----------------------------------------------------------------
+
+
+async def test_every_transaction_of_a_role_session_runs_as_the_role(
+    posting_role: RoleSessions,
+) -> None:
+    # The old fixture's failure: SET ROLE once per pooled connection was undone by the pool's
+    # rollback-on-return, so every session after the first on a connection ran as the
+    # superuser. Sequential sessions reuse the same pooled connection; so does a second
+    # transaction after a rollback.
+    for _ in range(3):
+        async with posting_role.sessionmaker() as session:
+            assert await _current_role(session) == (posting_role.role, False)
+            await session.rollback()
+            assert await _current_role(session) == (posting_role.role, False)
+            await session.commit()
+
+
+async def test_the_witness_catches_an_operation_run_as_the_superuser(
+    engine: AsyncEngine, posting_role: RoleSessions, role_witness: RoleWitness
+) -> None:
+    superuser = create_sessionmaker(engine)
+    account = await commit_funded_account(superuser, 100)
+    role_witness.forget_setup()
+
+    async with superuser() as session:  # the wrong sessions
+        await withdraw(
+            session, owner_id=account.owner_id, account_id=account.account_id, amount_minor=1
+        )
+
+    with pytest.raises(AssertionError):
+        role_witness.assert_ran_as(posting_role.role, attempts=1, audits=1)
