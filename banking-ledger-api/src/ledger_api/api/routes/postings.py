@@ -17,7 +17,7 @@ from fastapi import APIRouter, Request, Response, status
 from pydantic import BaseModel, ConfigDict, StrictInt
 
 from ledger_api.api.dependencies import IdempotencyKeyDep, SessionDep
-from ledger_api.api.errors import VALIDATION_ERROR_RESPONSE, ErrorResponse
+from ledger_api.api.errors import VALIDATION_OR_RULE_ERROR_RESPONSE, ErrorResponse
 from ledger_api.domain.transaction import TransactionKind
 from ledger_api.services.posting import PostingResult, deposit, transfer, withdraw
 
@@ -27,7 +27,7 @@ REPLAYED_HEADER = "Idempotent-Replayed"
 
 ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     status.HTTP_404_NOT_FOUND: {"model": ErrorResponse},
-    **VALIDATION_ERROR_RESPONSE,
+    **VALIDATION_OR_RULE_ERROR_RESPONSE,
     status.HTTP_428_PRECONDITION_REQUIRED: {"model": ErrorResponse},
     status.HTTP_503_SERVICE_UNAVAILABLE: {"model": ErrorResponse},
 }

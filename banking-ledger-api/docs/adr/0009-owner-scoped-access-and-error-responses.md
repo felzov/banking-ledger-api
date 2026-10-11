@@ -75,3 +75,22 @@ authentication is added. Phase 3 also needs a first, consistent error format.
   before they can be accepted.
 - A duplicate email returns 409, which allows email enumeration; ADR 0008's rate limiting is
   the mitigation.
+
+## Amendment (Phase 7, 2026-10-11)
+
+- The statement (`GET .../accounts/{account_id}/statement`) and the single-transaction read
+  (`GET .../accounts/{account_id}/transactions/{transaction_id}`) live under `/users/{user_id}`
+  and reuse the owner-scoped account lookup, **first**: someone else's, a system or a missing
+  account is `account_not_found`, whatever the cursor or transaction id.
+- A transaction is then looked up among that account's entries only. A transaction that does
+  not exist, belongs to other accounts, or is the user's own posting on a different account is
+  the same `404 transaction_not_found` (new `NotFoundError`), so the response never reveals
+  whether a transaction id exists elsewhere.
+- Every `201` posting carries `Location` to that transaction on the caller's account, built
+  from the parsed path parameters and the service's result, never from raw client text.
+- **Two 422 bodies.** `validation_error` (FastAPI) has `detail` as a list of
+  `{type, loc, msg}`; business rules and header checks have `detail` as a string. Routes that
+  can return both (the postings and the statement) document `422` as either schema; the others
+  document only `validation_error`, which is all they can return. A test validates real 422
+  bodies against the documented schema.
+- Still unauthenticated until Phase 8; these reads are as exposed as every other route.

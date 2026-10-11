@@ -208,3 +208,22 @@ database, using `session_replication_role = replica` where the schema itself wou
 - An entry-writing path that does not lock its accounts first can no longer insert an entry
   into an account's past: the ordering trigger locks and checks. Lock-first stays a rule of the
   posting protocol (ADR 0010), which also keeps such paths from deadlocking.
+
+## Amendment (Phase 7, 2026-10-11): the read API
+
+- **`GET /users/{user_id}/accounts/{account_id}/statement?limit=&cursor=`** serves
+  `get_statement` unchanged: `{account_id, balance_minor, entries, next_cursor}`, each entry
+  `{entry_id, transaction_id, kind, amount_minor, balance_after_minor, created_at}`, newest
+  first, signed, no counterparty. The range checks stay in the service (`422
+  invalid_statement_limit`, `invalid_statement_cursor`); a non-integer `limit` or a malformed
+  cursor is FastAPI's `422 validation_error`. The page is still one SQL statement.
+- **`GET /users/{user_id}/accounts/{account_id}/transactions/{transaction_id}`** returns one
+  transaction in the same entry shape: the account's own entry, with the balance right after
+  it computed exactly like a statement's running balance (the sum of the account's entries up
+  to it in `sequence_number` order). It is historical, never the current balance. The query
+  (`data.statements.find_posted_entry`) is shared with idempotent replays (ADR 0006) and only
+  ever reads the requested account's entries.
+- Both reads run in their own transaction (ADR 0001 amendment).
+- Cost: the transaction read sums the account's history up to the entry, O(entries before it),
+  like a statement page. The persisted-running-balance upgrade path above would make both
+  O(1).

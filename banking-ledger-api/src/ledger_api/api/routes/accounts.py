@@ -6,7 +6,11 @@ from fastapi import APIRouter, Query, Request, Response, status
 from pydantic import BaseModel, ConfigDict
 
 from ledger_api.api.dependencies import SessionDep
-from ledger_api.api.errors import VALIDATION_ERROR_RESPONSE, ErrorResponse
+from ledger_api.api.errors import (
+    VALIDATION_ERROR_RESPONSE,
+    VALIDATION_OR_RULE_ERROR_RESPONSE,
+    ErrorResponse,
+)
 from ledger_api.data.models import Account
 from ledger_api.domain.currency import Currency
 from ledger_api.domain.transaction import TransactionKind
@@ -146,7 +150,7 @@ class StatementResponse(BaseModel):
     "/{account_id}/statement",
     responses={
         **NOT_FOUND,
-        **VALIDATION_ERROR_RESPONSE,
+        **VALIDATION_OR_RULE_ERROR_RESPONSE,
         status.HTTP_500_INTERNAL_SERVER_ERROR: {"model": ErrorResponse},
     },
 )

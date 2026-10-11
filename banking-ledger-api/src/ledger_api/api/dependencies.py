@@ -16,9 +16,10 @@ def get_engine(request: Request) -> AsyncEngine:
 async def get_session(request: Request) -> AsyncIterator[AsyncSession]:
     """One AsyncSession per request; never shared between concurrent tasks (ADR 0001).
 
-    This dependency never commits. Services own transaction boundaries
-    (`async with session.begin():`); anything left uncommitted is rolled back when the session
-    closes at the end of the request.
+    This dependency never commits. Every service, reads included, owns its transaction
+    boundaries (`async with session.begin():`) and returns the session outside any transaction,
+    so several service calls can share it. Anything left uncommitted is rolled back when the
+    session closes at the end of the request.
     """
     async with request.app.state.sessionmaker() as session:
         yield session
