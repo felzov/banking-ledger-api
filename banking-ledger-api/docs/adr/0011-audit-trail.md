@@ -134,3 +134,20 @@ future hardening work for Phase 10 and are not part of Phase 5.
   the class name of the underlying error, including when it is not a database error (e.g.
   `ConnectionResetError` during COMMIT). The class name only, never its message, which can
   quote connection details.
+
+## Amendment (Phase 8, 2026-10-11): authentication events (ADR 0013)
+
+- New actions (migration 0012): `auth.login` (succeeded; rejected with reason
+  `invalid_credentials`; failed) and `auth.logout` (succeeded). Every existing audit rule
+  applies to them: a reason exactly when not succeeded, a real actor for every success, never a
+  transaction reference.
+- **Actors.** A successful login or logout records the user. A rejected login records the
+  email's user when the email is registered, and no actor otherwise; the email address is never
+  recorded. Details hold only the session id.
+- **Unknown actors on user-scoped routes no longer occur.** The path's `{user_id}` is now always
+  the authenticated caller, so the "claimed actor that does not exist" case (stored as NULL with
+  `details.requested_user_id`) is reachable only from internal callers.
+- **Not audited** (logs only, ADR 0007): `401` and `403` on protected routes (no service runs),
+  failed logouts, and the per-request authentication lookup.
+- Never in `details`, the fallback log line or an error: a password, a bearer token, or a
+  token's digest.
