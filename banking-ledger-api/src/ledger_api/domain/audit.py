@@ -21,6 +21,9 @@ class AuditAction(StrEnum):
     POSTING_DEPOSIT = "posting.deposit"
     POSTING_WITHDRAWAL = "posting.withdrawal"
     POSTING_TRANSFER = "posting.transfer"
+    # Phase 8 (ADR 0013): no password, token or token hash ever goes into their details.
+    AUTH_LOGIN = "auth.login"
+    AUTH_LOGOUT = "auth.logout"
 
 
 # A successful posting, and only a successful posting, references its transaction.

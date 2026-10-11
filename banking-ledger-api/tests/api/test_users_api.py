@@ -5,11 +5,17 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
+from tests.auth_helpers import TEST_PASSWORD, log_in, signup
+
+FORBIDDEN = {"code": "forbidden", "detail": "You may only access your own resources."}
+
 
 async def _create_user(client: AsyncClient, email: str) -> dict[str, Any]:
-    response = await client.post("/users", json={"email": email})
+    """Register (the response body is returned) and log in, so the client may act as them."""
+    response = await client.post("/users", json={"email": email, "password": TEST_PASSWORD})
     assert response.status_code == 201, response.text
     body: dict[str, Any] = response.json()
+    await log_in(client, body["email"], body["id"])
     return body
 
 
@@ -26,7 +32,9 @@ def _assert_validation_error_without_echo(body: dict[str, Any], *submitted: str)
 
 
 async def test_create_user_returns_201_with_location_and_the_user(api_client: AsyncClient) -> None:
-    response = await api_client.post("/users", json={"email": "alice@example.com"})
+    response = await api_client.post(
+        "/users", json={"email": "alice@example.com", "password": TEST_PASSWORD}
+    )
 
     assert response.status_code == 201
     body = response.json()
@@ -47,7 +55,9 @@ async def test_create_user_stores_the_canonical_email(api_client: AsyncClient) -
 async def test_duplicate_email_in_any_case_returns_409(api_client: AsyncClient) -> None:
     await _create_user(api_client, "bob@example.com")
 
-    response = await api_client.post("/users", json={"email": "BOB@Example.com"})
+    response = await api_client.post(
+        "/users", json={"email": "BOB@Example.com", "password": TEST_PASSWORD}
+    )
 
     assert response.status_code == 409
     assert response.json() == {
@@ -63,20 +73,24 @@ async def test_duplicate_email_in_any_case_returns_409(api_client: AsyncClient) 
 async def test_invalid_email_returns_422_without_echoing_it(
     api_client: AsyncClient, email: str
 ) -> None:
-    response = await api_client.post("/users", json={"email": email})
+    response = await api_client.post("/users", json={"email": email, "password": TEST_PASSWORD})
 
     assert response.status_code == 422
-    _assert_validation_error_without_echo(response.json(), email, "secret")
+    _assert_validation_error_without_echo(response.json(), email, "secret", TEST_PASSWORD)
 
 
 @pytest.mark.parametrize(
     "payload",
     [
         {},
-        {"email": None},
-        {"email": 42},
-        {"email": "x" * 321},
-        {"email": "carol@example.com", "id": str(uuid.uuid7())},  # extra fields are rejected
+        {"email": None, "password": TEST_PASSWORD},
+        {"email": 42, "password": TEST_PASSWORD},
+        {"email": "x" * 321, "password": TEST_PASSWORD},
+        {"email": "carol@example.com"},  # the password is required
+        {"email": "carol@example.com", "password": None},
+        {"email": "carol@example.com", "password": 123456789012},
+        # extra fields are rejected
+        {"email": "carol@example.com", "password": TEST_PASSWORD, "id": str(uuid.uuid7())},
     ],
 )
 async def test_malformed_create_user_requests_return_422(
@@ -109,18 +123,30 @@ async def test_get_user_returns_the_user(api_client: AsyncClient) -> None:
     assert response.json() == created
 
 
-async def test_unknown_user_returns_404(api_client: AsyncClient) -> None:
-    response = await api_client.get(f"/users/{uuid.uuid7()}")
+async def test_another_user_id_is_forbidden(api_client: AsyncClient) -> None:
+    # Since Phase 8 a caller can only read themselves: any other id, existing or not, is 403
+    # (it used to be 404 user_not_found for an unknown id).
+    caller = await signup(api_client)
+    other = await signup(api_client)
 
-    assert response.status_code == 404
-    assert response.json() == {"code": "user_not_found", "detail": "User not found."}
+    for user_id in (other.user_id, str(uuid.uuid7())):
+        response = await api_client.get(f"/users/{user_id}", headers=caller.headers)
+        assert (response.status_code, response.json()) == (403, FORBIDDEN)
 
 
-async def test_malformed_user_id_returns_422(api_client: AsyncClient) -> None:
-    response = await api_client.get("/users/not-a-uuid")
+async def test_malformed_user_id_returns_422_once_authenticated(api_client: AsyncClient) -> None:
+    caller = await signup(api_client)
+
+    response = await api_client.get("/users/not-a-uuid", headers=caller.headers)
 
     assert response.status_code == 422
     _assert_validation_error_without_echo(response.json(), "not-a-uuid")
+
+
+async def test_reading_a_user_without_a_token_is_401(anonymous_client: AsyncClient) -> None:
+    for user_id in (str(uuid.uuid7()), "not-a-uuid"):
+        response = await anonymous_client.get(f"/users/{user_id}")
+        assert (response.status_code, response.json()["code"]) == (401, "authentication_required")
 
 
 # --- unexpected errors -------------------------------------------------------------------------

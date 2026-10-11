@@ -35,6 +35,8 @@ LEDGER_TABLES = {
     "ledger_entries",
     "audit_events",
     "idempotency_keys",
+    "user_credentials",
+    "auth_sessions",
 }
 
 
@@ -357,10 +359,10 @@ async def _version(engine: AsyncEngine) -> str | None:
     return version if isinstance(version, str) else None
 
 
-async def test_downgrade_from_head_keeps_0010_keys_behind_0010s_guard() -> None:
-    # A head database holding only a legacy (0010-era, unlinked) key. Downgrading to 0009:
+async def test_downgrade_from_0011_keeps_0010_keys_behind_0010s_guard() -> None:
+    # A 0011 database holding only a legacy (0010-era, unlinked) key. Downgrading to 0009:
     # 0011 has no links to protect and downgrades; 0010 then refuses to drop a populated
-    # idempotency_keys. Alembic runs one call in one transaction, so a single call from head
+    # idempotency_keys. Alembic runs one call in one transaction, so a single call from 0011
     # is refused as a whole (still at 0011); step by step, 0011 commits and 0010 refuses.
     server_url = configured_database_url()
     url = disposable_database_url(server_url, "_legacy_downgrade")
@@ -373,7 +375,9 @@ async def test_downgrade_from_head_keeps_0010_keys_behind_0010s_guard() -> None:
         async with engine.begin() as connection:
             for statement in COMMITTED_KEYED_DEPOSIT:
                 await connection.execute(text(statement.format(**ids)))
-        await run_alembic(engine, lambda config: command.upgrade(config, "head"))
+        # 0011 explicitly: the revision whose downgrade path this exercises (later revisions
+        # add their own downgrade guards in front of it).
+        await run_alembic(engine, lambda config: command.upgrade(config, "0011"))
         async with engine.connect() as connection:
             legacy = [tuple(row) for row in await connection.execute(LEGACY_KEYS)]
             columns_0011 = list((await connection.execute(TRANSACTION_COLUMNS)).scalars())
@@ -911,3 +915,154 @@ async def test_every_ledger_has_one_settlement_account_without_an_owner(
     assert sorted((currency, owner) for currency, owner, _ in rows) == sorted(
         (currency.value, None) for currency in Currency
     )
+
+
+# --- 0012: authentication -----------------------------------------------------------------------
+
+AUDIT_ACTION_CHECK = text(
+    "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conname = 'ck_audit_events_action'"
+)
+ARGON2ID_SAMPLE = "$argon2id$v=19$m=8,t=1,p=1$c2FsdHNhbHQxMjM0NTY3OA$" + "a" * 43
+
+
+async def _engine_at(name: str, revision: str) -> AsyncEngine:
+    server_url = configured_database_url()
+    url = disposable_database_url(server_url, name)
+    assert url.database is not None
+    await recreate_database(server_url, url.database)
+    engine = create_async_engine(url, poolclass=NullPool)
+    await run_alembic(engine, lambda config: command.upgrade(config, revision))
+    return engine
+
+
+async def _new_user(connection: AsyncConnection) -> uuid.UUID:
+    user_id = await connection.scalar(
+        text("INSERT INTO users (email) VALUES (:email) RETURNING id"),
+        {"email": f"auth-{uuid.uuid7().hex}@example.test"},
+    )
+    assert isinstance(user_id, uuid.UUID)
+    return user_id
+
+
+async def test_0012_round_trips_exactly_on_an_empty_database() -> None:
+    engine = await _engine_at("_auth_round_trip", "0011")
+    try:
+        tables_0011, functions_0011 = await _public_tables(engine), await _public_functions(engine)
+        async with engine.connect() as connection:
+            actions_0011 = await connection.scalar(AUDIT_ACTION_CHECK)
+
+        await run_alembic(engine, lambda config: command.upgrade(config, "0012"))
+        assert await _public_tables(engine) == tables_0011 | {"user_credentials", "auth_sessions"}
+        assert await _public_functions(engine) == functions_0011 | {"forbid_auth_session_changes"}
+        async with engine.connect() as connection:
+            actions_0012 = await connection.scalar(AUDIT_ACTION_CHECK)
+        assert isinstance(actions_0012, str)
+        assert "auth.login" in actions_0012
+        assert "auth.logout" in actions_0012
+
+        await run_alembic(engine, lambda config: command.downgrade(config, "0011"))
+        assert await _public_tables(engine) == tables_0011
+        assert await _public_functions(engine) == functions_0011
+        async with engine.connect() as connection:
+            assert await connection.scalar(AUDIT_ACTION_CHECK) == actions_0011  # byte for byte
+
+        await run_alembic(engine, lambda config: command.upgrade(config, "0012"))
+        assert await _version(engine) == "0012"
+    finally:
+        await engine.dispose()
+
+
+async def test_0012_upgrades_a_populated_0011_database_without_backfilling() -> None:
+    engine = await _engine_at("_auth_populated", "0011")
+    try:
+        async with engine.begin() as connection:
+            await _post_raw_deposit(connection, amount=4_200)
+            await connection.execute(
+                text(
+                    "INSERT INTO audit_events (action, outcome, reason) "
+                    "VALUES ('user.register', 'rejected', 'email_already_registered')"
+                )
+            )
+        before = await _snapshot(engine)
+
+        await run_alembic(engine, lambda config: command.upgrade(config, "0012"))
+
+        assert await _snapshot(engine) == before  # every existing row unchanged
+        async with engine.connect() as connection:
+            # No credentials or sessions appear: existing users simply cannot log in.
+            assert await connection.scalar(text("SELECT count(*) FROM user_credentials")) == 0
+            assert await connection.scalar(text("SELECT count(*) FROM auth_sessions")) == 0
+            assert await connection.scalar(text("SELECT count(*) FROM users")) == 1
+    finally:
+        await engine.dispose()
+
+
+@pytest.mark.parametrize(
+    ("populate", "message"),
+    [
+        (
+            "INSERT INTO user_credentials (user_id, password_hash) VALUES (:user, :hash)",
+            "refusing to drop user_credentials",
+        ),
+        (
+            "INSERT INTO audit_events (action, outcome, reason) "
+            "VALUES ('auth.login', 'rejected', 'invalid_credentials')",
+            "authentication audit events exist",
+        ),
+    ],
+    ids=["credentials", "auth-audit-events"],
+)
+async def test_0012_downgrade_refuses_to_discard_credentials_or_auth_events(
+    populate: str, message: str
+) -> None:
+    engine = await _engine_at("_auth_guard", "0012")
+    try:
+        async with engine.begin() as connection:
+            user_id = await _new_user(connection)
+            await connection.execute(text(populate), {"user": user_id, "hash": ARGON2ID_SAMPLE})
+        rows = await _snapshot(engine)
+
+        with pytest.raises(DBAPIError) as excinfo:
+            await run_alembic(engine, lambda config: command.downgrade(config, "0011"))
+
+        assert sqlstate(excinfo.value) == "2BP01"  # dependent_objects_still_exist
+        assert message in str(excinfo.value.orig)
+        assert await _version(engine) == "0012"  # nothing of the downgrade survived
+        assert {"user_credentials", "auth_sessions"} <= await _public_tables(engine)
+        assert await _snapshot(engine) == rows
+        async with engine.connect() as connection:
+            assert (
+                await connection.scalar(text("SELECT count(*) FROM user_credentials"))
+                + await connection.scalar(
+                    text("SELECT count(*) FROM audit_events WHERE action LIKE 'auth.%'")
+                )
+            ) == 1
+    finally:
+        await engine.dispose()
+
+
+async def test_0012_downgrade_drops_sessions_when_nothing_else_is_at_stake() -> None:
+    # Sessions alone are not a reason to refuse: dropping them only logs everyone out.
+    engine = await _engine_at("_auth_sessions_only", "0012")
+    try:
+        async with engine.begin() as connection:
+            user_id = await _new_user(connection)
+            await connection.execute(
+                text(
+                    "INSERT INTO auth_sessions (user_id, token_hash, expires_at) "
+                    "VALUES (:user, decode(repeat('ab', 32), 'hex'), now() + interval '30 minutes')"
+                ),
+                {"user": user_id},
+            )
+
+        await run_alembic(engine, lambda config: command.downgrade(config, "0011"))
+
+        assert await _version(engine) == "0011"
+        assert not {"user_credentials", "auth_sessions"} & await _public_tables(engine)
+        assert "forbid_auth_session_changes" not in await _public_functions(engine)
+
+        await run_alembic(engine, lambda config: command.upgrade(config, "0012"))
+        async with engine.connect() as connection:
+            assert await connection.scalar(text("SELECT count(*) FROM auth_sessions")) == 0
+    finally:
+        await engine.dispose()

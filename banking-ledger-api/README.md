@@ -3,24 +3,24 @@
 A production-oriented banking backend built around a **double-entry ledger**: ACID money
 movement, concurrency control, idempotent APIs, and an append-only audit trail.
 
-> **Status: Phase 7 of 10. The REST API: postings, statements and transactions.**
-> Users can be registered and customer accounts opened and read. Deposits, withdrawals and
-> transfers are exposed over HTTP, each requiring an `Idempotency-Key`: a retried request never
-> moves money twice, and an unknown COMMIT outcome is recoverable. An account's statement (its
-> history with running balances) and any single transaction can be read back, always from the
-> owner's side. Every attempt is recorded in an append-only audit trail. **There is no
-> authentication yet (Phase 8).** The full design is documented in the [ADRs](docs/adr/).
+> **Status: Phase 8 of 10. Authentication and authorization.**
+> Users register with a password and log in for a 30-minute bearer token. Every user-scoped
+> route requires that token, and only its owner may use it on their own data. Deposits,
+> withdrawals and transfers require an `Idempotency-Key`: a retried request never moves money
+> twice, and an unknown COMMIT outcome is recoverable. Statements and single transactions are
+> read from the owner's side. Every attempt is recorded in an append-only audit trail. The full
+> design is documented in the [ADRs](docs/adr/).
 
 > [!WARNING]
-> **The API is unauthenticated until Phase 8.** Anyone who knows a user ID can act as that
-> user: move that user's money, replay their keyed requests, and read their accounts,
-> statements and transactions. Ownership scoping (below) only guarantees that an account is
-> reached through its true owner, not who the caller is. Do not expose the API to untrusted
-> clients. See [ADR 0009](docs/adr/0009-owner-scoped-access-and-error-responses.md).
+> **Not production-ready.** Authentication and authorization are implemented (see
+> [Security](#security)), but several controls a public deployment needs are not:
+> - **no rate limiting or lockout** against password guessing (Phase 10);
+> - **no HTTPS**: the local stack is plain HTTP on 127.0.0.1, and bearer tokens must only
+>   travel over TLS;
+> - **the application connects to PostgreSQL as a superuser** (the Compose bootstrap role),
+>   which can disable the append-only triggers; least-privilege roles are Phase 10.
 >
-> **The application connects to PostgreSQL as a superuser** (the Compose bootstrap role). The
-> append-only triggers protect against application bugs, not against that role, which can
-> disable them. Least-privilege database roles are planned hardening (Phase 10).
+> Do not expose it to untrusted networks.
 
 All data is synthetic. No real financial information, credentials or personal data are used.
 
@@ -66,6 +66,8 @@ banking-ledger-api/.venv/bin/pre-commit install
 | `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | db | (required) | Database bootstrap credentials |
 | `POSTGRES_PORT` | compose | `5432` | Host port, bound to 127.0.0.1 |
 | `API_PORT` | compose | `8000` | Host port, bound to 127.0.0.1 |
+| `AUTH_SESSION_TTL_SECONDS` | api | `1800` | Absolute lifetime of a login session (30 minutes; 60–86,400) |
+| `ARGON2_TIME_COST` / `ARGON2_MEMORY_COST_KIB` / `ARGON2_PARALLELISM` | api | `3` / `65536` / `4` | Argon2id password-hashing cost (RFC 9106 low-memory profile). With `APP_ENV=production`, anything below 19,456 KiB or 2 passes is refused at startup |
 
 ## Development commands
 
@@ -87,7 +89,9 @@ banking-ledger-api/.venv/bin/pre-commit install
 |---|---|---|
 | GET | `/health/live` | Liveness: the process is serving requests. It checks no dependencies |
 | GET | `/health/ready` | Readiness: PostgreSQL answers `SELECT 1` within 2 s. Otherwise `503 {"status": "unavailable"}` |
-| POST | `/users` | Register a user: `{"email"}`. `201` + `Location`; `409` if the email exists |
+| POST | `/users` | **Public.** Register: `{"email", "password"}` (12–128 characters). `201` + `Location`; the password is never returned; `409` if the email exists |
+| POST | `/sessions` | **Public.** Log in: `{"email", "password"}`. `201 {"access_token", "token_type": "bearer", "expires_at"}`; `401 invalid_credentials` |
+| DELETE | `/sessions/current` | Log out: revokes the bearer token of the request. `204` |
 | GET | `/users/{user_id}` | Get a user |
 | POST | `/users/{user_id}/accounts` | Open a customer account: `{"currency": "GBP" \| "EUR"}`. Balance starts at 0. `409` if the user already has one in that currency |
 | GET | `/users/{user_id}/accounts` | List the user's accounts: `{"items": [...]}` |
@@ -97,6 +101,10 @@ banking-ledger-api/.venv/bin/pre-commit install
 | POST | `/users/{user_id}/accounts/{account_id}/deposits` | Money in from outside: `{"amount_minor"}`. Requires `Idempotency-Key`. `201` + `Location` |
 | POST | `/users/{user_id}/accounts/{account_id}/withdrawals` | Money out to outside: `{"amount_minor"}`. Requires `Idempotency-Key`. `201` + `Location` |
 | POST | `/users/{user_id}/accounts/{account_id}/transfers` | To any customer account in the same currency: `{"destination_account_id", "amount_minor"}`. Requires `Idempotency-Key`. `201` + `Location` |
+
+Every route under `/users/{user_id}` requires `Authorization: Bearer <access_token>`, and
+`{user_id}` must be the token's user (see [Authentication](#authentication)). The health
+endpoints, registration and login are public.
 
 There is deliberately no separate `/balance` endpoint (`GET .../accounts/{account_id}` returns
 `balance_minor`) and no separate transaction list (the statement is the account's history).
@@ -108,16 +116,21 @@ Interactive documentation, including every request and response schema:
 
 ```bash
 curl -s -X POST localhost:8000/users -H 'content-type: application/json' \
-  -d '{"email": "Alice@Example.com"}'
+  -d '{"email": "Alice@Example.com", "password": "correct horse battery staple"}'
 # 201 {"id": "<uuid>", "email": "alice@example.com", "created_at": "..."}
 
+curl -s -X POST localhost:8000/sessions -H 'content-type: application/json' \
+  -d '{"email": "alice@example.com", "password": "correct horse battery staple"}'
+# 201 {"access_token": "lt_...", "token_type": "bearer", "expires_at": "..."}
+TOKEN='lt_...'   # valid for 30 minutes
+
 curl -s -X POST localhost:8000/users/<user_id>/accounts -H 'content-type: application/json' \
-  -d '{"currency": "GBP"}'
+  -H "Authorization: Bearer $TOKEN" -d '{"currency": "GBP"}'
 # 201 {"id": "<uuid>", "currency": "GBP", "balance_minor": 0, "created_at": "..."}
 
 curl -si -X POST localhost:8000/users/<user_id>/accounts/<account_id>/deposits \
-  -H 'content-type: application/json' -H 'Idempotency-Key: deposit-2026-10-10-001' \
-  -d '{"amount_minor": 2500}'
+  -H 'content-type: application/json' -H "Authorization: Bearer $TOKEN" \
+  -H 'Idempotency-Key: deposit-2026-10-10-001' -d '{"amount_minor": 2500}'
 # 201 {"transaction_id": "<uuid>", "kind": "deposit", "account_id": "<uuid>",
 #      "amount_minor": 2500, "balance_after_minor": 2500, "created_at": "..."}
 
@@ -126,21 +139,49 @@ curl -si -X POST localhost:8000/users/<user_id>/accounts/<account_id>/deposits \
 # The same request again (e.g. after a timeout): nothing is posted twice.
 # 201, same body, same Location, plus the header  Idempotent-Replayed: true
 
-curl -s 'localhost:8000/users/<user_id>/accounts/<account_id>/statement?limit=2'
+curl -s -H "Authorization: Bearer $TOKEN" \
+  'localhost:8000/users/<user_id>/accounts/<account_id>/statement?limit=2'
 # 200 {"account_id": "<uuid>", "balance_minor": 2500,
 #      "entries": [{"entry_id": "<uuid>", "transaction_id": "<uuid>", "kind": "deposit",
 #                   "amount_minor": 2500, "balance_after_minor": 2500, "created_at": "..."}],
 #      "next_cursor": null}
 
-curl -s localhost:8000/users/<user_id>/accounts/<account_id>/transactions/<transaction_id>
+curl -s -H "Authorization: Bearer $TOKEN" \
+  localhost:8000/users/<user_id>/accounts/<account_id>/transactions/<transaction_id>
 # 200 the same entry as on the statement
+
+curl -s -o /dev/null -w '%{http_code}\n' -X DELETE localhost:8000/sessions/current \
+  -H "Authorization: Bearer $TOKEN"
+# 204: the token is revoked; using it again answers 401 invalid_token
 ```
+
+### Authentication
+
+- **Register, then log in.** `POST /users` takes an email and a password. The password must be
+  12–128 characters after Unicode NFKC normalization, with no composition rules. `POST /sessions`
+  exchanges the email and password for an opaque bearer token (`lt_...`, 256 random bits),
+  shown exactly once, with `Cache-Control: no-store`.
+- **Sessions last 30 minutes,** absolutely (`expires_at`, set by the database's clock). There is
+  no refresh token: log in again. `DELETE /sessions/current` revokes the token immediately.
+- **Every route under `/users/{user_id}` needs `Authorization: Bearer <token>`**, and
+  `{user_id}` must be the token's user.
+  - No usable header (missing, empty, repeated, another scheme): `401 authentication_required`.
+  - A malformed, unknown, expired or revoked token: `401 invalid_token`. One answer for all.
+  - Every `401` carries `WWW-Authenticate: Bearer` (`invalid_token` adds `error="invalid_token"`).
+  - A valid token on another user's id, existing or not: `403 forbidden`, before anything is
+    read or written. It never claims an idempotency key or moves money.
+- **Login failures are indistinguishable:** an unknown email and a wrong password both answer
+  `401 invalid_credentials`, and cost the same work.
+- **Never stored or logged:** the password (only its Argon2id hash is stored) and the token
+  (only its SHA-256 digest is stored). Neither ever appears in a response other than the login,
+  in a log line, or in the audit trail.
 
 ### Rules
 
 - **Accounts are only reachable through their owner.** Every user-scoped route lives under
-  `/users/{user_id}`. Another user's account, a system (settlement) account and a missing
-  account all return the same `404`, so responses never reveal which IDs exist.
+  `/users/{user_id}`, which must be the caller. Within the caller's own scope, another user's
+  account, a system (settlement) account and a missing account all return the same `404`, so
+  responses never reveal which IDs exist.
 - **Clients never choose** an account's owner (it comes from the URL), its kind (always
   `customer`) or its balance (starts at 0). Unknown request fields are rejected with `422`.
 - **Emails** are stored in one canonical form: trimmed, syntax-checked, lowercased.
@@ -174,11 +215,15 @@ Every error body is `{"code": "...", "detail": ...}`:
 
 | Status | `code` | When |
 |---|---|---|
-| 404 | `user_not_found`, `account_not_found` | Unknown user; account missing or not the user's (a posting, statement or transaction read for an unknown user is `account_not_found`) |
+| 401 | `authentication_required` | No usable `Authorization: Bearer` header on a protected route or logout |
+| 401 | `invalid_token` | The bearer token is malformed, unknown, expired or revoked |
+| 401 | `invalid_credentials` | Login with an unknown email or a wrong password (indistinguishable) |
+| 403 | `forbidden` | A valid token on another user's `/users/{user_id}/...` (whether or not that user exists) |
+| 404 | `account_not_found` | Within the caller's own scope: the account is missing, someone else's, or a system account |
 | 404 | `destination_account_not_found` | A transfer's destination is missing or not a customer account |
 | 404 | `transaction_not_found` | The transaction has no entry on this account (it does not exist, or belongs to other accounts) |
 | 409 | `email_already_registered`, `account_already_exists` | Uniqueness rules (enforced by the database) |
-| 422 | `validation_error` | Invalid request. `detail` lists `{type, loc, msg}`; submitted values are never echoed |
+| 422 | `validation_error` | Invalid request, including a password outside the policy. `detail` lists `{type, loc, msg}`; submitted values (passwords included) are never echoed |
 | 422 | `invalid_amount`, `same_account_transfer`, `currency_mismatch`, `insufficient_funds` | Posting rules |
 | 422 | `idempotency_key_mismatch` | The `Idempotency-Key` was already used for a different request |
 | 422 | `invalid_statement_limit`, `invalid_statement_cursor` | A `limit` outside 1–100; a cursor that is not an entry of this account. (A non-integer `limit` or a malformed cursor is `validation_error`) |
@@ -209,7 +254,9 @@ lets that check work for a least-privilege role (a narrow `SECURITY DEFINER` seq
 tables they read; [`0010`](migrations/versions/0010_add_idempotency_keys.py) adds the
 append-only idempotency keys and
 [`0011`](migrations/versions/0011_link_transactions_to_idempotency_keys.py) makes each keyed
-transaction and its key reference each other.
+transaction and its key reference each other, and
+[`0012`](migrations/versions/0012_add_authentication.py) adds password credentials, bearer-token
+sessions and the authentication audit actions.
 
 ```
 users 1 ── 0..* accounts *── 1 ledgers 1 ── * transactions ── 0..1 audit_events (succeeded)
@@ -228,6 +275,8 @@ users 1 ── 0..* accounts *── 1 ledgers 1 ── * transactions ── 0.
 | `ledger_entries` | One signed `amount_minor` on one account, with a `sequence_number` that orders each account's entries in commit order. Append-only |
 | `audit_events` | One row per audited attempt: action, outcome (`succeeded`, `rejected`, `failed`), reason code, idempotency key, safe JSON details. Append-only |
 | `idempotency_keys` | One row per key a user consumed with a **committed** posting: the request fingerprint and the transaction it produced. Append-only, kept indefinitely |
+| `user_credentials` | A user's Argon2id password hash (only that encoding is accepted). Optional: users created before migration 0012 have none and cannot log in |
+| `auth_sessions` | One row per issued bearer token: only its SHA-256 digest, the database-time `created_at` and `expires_at`, and `revoked_at`. Rows are never edited except to be revoked, once |
 
 Conventions: UUIDv7 primary keys (exception: `audit_events.id` is a `BIGINT` identity, never
 exposed; its values have gaps); money is `BIGINT` minor units named `*_minor`; timestamps are
@@ -251,6 +300,7 @@ Invariants enforced by PostgreSQL itself, so every code path is bound by them:
 | A key is used once per user, by exactly one committed transaction, and never changes | Primary key `(user_id, key)`, unique `transaction_id` with a foreign key checked at `COMMIT`, append-only triggers; 0010's downgrade refuses a non-empty table |
 | A key is 1–255 visible ASCII characters; a fingerprint is 32 bytes | CHECK constraints |
 | A key and its transaction reference each other, and the transaction is the key owner's own posting: no key can be attached to an existing or another user's transaction | Columns on the immutable `transactions` row, unique and foreign-key constraints, and a link check at `COMMIT` on both tables (migration 0011) |
+| No plaintext password or token is stored; a session lasts at most 24 hours and can only be revoked once | An Argon2id-only `CHECK` on `user_credentials`; a unique 32-byte digest, an expiry-window `CHECK` and a revoke-only trigger on `auth_sessions` (migration 0012) |
 
 Triggers bind ordinary sessions only. A superuser or the table owner can disable them, and the
 application currently connects as a superuser, so these rules guard against application bugs,
@@ -316,8 +366,11 @@ only source of truth; Redis is never involved.
 
 ## Audit trail
 
-User registration, account opening and every posting attempt are recorded in `audit_events`
-([ADR 0011](docs/adr/0011-audit-trail.md)):
+User registration, account opening, every posting attempt, logins (successful and rejected)
+and logouts are recorded in `audit_events`
+([ADR 0011](docs/adr/0011-audit-trail.md), [ADR 0013](docs/adr/0013-authentication-and-authorization.md)).
+A rejected login records the email's user when the email is registered, never the email itself.
+Requests refused with `401` or `403` are not audited (no service runs):
 
 - **Succeeded** events are the last write of the business transaction: they commit with it or
   not at all, even when a deferred check rejects the transaction at `COMMIT`. If the audit
@@ -362,6 +415,41 @@ historical balance calculation (also used by idempotent replays).
   MVP; the documented upgrade path is persisted running balances with a gapless per-account
   sequence ([ADR 0012](docs/adr/0012-statement-ordering-and-reconciliation.md), "Alternatives
   considered").
+
+## Security
+
+**Implemented** ([ADR 0013](docs/adr/0013-authentication-and-authorization.md)):
+
+- Passwords: the 12–128-character policy after NFKC; Argon2id hashing, with production refusing
+  parameters below OWASP's minimum; hashing and verification run in a worker thread, never
+  while a database connection is held.
+- Opaque bearer tokens with 256 random bits. Only their SHA-256 digest is stored, so there is no
+  signing key to leak. A 30-minute absolute lifetime in database time, revocation on logout,
+  and no refresh tokens.
+- Authentication on every user-scoped route, and ownership (`{user_id}` must be the caller)
+  enforced by one router-level dependency before any service runs. Cross-user requests are
+  `403` and change nothing.
+- Login failures that don't reveal whether an email is registered (same answer, same cost).
+- No password, token or token digest in responses (apart from the login's token), logs, errors
+  or audit details. Validation errors never echo submitted values.
+- Owner-scoped lookups and identical 404s inside the caller's scope (ADR 0009); idempotency
+  keys scoped to the authenticated user; database-enforced ledger, idempotency and audit
+  invariants.
+
+**Not implemented** (deferred, so not controls this project provides today):
+
+- **Rate limiting and lockout** against password guessing and credential stuffing (Phase 10,
+  [ADR 0008](docs/adr/0008-redis-only-for-rate-limiting.md)). Each guess only costs one Argon2id
+  verification.
+- **Session cleanup** (expired rows accumulate), a **per-user session limit**, listing sessions,
+  and "revoke all sessions".
+- **A least-privilege database role** (Phase 10). The application connects as a superuser,
+  which can disable the append-only and integrity triggers.
+- **Production HTTPS.** The local stack serves plain HTTP on 127.0.0.1; a deployment needs TLS
+  termination, since bearer tokens must never travel unencrypted.
+- Password change and reset, email verification, MFA, roles and administrators.
+- Registration answers `409` for a registered email, which allows enumerating addresses; rate
+  limiting is the intended mitigation.
 
 ## Testing
 
@@ -449,6 +537,25 @@ Read API tests (Phase 7):
   and a `Location` on every `201` (the same on a replay) that leads to the posted transaction.
 - **OpenAPI**: every real `422` body matches the schema its route documents, for both shapes.
 
+Authentication tests (Phase 8):
+
+- **Domain**: the password policy (NFKC, lengths), Argon2id hashing that fails closed on any
+  other hash format, and token entropy, format and digests; no secret in `repr` or logs.
+- **Schema**: the credential and session constraints, the revoke-only trigger, and the
+  migration's upgrade, downgrade refusal (credentials or authentication audit events) and round
+  trip.
+- **Login and logout** with real commits: only the token digest is stored, with a 30-minute
+  expiry in database time; an unknown email and a wrong password fail identically and cost one
+  Argon2id verification each; concurrent duplicate registrations create one user; concurrent
+  logouts revoke once. On a one-connection pool, Argon2id never runs on the event loop or while
+  a database connection is held.
+- **Enforcement on every route**: an explicit route inventory; on all nine protected routes,
+  missing, malformed, unknown, expired and revoked tokens are `401`, the owner succeeds, and
+  another user's token is `403`; refused cross-user postings change no balance, entry,
+  idempotency key or audit event; another user cannot replay a keyed posting; no token or digest
+  appears in responses, logs or audit details. A full authenticated flow on a one-connection
+  pool leaves no transaction open and no connection held after any request.
+
 CI runs the same suite against a PostgreSQL service container and smoke-tests the Compose
 stack.
 
@@ -468,6 +575,7 @@ stack.
 | [0010](docs/adr/0010-posting-protocol.md) | Posting protocol: sealed transactions, one sorted lock, whole-transaction retries |
 | [0011](docs/adr/0011-audit-trail.md) | Audit trail: schema, write protocol, scope and the limits of trigger protection |
 | [0012](docs/adr/0012-statement-ordering-and-reconciliation.md) | Commit-ordered entries, statements with computed running balances, independent reconciliation |
+| [0013](docs/adr/0013-authentication-and-authorization.md) | Password login (Argon2id) with opaque, database-backed bearer tokens; one router-level ownership check |
 
 ## Roadmap
 
@@ -478,6 +586,6 @@ stack.
 5. ✅ Audit trail, statements (service layer) and reconciliation
 6. ✅ Idempotency and the HTTP posting API (deposits, withdrawals, transfers)
 7. ✅ REST API: statements, single transactions, `Location` on postings
-8. Authentication and authorization
+8. ✅ Authentication and authorization (password login, bearer tokens, ownership on every user-scoped route)
 9. Reliability
 10. Security and observability (including least-privilege database roles)

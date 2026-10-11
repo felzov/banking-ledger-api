@@ -13,6 +13,7 @@ from httpx import AsyncClient, Response
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ledger_api.domain.currency import Currency
+from tests.auth_helpers import OWNER_TOKENS, signup
 from tests.factories import get_settlement_account
 
 ENTRY_FIELDS = {
@@ -28,9 +29,7 @@ ACCOUNT_NOT_FOUND = {"code": "account_not_found", "detail": "Account not found."
 
 
 async def _user(client: AsyncClient) -> str:
-    response = await client.post("/users", json={"email": f"u-{uuid.uuid7().hex}@example.com"})
-    assert response.status_code == 201, response.text
-    user_id: str = response.json()["id"]
+    user_id = (await signup(client)).user_id
     return user_id
 
 
@@ -217,10 +216,16 @@ async def test_the_account_is_checked_before_the_transaction(
         (user_id, other_account),
         (user_id, str(settlement.id)),
         (user_id, str(uuid.uuid7())),
-        (str(uuid.uuid7()), other_account),
     ]:
         status_code, body = await _get(api_client, owner, account, theirs["transaction_id"])
         assert (status_code, body) == (404, ACCOUNT_NOT_FOUND), (owner, account)
+
+    # Another user id in the path, with the caller's token: 403 before any lookup (Phase 8).
+    response = await api_client.get(
+        _path(str(uuid.uuid7()), other_account, theirs["transaction_id"]),
+        headers={"Authorization": f"Bearer {OWNER_TOKENS[api_client][user_id]}"},
+    )
+    assert (response.status_code, response.json()["code"]) == (403, "forbidden")
 
 
 async def test_a_malformed_transaction_id_is_a_validation_error(api_client: AsyncClient) -> None:

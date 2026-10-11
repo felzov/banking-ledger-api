@@ -23,6 +23,7 @@ from ledger_api.domain.errors import (
 )
 from ledger_api.domain.transaction import TransactionKind
 from ledger_api.services.posting import PostingResult, deposit, transfer, withdraw
+from tests.auth_helpers import grant_token
 from tests.conftest import SessionFactory
 from tests.database import assert_reconciled
 from tests.factories import create_customer_account, create_user, get_settlement_account
@@ -370,6 +371,7 @@ async def test_account_api_shows_the_posted_balance(
     account = await _account(db_session)
     owner_id = await _owner(account)
     await _fund(new_session, account, 4_200)
+    await grant_token(api_client, db_session, owner_id)  # a factory user: no password
 
     response = await api_client.get(f"/users/{owner_id}/accounts/{account.id}")
 

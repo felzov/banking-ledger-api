@@ -19,6 +19,7 @@ from ledger_api.domain.currency import Currency
 from ledger_api.domain.errors import CommitOutcomeUnknownError
 from ledger_api.domain.posting import MAX_AMOUNT_MINOR
 from ledger_api.services.posting import PostingResult
+from tests.auth_helpers import OWNER_TOKENS, signup
 from tests.factories import get_settlement_account
 
 POSTING_FIELDS = {
@@ -36,9 +37,7 @@ def _key() -> str:
 
 
 async def _create_user(client: AsyncClient) -> str:
-    response = await client.post("/users", json={"email": f"u-{uuid.uuid7().hex}@example.com"})
-    assert response.status_code == 201, response.text
-    user_id: str = response.json()["id"]
+    user_id = (await signup(client)).user_id
     return user_id
 
 
@@ -384,12 +383,11 @@ async def test_business_rejections_map_to_their_codes(
             404,
             "destination_account_not_found",
         ),
-        # Someone else's account, a settlement account, a missing account, an unknown user:
-        # all the same 404 (ADR 0009).
+        # Someone else's account, a settlement account, a missing account, all on the
+        # caller's own path: the same 404 (ADR 0009).
         (user_id, other_account, "withdrawals", {"amount_minor": 1}, 404, "account_not_found"),
         (user_id, str(settlement.id), "deposits", {"amount_minor": 1}, 404, "account_not_found"),
         (user_id, str(uuid.uuid7()), "deposits", {"amount_minor": 1}, 404, "account_not_found"),
-        (str(uuid.uuid7()), account_id, "deposits", {"amount_minor": 1}, 404, "account_not_found"),
     ]
     for owner, account, operation, body, status_code, code in cases:
         response = await _post(api_client, owner, account, operation, body)
@@ -397,6 +395,16 @@ async def test_business_rejections_map_to_their_codes(
             operation,
             body,
         )
+
+    # Another user id in the path, with the caller's own token: refused before anything else
+    # (Phase 8, 403 forbidden; it used to be 404 account_not_found).
+    caller_token = OWNER_TOKENS[api_client][user_id]
+    response = await api_client.post(
+        f"/users/{uuid.uuid7()}/accounts/{account_id}/deposits",
+        json={"amount_minor": 1},
+        headers={"Authorization": f"Bearer {caller_token}", "Idempotency-Key": _key()},
+    )
+    assert (response.status_code, response.json()["code"]) == (403, "forbidden")
 
     assert await _balance(api_client, user_id, account_id) == 100
     assert await _balance(api_client, other_user, other_account) == 0

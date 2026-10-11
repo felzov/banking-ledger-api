@@ -2,6 +2,7 @@
 
 from ledger_api.data.models.account import Account
 from ledger_api.data.models.audit import AuditEvent
+from ledger_api.data.models.auth import AuthSession, UserCredential
 from ledger_api.data.models.idempotency import IdempotencyKey
 from ledger_api.data.models.ledger import Ledger
 from ledger_api.data.models.transaction import LedgerEntry, Transaction
@@ -10,9 +11,11 @@ from ledger_api.data.models.user import User
 __all__ = [
     "Account",
     "AuditEvent",
+    "AuthSession",
     "IdempotencyKey",
     "Ledger",
     "LedgerEntry",
     "Transaction",
     "User",
+    "UserCredential",
 ]

@@ -14,6 +14,7 @@ from httpx import AsyncClient
 from pydantic import BaseModel, ValidationError
 
 from ledger_api.api.errors import ErrorResponse, ValidationErrorResponse
+from tests.auth_helpers import signup
 
 MODELS: dict[str, type[BaseModel]] = {
     "#/components/schemas/ErrorResponse": ErrorResponse,
@@ -45,9 +46,9 @@ def _validates(model: type[BaseModel], body: Any) -> bool:
 
 
 async def _customer(client: AsyncClient) -> tuple[str, str]:
-    user = (await client.post("/users", json={"email": f"u-{uuid.uuid7().hex}@example.com"})).json()
-    account = (await client.post(f"/users/{user['id']}/accounts", json={"currency": "GBP"})).json()
-    return user["id"], account["id"]
+    user_id = (await signup(client)).user_id
+    account = (await client.post(f"/users/{user_id}/accounts", json={"currency": "GBP"})).json()
+    return user_id, account["id"]
 
 
 def _key() -> dict[str, str]:

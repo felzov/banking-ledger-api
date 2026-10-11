@@ -25,6 +25,10 @@ class RuleViolationError(DomainError):
     """A well-formed request that a business rule rejects (e.g. insufficient funds)."""
 
 
+class AuthenticationError(DomainError):
+    """The caller could not be authenticated (e.g. a failed login)."""
+
+
 class UnavailableError(DomainError):
     """A transient condition (contention): nothing happened, and retrying may succeed."""
 
@@ -51,6 +55,19 @@ class TransactionNotFoundError(NotFoundError):
     # not exist or belongs only to other accounts is deliberately indistinguishable.
     code = "transaction_not_found"
     message = "Transaction not found."
+
+
+class InvalidCredentialsError(AuthenticationError):
+    # An unknown email and a wrong password are deliberately indistinguishable: the response
+    # never reveals whether an email address is registered.
+    code = "invalid_credentials"
+    message = "Invalid email or password."
+
+
+class InvalidTokenError(AuthenticationError):
+    # Unknown, expired, revoked or malformed: deliberately one answer.
+    code = "invalid_token"
+    message = "The bearer token is invalid, expired or revoked."
 
 
 class EmailAlreadyRegisteredError(ConflictError):

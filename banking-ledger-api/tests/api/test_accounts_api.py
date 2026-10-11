@@ -6,13 +6,14 @@ from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ledger_api.domain.currency import Currency
+from tests.auth_helpers import signup
 from tests.factories import get_settlement_account
+
+FORBIDDEN = {"code": "forbidden", "detail": "You may only access your own resources."}
 
 
 async def _create_user(client: AsyncClient) -> str:
-    response = await client.post("/users", json={"email": f"u-{uuid.uuid7().hex}@example.com"})
-    assert response.status_code == 201, response.text
-    user_id: str = response.json()["id"]
+    user_id = (await signup(client)).user_id
     return user_id
 
 
@@ -65,13 +66,21 @@ async def test_second_account_in_the_same_currency_returns_409(api_client: Async
     }
 
 
-async def test_opening_an_account_for_an_unknown_user_returns_404(
+async def test_opening_an_account_under_another_user_id_is_forbidden(
     api_client: AsyncClient,
 ) -> None:
-    response = await api_client.post(f"/users/{uuid.uuid7()}/accounts", json={"currency": "GBP"})
+    # Since Phase 8 the path's user must be the caller: an unknown user id is refused before
+    # any lookup (403, revealing nothing), where it used to be 404 user_not_found.
+    caller = await signup(api_client)
 
-    assert response.status_code == 404
-    assert response.json() == {"code": "user_not_found", "detail": "User not found."}
+    response = await api_client.post(
+        f"/users/{uuid.uuid7()}/accounts", json={"currency": "GBP"}, headers=caller.headers
+    )
+
+    assert response.status_code == 403
+    assert response.json() == FORBIDDEN
+    listed = await api_client.get(f"/users/{caller.user_id}/accounts")
+    assert listed.json() == {"items": []}
 
 
 @pytest.mark.parametrize(
@@ -126,11 +135,12 @@ async def test_list_returns_the_users_accounts_in_creation_order(api_client: Asy
     assert response.json() == {"items": [eur, gbp]}
 
 
-async def test_list_for_an_unknown_user_returns_404(api_client: AsyncClient) -> None:
-    response = await api_client.get(f"/users/{uuid.uuid7()}/accounts")
+async def test_listing_another_user_ids_accounts_is_forbidden(api_client: AsyncClient) -> None:
+    caller = await signup(api_client)
 
-    assert response.status_code == 404
-    assert response.json()["code"] == "user_not_found"
+    response = await api_client.get(f"/users/{uuid.uuid7()}/accounts", headers=caller.headers)
+
+    assert (response.status_code, response.json()) == (403, FORBIDDEN)
 
 
 async def test_get_account_returns_it_to_its_owner(api_client: AsyncClient) -> None:
@@ -204,8 +214,10 @@ async def test_accounts_are_isolated_even_with_an_unknown_user_in_the_path(
 ) -> None:
     owner = await _create_user(api_client)
     account = await _open_account(api_client, owner, "GBP")
+    caller = await signup(api_client)
 
-    response = await api_client.get(f"/users/{uuid.uuid7()}/accounts/{account['id']}")
+    response = await api_client.get(
+        f"/users/{uuid.uuid7()}/accounts/{account['id']}", headers=caller.headers
+    )
 
-    assert response.status_code == 404
-    assert response.json()["code"] == "account_not_found"
+    assert (response.status_code, response.json()) == (403, FORBIDDEN)

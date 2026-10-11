@@ -8,9 +8,11 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from ledger_api.domain.errors import (
+    AuthenticationError,
     ConflictError,
     DomainError,
     InternalError,
+    InvalidTokenError,
     NotFoundError,
     RuleViolationError,
     UnavailableError,
@@ -18,6 +20,7 @@ from ledger_api.domain.errors import (
 
 # Domain errors are mapped by category, so a new error type needs no change here.
 STATUS_BY_CATEGORY: dict[type[DomainError], int] = {
+    AuthenticationError: status.HTTP_401_UNAUTHORIZED,
     NotFoundError: status.HTTP_404_NOT_FOUND,
     ConflictError: status.HTTP_409_CONFLICT,
     RuleViolationError: status.HTTP_422_UNPROCESSABLE_CONTENT,
@@ -39,9 +42,23 @@ class ApiError(Exception):
     status_code: ClassVar[int]
     code: ClassVar[str]
     message: ClassVar[str]
+    headers: ClassVar[dict[str, str]] = {}
 
     def __init__(self) -> None:
         super().__init__(self.message)
+
+
+# Every 401 carries a challenge (RFC 9110); a rejected token says so (RFC 6750).
+BEARER_CHALLENGE = "Bearer"
+INVALID_TOKEN_CHALLENGE = 'Bearer error="invalid_token"'  # noqa: S105 (a header value, not a secret)
+
+
+class AuthenticationRequiredError(ApiError):
+    # No usable Authorization header: missing, empty, repeated or not the Bearer scheme.
+    status_code = status.HTTP_401_UNAUTHORIZED
+    code = "authentication_required"
+    message = "This request requires a bearer token."
+    headers: ClassVar[dict[str, str]] = {"WWW-Authenticate": BEARER_CHALLENGE}
 
 
 class IdempotencyKeyRequiredError(ApiError):
@@ -55,6 +72,14 @@ class InvalidIdempotencyKeyError(ApiError):
     status_code = status.HTTP_422_UNPROCESSABLE_CONTENT
     code = "invalid_idempotency_key"
     message = "The Idempotency-Key header must be one value of 1-255 visible ASCII characters."
+
+
+class ForbiddenError(ApiError):
+    # Authenticated, but {user_id} in the path is not the caller. Decided from the path and the
+    # token alone, with no lookup, so it reveals nothing about whether that user exists.
+    status_code = status.HTTP_403_FORBIDDEN
+    code = "forbidden"
+    message = "You may only access your own resources."
 
 
 class ErrorResponse(BaseModel):
@@ -79,14 +104,23 @@ async def _domain_error(request: Request, exc: Exception) -> JSONResponse:
     if not isinstance(exc, DomainError):  # registered for DomainError only
         raise exc
     body = ErrorResponse(code=exc.code, detail=exc.message)
-    return JSONResponse(status_code=status_for(exc), content=body.model_dump())
+    status_code = status_for(exc)
+    headers = None
+    if status_code == status.HTTP_401_UNAUTHORIZED:
+        challenge = (
+            INVALID_TOKEN_CHALLENGE if isinstance(exc, InvalidTokenError) else BEARER_CHALLENGE
+        )
+        headers = {"WWW-Authenticate": challenge}
+    return JSONResponse(status_code=status_code, content=body.model_dump(), headers=headers)
 
 
 async def _api_error(request: Request, exc: Exception) -> JSONResponse:
     if not isinstance(exc, ApiError):  # registered for ApiError only
         raise exc
     body = ErrorResponse(code=exc.code, detail=exc.message)
-    return JSONResponse(status_code=exc.status_code, content=body.model_dump())
+    return JSONResponse(
+        status_code=exc.status_code, content=body.model_dump(), headers=exc.headers or None
+    )
 
 
 async def _validation_error(request: Request, exc: Exception) -> JSONResponse:

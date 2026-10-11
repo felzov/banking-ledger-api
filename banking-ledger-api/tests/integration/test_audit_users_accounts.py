@@ -20,6 +20,7 @@ from ledger_api.domain.errors import (
 from ledger_api.services import audit as audit_service
 from ledger_api.services.accounts import open_customer_account
 from ledger_api.services.users import register_user
+from tests.auth_helpers import TEST_PASSWORD, signup
 from tests.conftest import SessionFactory
 
 
@@ -152,8 +153,7 @@ async def test_failed_account_opening_never_names_the_rolled_back_account(
 async def test_reads_and_malformed_requests_are_not_audited(
     api_client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    response = await api_client.post("/users", json={"email": "reader@example.com"})
-    user_id = response.json()["id"]
+    user_id = (await signup(api_client, "reader@example.com")).user_id
     since = await _latest_event_id(db_session)
 
     assert (await api_client.get(f"/users/{user_id}")).status_code == 200
@@ -168,10 +168,14 @@ async def test_reads_and_malformed_requests_are_not_audited(
 async def test_api_rejection_is_audited_and_still_returns_the_business_error(
     api_client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    await api_client.post("/users", json={"email": "api-dup@example.com"})
+    await api_client.post(
+        "/users", json={"email": "api-dup@example.com", "password": TEST_PASSWORD}
+    )
     since = await _latest_event_id(db_session)
 
-    response = await api_client.post("/users", json={"email": "api-dup@example.com"})
+    response = await api_client.post(
+        "/users", json={"email": "api-dup@example.com", "password": TEST_PASSWORD}
+    )
 
     assert response.status_code == 409
     assert response.json()["code"] == "email_already_registered"

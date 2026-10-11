@@ -94,3 +94,21 @@ authentication is added. Phase 3 also needs a first, consistent error format.
   document only `validation_error`, which is all they can return. A test validates real 422
   bodies against the documented schema.
 - Still unauthenticated until Phase 8; these reads are as exposed as every other route.
+
+## Amendment (Phase 8, 2026-10-11): authentication enforced (ADR 0013)
+
+- **The API is authenticated.** The router-level dependency this ADR planned now exists: every
+  route under `/users/{user_id}` requires a valid bearer token, and the caller must be
+  `{user_id}`. The consequence "unauthenticated until Phase 8" no longer applies.
+- **Another user's id is `403 forbidden`, no longer a `404`.** `GET /users/{other}`,
+  `/users/{other}/accounts`, and every route under another user's id, existing or not, answer
+  403. The check compares the path with the token without a lookup, so it reveals nothing about
+  whether that user exists. Without a valid token the answer is `401` (`authentication_required`
+  or `invalid_token`).
+- **Inside the caller's own scope, nothing changes:** someone else's account, a system account
+  and a missing account are still the same `404 account_not_found`, through the owner-scoped
+  lookup; `transaction_not_found` and `destination_account_not_found` are unchanged.
+- `user_not_found` can no longer be reached through the API: the path's user is always the
+  authenticated caller, who exists.
+- The architecture tests are joined by an explicit route inventory: every route is classified
+  as public or protected, and every protected route is tested for 401 and 403.

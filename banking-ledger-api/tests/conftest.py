@@ -13,6 +13,7 @@ from ledger_api.api.dependencies import get_session
 from ledger_api.config import Settings
 from ledger_api.data.engine import create_engine
 from ledger_api.main import create_app
+from tests.auth_helpers import OWNER_TOKENS, authenticate_as_path_owner
 from tests.database import (
     configured_database_url,
     disposable_database_url,
@@ -27,7 +28,15 @@ UNREACHABLE_DATABASE_URL = "postgresql+asyncpg://ledger:synthetic@127.0.0.1:1/le
 def settings_for(database_url: URL | str) -> Settings:
     if isinstance(database_url, URL):
         database_url = database_url.render_as_string(hide_password=False)
-    return Settings(app_env="test", database_url=SecretStr(database_url))
+    # Cheapest Argon2id parameters: the suite tests the protocol, not Argon2's cost. Only
+    # allowed outside production (Settings refuses them there).
+    return Settings(
+        app_env="test",
+        database_url=SecretStr(database_url),
+        argon2_time_cost=1,
+        argon2_memory_cost_kib=8,
+        argon2_parallelism=1,
+    )
 
 
 @pytest.fixture(scope="session")
@@ -140,4 +149,18 @@ async def api_client(app: FastAPI, new_session: SessionFactory) -> AsyncIterator
 
     app.dependency_overrides[get_session] = session_on_test_connection
     async with serve(app) as client:
+        # Acts as the owner of a /users/{user_id} path only for users the test signed up or
+        # granted a token (tests.auth_helpers); everything else goes out unauthenticated.
+        tokens: dict[str, str] = {}
+        OWNER_TOKENS[client] = tokens
+        client.event_hooks["request"].append(authenticate_as_path_owner(tokens))
+        yield client
+
+
+@pytest.fixture
+async def anonymous_client(api_client: AsyncClient, app: FastAPI) -> AsyncIterator[AsyncClient]:
+    """A second client on the same app and rolled-back connection, never adding a token."""
+    async with AsyncClient(
+        transport=ASGITransport(app=app), base_url="http://testserver"
+    ) as client:
         yield client
