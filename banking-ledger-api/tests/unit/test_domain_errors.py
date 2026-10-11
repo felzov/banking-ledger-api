@@ -1,6 +1,7 @@
 import pytest
 
 from ledger_api.domain.errors import (
+    AuthenticationError,
     ConflictError,
     DomainError,
     InternalError,
@@ -36,7 +37,14 @@ def test_every_concrete_error_has_a_code_message_and_category(
     assert error_type.message
     assert issubclass(
         error_type,
-        (NotFoundError, ConflictError, RuleViolationError, UnavailableError, InternalError),
+        (
+            AuthenticationError,
+            NotFoundError,
+            ConflictError,
+            RuleViolationError,
+            UnavailableError,
+            InternalError,
+        ),
     )
 
 

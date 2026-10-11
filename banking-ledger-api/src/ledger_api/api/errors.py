@@ -8,6 +8,7 @@ from fastapi.responses import JSONResponse
 from pydantic import BaseModel
 
 from ledger_api.domain.errors import (
+    AuthenticationError,
     ConflictError,
     DomainError,
     InternalError,
@@ -18,6 +19,7 @@ from ledger_api.domain.errors import (
 
 # Domain errors are mapped by category, so a new error type needs no change here.
 STATUS_BY_CATEGORY: dict[type[DomainError], int] = {
+    AuthenticationError: status.HTTP_401_UNAUTHORIZED,
     NotFoundError: status.HTTP_404_NOT_FOUND,
     ConflictError: status.HTTP_409_CONFLICT,
     RuleViolationError: status.HTTP_422_UNPROCESSABLE_CONTENT,
