@@ -24,10 +24,22 @@ from tests.database import (
 UNREACHABLE_DATABASE_URL = "postgresql+asyncpg://ledger:synthetic@127.0.0.1:1/ledger"
 
 
+# The test password used to register users through the API (synthetic).
+TEST_PASSWORD = "correct horse battery staple"  # noqa: S105 (synthetic test data)
+
+
 def settings_for(database_url: URL | str) -> Settings:
     if isinstance(database_url, URL):
         database_url = database_url.render_as_string(hide_password=False)
-    return Settings(app_env="test", database_url=SecretStr(database_url))
+    # Cheapest Argon2id parameters: the suite tests the protocol, not Argon2's cost. Only
+    # allowed outside production (Settings refuses them there).
+    return Settings(
+        app_env="test",
+        database_url=SecretStr(database_url),
+        argon2_time_cost=1,
+        argon2_memory_cost_kib=8,
+        argon2_parallelism=1,
+    )
 
 
 @pytest.fixture(scope="session")

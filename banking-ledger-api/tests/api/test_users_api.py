@@ -5,9 +5,11 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
+from tests.conftest import TEST_PASSWORD
+
 
 async def _create_user(client: AsyncClient, email: str) -> dict[str, Any]:
-    response = await client.post("/users", json={"email": email})
+    response = await client.post("/users", json={"email": email, "password": TEST_PASSWORD})
     assert response.status_code == 201, response.text
     body: dict[str, Any] = response.json()
     return body
@@ -26,7 +28,9 @@ def _assert_validation_error_without_echo(body: dict[str, Any], *submitted: str)
 
 
 async def test_create_user_returns_201_with_location_and_the_user(api_client: AsyncClient) -> None:
-    response = await api_client.post("/users", json={"email": "alice@example.com"})
+    response = await api_client.post(
+        "/users", json={"email": "alice@example.com", "password": TEST_PASSWORD}
+    )
 
     assert response.status_code == 201
     body = response.json()
@@ -47,7 +51,9 @@ async def test_create_user_stores_the_canonical_email(api_client: AsyncClient) -
 async def test_duplicate_email_in_any_case_returns_409(api_client: AsyncClient) -> None:
     await _create_user(api_client, "bob@example.com")
 
-    response = await api_client.post("/users", json={"email": "BOB@Example.com"})
+    response = await api_client.post(
+        "/users", json={"email": "BOB@Example.com", "password": TEST_PASSWORD}
+    )
 
     assert response.status_code == 409
     assert response.json() == {
@@ -63,20 +69,24 @@ async def test_duplicate_email_in_any_case_returns_409(api_client: AsyncClient) 
 async def test_invalid_email_returns_422_without_echoing_it(
     api_client: AsyncClient, email: str
 ) -> None:
-    response = await api_client.post("/users", json={"email": email})
+    response = await api_client.post("/users", json={"email": email, "password": TEST_PASSWORD})
 
     assert response.status_code == 422
-    _assert_validation_error_without_echo(response.json(), email, "secret")
+    _assert_validation_error_without_echo(response.json(), email, "secret", TEST_PASSWORD)
 
 
 @pytest.mark.parametrize(
     "payload",
     [
         {},
-        {"email": None},
-        {"email": 42},
-        {"email": "x" * 321},
-        {"email": "carol@example.com", "id": str(uuid.uuid7())},  # extra fields are rejected
+        {"email": None, "password": TEST_PASSWORD},
+        {"email": 42, "password": TEST_PASSWORD},
+        {"email": "x" * 321, "password": TEST_PASSWORD},
+        {"email": "carol@example.com"},  # the password is required
+        {"email": "carol@example.com", "password": None},
+        {"email": "carol@example.com", "password": 123456789012},
+        # extra fields are rejected
+        {"email": "carol@example.com", "password": TEST_PASSWORD, "id": str(uuid.uuid7())},
     ],
 )
 async def test_malformed_create_user_requests_return_422(

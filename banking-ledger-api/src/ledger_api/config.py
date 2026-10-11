@@ -28,6 +28,10 @@ class Settings(BaseSettings):
     argon2_memory_cost_kib: int = Field(DEFAULT_PARAMETERS.memory_cost, ge=8)
     argon2_parallelism: int = Field(DEFAULT_PARAMETERS.parallelism, ge=1)
 
+    # Absolute lifetime of a login session (ADR 0013): 30 minutes, no refresh. Bounded by the
+    # database's 24-hour cap (ck_auth_sessions_expiry_window).
+    auth_session_ttl_seconds: int = Field(1_800, ge=60, le=86_400)
+
     @field_validator("database_url")
     @classmethod
     def _require_asyncpg_driver(cls, value: SecretStr) -> SecretStr:

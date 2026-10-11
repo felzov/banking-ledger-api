@@ -64,6 +64,12 @@ class InvalidCredentialsError(AuthenticationError):
     message = "Invalid email or password."
 
 
+class InvalidTokenError(AuthenticationError):
+    # Unknown, expired, revoked or malformed: deliberately one answer.
+    code = "invalid_token"
+    message = "The bearer token is invalid, expired or revoked."
+
+
 class EmailAlreadyRegisteredError(ConflictError):
     code = "email_already_registered"
     message = "A user with this email address already exists."

@@ -16,6 +16,7 @@ from ledger_api.api.routes import accounts as accounts_routes
 from ledger_api.domain.currency import Currency
 from ledger_api.domain.errors import StatementInconsistencyError
 from ledger_api.services.statements import DEFAULT_LIMIT, MAX_LIMIT, StatementPage
+from tests.conftest import TEST_PASSWORD
 from tests.factories import get_settlement_account
 
 ENTRY_FIELDS = {
@@ -30,7 +31,9 @@ NOT_FOUND = {"code": "account_not_found", "detail": "Account not found."}
 
 
 async def _customer(client: AsyncClient, currency: str = "GBP") -> tuple[str, str]:
-    response = await client.post("/users", json={"email": f"u-{uuid.uuid7().hex}@example.com"})
+    response = await client.post(
+        "/users", json={"email": f"u-{uuid.uuid7().hex}@example.com", "password": TEST_PASSWORD}
+    )
     assert response.status_code == 201, response.text
     user_id: str = response.json()["id"]
     response = await client.post(f"/users/{user_id}/accounts", json={"currency": currency})

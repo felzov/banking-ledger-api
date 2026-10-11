@@ -4,9 +4,10 @@ from contextlib import asynccontextmanager
 from fastapi import APIRouter, FastAPI
 
 from ledger_api.api.errors import register_error_handlers
-from ledger_api.api.routes import accounts, health, postings, users
+from ledger_api.api.routes import accounts, health, postings, sessions, users
 from ledger_api.config import Settings
 from ledger_api.data.engine import create_engine, create_sessionmaker
+from ledger_api.domain.passwords import make_hasher
 
 
 def create_app(settings: Settings | None = None) -> FastAPI:
@@ -28,9 +29,12 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
     app = FastAPI(title="Banking Ledger API", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings
+    # One Argon2id hasher per process, with the configured cost (ADR 0013).
+    app.state.password_hasher = make_hasher(settings.argon2_parameters())
     register_error_handlers(app)
     app.include_router(health.router)
     app.include_router(users.router)
+    app.include_router(sessions.router)
     app.include_router(_user_scoped_router())
     return app
 

@@ -12,6 +12,8 @@ worker thread (asyncio.to_thread), and never while holding a database connection
 Nothing here logs, and no error carries the password, the hash or any part of either.
 """
 
+import functools
+import secrets
 import unicodedata
 from dataclasses import dataclass
 
@@ -111,6 +113,18 @@ def verify_password(hasher: PasswordHasher, password_hash: str, raw: str) -> boo
         return False
     except (InvalidHashError, VerificationError) as error:
         raise MalformedPasswordHashError from error
+
+
+@functools.cache
+def dummy_password_hash(parameters: Argon2Parameters) -> str:
+    """An Argon2id hash of a random, discarded password, made with `parameters`.
+
+    A login for an unknown email verifies the submitted password against it, so that it costs
+    the same as a login with a wrong password: the response time does not reveal whether the
+    email is registered. Computed once per parameter set (slow: call from a worker thread the
+    first time); nothing can ever verify against it.
+    """
+    return make_hasher(parameters).hash(secrets.token_urlsafe(32))
 
 
 def needs_rehash(hasher: PasswordHasher, password_hash: str) -> bool:

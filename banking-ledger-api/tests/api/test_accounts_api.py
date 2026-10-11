@@ -6,11 +6,14 @@ from httpx import AsyncClient
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ledger_api.domain.currency import Currency
+from tests.conftest import TEST_PASSWORD
 from tests.factories import get_settlement_account
 
 
 async def _create_user(client: AsyncClient) -> str:
-    response = await client.post("/users", json={"email": f"u-{uuid.uuid7().hex}@example.com"})
+    response = await client.post(
+        "/users", json={"email": f"u-{uuid.uuid7().hex}@example.com", "password": TEST_PASSWORD}
+    )
     assert response.status_code == 201, response.text
     user_id: str = response.json()["id"]
     return user_id

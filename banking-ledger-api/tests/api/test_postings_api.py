@@ -19,6 +19,7 @@ from ledger_api.domain.currency import Currency
 from ledger_api.domain.errors import CommitOutcomeUnknownError
 from ledger_api.domain.posting import MAX_AMOUNT_MINOR
 from ledger_api.services.posting import PostingResult
+from tests.conftest import TEST_PASSWORD
 from tests.factories import get_settlement_account
 
 POSTING_FIELDS = {
@@ -36,7 +37,9 @@ def _key() -> str:
 
 
 async def _create_user(client: AsyncClient) -> str:
-    response = await client.post("/users", json={"email": f"u-{uuid.uuid7().hex}@example.com"})
+    response = await client.post(
+        "/users", json={"email": f"u-{uuid.uuid7().hex}@example.com", "password": TEST_PASSWORD}
+    )
     assert response.status_code == 201, response.text
     user_id: str = response.json()["id"]
     return user_id

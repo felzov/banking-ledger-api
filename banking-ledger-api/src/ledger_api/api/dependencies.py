@@ -1,10 +1,18 @@
 from collections.abc import AsyncIterator
+from datetime import timedelta
 from typing import Annotated
 
+from argon2 import PasswordHasher
 from fastapi import Depends, Header, Request
+from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
-from ledger_api.api.errors import IdempotencyKeyRequiredError, InvalidIdempotencyKeyError
+from ledger_api.api.errors import (
+    AuthenticationRequiredError,
+    IdempotencyKeyRequiredError,
+    InvalidIdempotencyKeyError,
+)
+from ledger_api.config import Settings
 from ledger_api.domain.idempotency import is_valid_idempotency_key
 
 
@@ -60,3 +68,37 @@ def get_idempotency_key(
 
 
 IdempotencyKeyDep = Annotated[str, Depends(get_idempotency_key)]
+
+
+def get_password_hasher(request: Request) -> PasswordHasher:
+    """The process's Argon2id hasher, built once from the settings (create_app)."""
+    hasher: PasswordHasher = request.app.state.password_hasher
+    return hasher
+
+
+def get_session_lifetime(request: Request) -> timedelta:
+    settings: Settings = request.app.state.settings
+    return timedelta(seconds=settings.auth_session_ttl_seconds)
+
+
+PasswordHasherDep = Annotated[PasswordHasher, Depends(get_password_hasher)]
+SessionLifetimeDep = Annotated[timedelta, Depends(get_session_lifetime)]
+
+# Documents the Bearer scheme in OpenAPI. auto_error=False: a missing or non-Bearer header is
+# answered by this API's own 401 authentication_required, in its {code, detail} format.
+bearer_scheme = HTTPBearer(auto_error=False, description="An access token from POST /sessions.")
+
+
+def get_bearer_token(
+    request: Request,
+    credentials: Annotated[HTTPAuthorizationCredentials | None, Depends(bearer_scheme)],
+) -> str:
+    """The token of `Authorization: Bearer <token>`. Missing, empty, repeated or another
+    scheme: 401 authentication_required. Whether the token is valid is the service's call
+    (401 invalid_token). The token is never logged."""
+    if credentials is None or len(request.headers.getlist("Authorization")) != 1:
+        raise AuthenticationRequiredError
+    return credentials.credentials
+
+
+BearerTokenDep = Annotated[str, Depends(get_bearer_token)]
