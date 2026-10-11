@@ -119,6 +119,22 @@ def register_error_handlers(app: FastAPI) -> None:
 
 
 # Shared OpenAPI documentation for error responses.
+
+# A route whose 422 can only be a malformed request (FastAPI's validation).
 VALIDATION_ERROR_RESPONSE: dict[int | str, dict[str, Any]] = {
     status.HTTP_422_UNPROCESSABLE_CONTENT: {"model": ValidationErrorResponse}
+}
+
+# A route whose service can also refuse a well-formed request with 422 (a RuleViolationError, or
+# an ApiError such as invalid_idempotency_key). The two bodies differ: validation_error carries a
+# list of {type, loc, msg}, every other code a string. The schema is either of them, so a
+# generated client can parse both.
+VALIDATION_OR_RULE_ERROR_RESPONSE: dict[int | str, dict[str, Any]] = {
+    status.HTTP_422_UNPROCESSABLE_CONTENT: {
+        "model": ValidationErrorResponse | ErrorResponse,
+        "description": (
+            "validation_error (a malformed request; detail is a list of {type, loc, msg}), "
+            "or a business rule refusing a well-formed request (detail is a string)."
+        ),
+    }
 }

@@ -3,18 +3,20 @@
 A production-oriented banking backend built around a **double-entry ledger**: ACID money
 movement, concurrency control, idempotent APIs, and an append-only audit trail.
 
-> **Status: Phase 6 of 10. Idempotency and the HTTP posting API.**
+> **Status: Phase 7 of 10. The REST API: postings, statements and transactions.**
 > Users can be registered and customer accounts opened and read. Deposits, withdrawals and
 > transfers are exposed over HTTP, each requiring an `Idempotency-Key`: a retried request never
-> moves money twice, and an unknown COMMIT outcome is recoverable. Every attempt is recorded in
-> an append-only audit trail. Account statements with running balances exist at the service
-> layer; their HTTP endpoint arrives in Phase 7. The full design is documented in the
-> [ADRs](docs/adr/).
+> moves money twice, and an unknown COMMIT outcome is recoverable. An account's statement (its
+> history with running balances) and any single transaction can be read back, always from the
+> owner's side. Every attempt is recorded in an append-only audit trail. **There is no
+> authentication yet (Phase 8).** The full design is documented in the [ADRs](docs/adr/).
 
 > [!WARNING]
 > **The API is unauthenticated until Phase 8.** Anyone who knows a user ID can act as that
-> user, including moving that user's money and replaying their keyed requests. Do not expose it
-> to untrusted clients. See [ADR 0009](docs/adr/0009-owner-scoped-access-and-error-responses.md).
+> user: move that user's money, replay their keyed requests, and read their accounts,
+> statements and transactions. Ownership scoping (below) only guarantees that an account is
+> reached through its true owner, not who the caller is. Do not expose the API to untrusted
+> clients. See [ADR 0009](docs/adr/0009-owner-scoped-access-and-error-responses.md).
 >
 > **The application connects to PostgreSQL as a superuser** (the Compose bootstrap role). The
 > append-only triggers protect against application bugs, not against that role, which can
@@ -90,9 +92,14 @@ banking-ledger-api/.venv/bin/pre-commit install
 | POST | `/users/{user_id}/accounts` | Open a customer account: `{"currency": "GBP" \| "EUR"}`. Balance starts at 0. `409` if the user already has one in that currency |
 | GET | `/users/{user_id}/accounts` | List the user's accounts: `{"items": [...]}` |
 | GET | `/users/{user_id}/accounts/{account_id}` | Get one of the user's accounts |
-| POST | `/users/{user_id}/accounts/{account_id}/deposits` | Money in from outside: `{"amount_minor"}`. Requires `Idempotency-Key`. `201` |
-| POST | `/users/{user_id}/accounts/{account_id}/withdrawals` | Money out to outside: `{"amount_minor"}`. Requires `Idempotency-Key`. `201` |
-| POST | `/users/{user_id}/accounts/{account_id}/transfers` | To any customer account in the same currency: `{"destination_account_id", "amount_minor"}`. Requires `Idempotency-Key`. `201` |
+| GET | `/users/{user_id}/accounts/{account_id}/statement?limit=&cursor=` | The account's history, newest first, with the balance after each entry. Keyset pagination: `limit` 1–100 (default 50), `cursor` = the previous page's `next_cursor` |
+| GET | `/users/{user_id}/accounts/{account_id}/transactions/{transaction_id}` | One transaction as it appears on this account (the same shape as a statement entry) |
+| POST | `/users/{user_id}/accounts/{account_id}/deposits` | Money in from outside: `{"amount_minor"}`. Requires `Idempotency-Key`. `201` + `Location` |
+| POST | `/users/{user_id}/accounts/{account_id}/withdrawals` | Money out to outside: `{"amount_minor"}`. Requires `Idempotency-Key`. `201` + `Location` |
+| POST | `/users/{user_id}/accounts/{account_id}/transfers` | To any customer account in the same currency: `{"destination_account_id", "amount_minor"}`. Requires `Idempotency-Key`. `201` + `Location` |
+
+There is deliberately no separate `/balance` endpoint (`GET .../accounts/{account_id}` returns
+`balance_minor`) and no separate transaction list (the statement is the account's history).
 
 Interactive documentation, including every request and response schema:
 <http://localhost:8000/docs>.
@@ -114,8 +121,19 @@ curl -si -X POST localhost:8000/users/<user_id>/accounts/<account_id>/deposits \
 # 201 {"transaction_id": "<uuid>", "kind": "deposit", "account_id": "<uuid>",
 #      "amount_minor": 2500, "balance_after_minor": 2500, "created_at": "..."}
 
+# Location: /users/<user_id>/accounts/<account_id>/transactions/<transaction_id>
+
 # The same request again (e.g. after a timeout): nothing is posted twice.
-# 201, same body, plus the header  Idempotent-Replayed: true
+# 201, same body, same Location, plus the header  Idempotent-Replayed: true
+
+curl -s 'localhost:8000/users/<user_id>/accounts/<account_id>/statement?limit=2'
+# 200 {"account_id": "<uuid>", "balance_minor": 2500,
+#      "entries": [{"entry_id": "<uuid>", "transaction_id": "<uuid>", "kind": "deposit",
+#                   "amount_minor": 2500, "balance_after_minor": 2500, "created_at": "..."}],
+#      "next_cursor": null}
+
+curl -s localhost:8000/users/<user_id>/accounts/<account_id>/transactions/<transaction_id>
+# 200 the same entry as on the statement
 ```
 
 ### Rules
@@ -131,6 +149,24 @@ curl -si -X POST localhost:8000/users/<user_id>/accounts/<account_id>/deposits \
 - **Amounts** are whole minor units (`2500` is £25.00), JSON integers only: `"2500"`, `25.0`
   and `true` are rejected. Valid amounts are 1–100,000,000 per posting.
 - **Responses show only the caller's balance**, never a counterparty's.
+- **Statements and transactions are account-relative.** Each entry is the account's own side of
+  a transaction: `amount_minor` is signed (negative debits the account, positive credits it),
+  and `balance_after_minor` is the account's balance right after that entry, computed from its
+  history. It is historical: later postings never change it, and it is not the current
+  balance (that is the statement's `balance_minor`). A transfer shows the payer a negative
+  entry and the payee a positive one, each with only their own balance. No counterparty is
+  ever shown.
+- **Pagination** follows `next_cursor` until it is `null`. Postings made between page requests
+  only appear on a fresh first page; following the cursor never repeats or skips an entry.
+- **Not found, without revealing anything.** For the statement and transaction reads, the
+  account is checked first: someone else's, a system or a missing account is
+  `404 account_not_found`. Only then is the transaction looked up, among this account's entries
+  only: a transaction that does not exist, belongs to other accounts, or is the user's own
+  posting on a different account is the same `404 transaction_not_found`. An unknown cursor
+  and another account's entry are the same `422 invalid_statement_cursor`.
+- **`Location`** on every `201` posting, replays included, names the transaction as it appears
+  on the caller's account (for a transfer, the source account). A replay points at the
+  original transaction.
 
 ### Errors
 
@@ -138,17 +174,22 @@ Every error body is `{"code": "...", "detail": ...}`:
 
 | Status | `code` | When |
 |---|---|---|
-| 404 | `user_not_found`, `account_not_found` | Unknown user; account missing or not the user's (a posting for an unknown user is `account_not_found`) |
+| 404 | `user_not_found`, `account_not_found` | Unknown user; account missing or not the user's (a posting, statement or transaction read for an unknown user is `account_not_found`) |
 | 404 | `destination_account_not_found` | A transfer's destination is missing or not a customer account |
+| 404 | `transaction_not_found` | The transaction has no entry on this account (it does not exist, or belongs to other accounts) |
 | 409 | `email_already_registered`, `account_already_exists` | Uniqueness rules (enforced by the database) |
 | 422 | `validation_error` | Invalid request. `detail` lists `{type, loc, msg}`; submitted values are never echoed |
 | 422 | `invalid_amount`, `same_account_transfer`, `currency_mismatch`, `insufficient_funds` | Posting rules |
 | 422 | `idempotency_key_mismatch` | The `Idempotency-Key` was already used for a different request |
+| 422 | `invalid_statement_limit`, `invalid_statement_cursor` | A `limit` outside 1–100; a cursor that is not an entry of this account. (A non-integer `limit` or a malformed cursor is `validation_error`) |
 | 422 | `invalid_idempotency_key` | The header is not one value of 1–255 visible ASCII characters (never echoed) |
 | 428 | `idempotency_key_required` | A posting without an `Idempotency-Key` header |
 | 503 | `temporarily_unavailable` | Lock or statement timeout, or contention retries exhausted. Nothing was posted |
 | 503 | `outcome_unknown` | The connection was lost during COMMIT: the posting may or may not have been applied. **Retry with the same `Idempotency-Key`** |
-| 500 | `internal_error` | Anything unexpected. No details are returned; the traceback goes to the server log |
+| 500 | `internal_error` | Anything unexpected, including a statement whose balance does not match its entries (refused rather than returned). No details are returned; the traceback goes to the server log |
+
+Two body shapes share `422`, and the OpenAPI schema documents both where both can occur:
+`validation_error` carries a list of `{type, loc, msg}`; every other code carries a string.
 
 ## Database
 
@@ -299,8 +340,10 @@ the pool timeout) before giving up, which delays the error response. This is acc
 ## Statements
 
 `services.statements.get_statement` returns an owner's account history, newest first, with the
-balance after each entry ([ADR 0012](docs/adr/0012-statement-ordering-and-reconciliation.md)).
-There is no HTTP endpoint yet (Phase 7).
+balance after each entry ([ADR 0012](docs/adr/0012-statement-ordering-and-reconciliation.md)),
+served by `GET /users/{user_id}/accounts/{account_id}/statement`.
+`get_account_transaction` serves a single transaction in the same entry shape, with the same
+historical balance calculation (also used by idempotent replays).
 
 - Entries are ordered by `sequence_number`. It is drawn while the posting holds the account's
   row lock, which it keeps until `COMMIT`, so for one account sequence order is commit order.
@@ -313,6 +356,12 @@ There is no HTTP endpoint yet (Phase 7).
   or skips an entry.
 - No counterparty is shown. If the balance does not equal the sum of the entries, the service
   refuses (`internal_error`) and logs an ERROR instead of returning a possibly wrong statement.
+- **Cost (known limitation):** running balances are recomputed on every read. Each statement
+  page scans the account's whole history, and a single-transaction read sums the account's
+  entries up to that one, so both grow linearly with the account's history. Acceptable for the
+  MVP; the documented upgrade path is persisted running balances with a gapless per-account
+  sequence ([ADR 0012](docs/adr/0012-statement-ordering-and-reconciliation.md), "Alternatives
+  considered").
 
 ## Testing
 
@@ -387,6 +436,19 @@ Idempotency tests:
 - **API contract**: `428`/`422` for the header, strict integer amounts, every error code, and the
   OpenAPI schema.
 
+Read API tests (Phase 7):
+
+- **Session boundaries**: every read service returns the session outside a transaction and its
+  connection to the pool (on a one-connection pool), including on failure; a posting, and a
+  rejected posting with its audit event, work on the same session right after any read.
+- **Statement API**: cursor pagination through the whole history, signed amounts and running
+  balances, empty accounts, limit bounds and malformed input, unknown and foreign cursors, and
+  identical 404s for missing, foreign and system accounts.
+- **Transaction API and `Location`**: each kind of posting read back from the owner's account,
+  a transfer from the payee's, the historical balance after later postings, identical 404s,
+  and a `Location` on every `201` (the same on a replay) that leads to the posted transaction.
+- **OpenAPI**: every real `422` body matches the schema its route documents, for both shapes.
+
 CI runs the same suite against a PostgreSQL service container and smoke-tests the Compose
 stack.
 
@@ -415,7 +477,7 @@ stack.
 4. ✅ Ledger and transaction posting
 5. ✅ Audit trail, statements (service layer) and reconciliation
 6. ✅ Idempotency and the HTTP posting API (deposits, withdrawals, transfers)
-7. REST API: statements and the remaining read endpoints
+7. ✅ REST API: statements, single transactions, `Location` on postings
 8. Authentication and authorization
 9. Reliability
 10. Security and observability (including least-privilege database roles)

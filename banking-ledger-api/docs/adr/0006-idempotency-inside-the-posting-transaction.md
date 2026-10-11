@@ -143,3 +143,9 @@ would then "replay" it instead of posting. Migration 0011 closes this in the dat
 - What it does not stop: a role that can insert transactions can still insert a complete, new,
   balanced posting with its own key, exactly as it could before; restricting that needs a
   `SECURITY DEFINER` posting function (ADR 0010, Phase 10). A superuser can disable triggers.
+
+## Amendment (Phase 7, 2026-10-11)
+
+- A replay also returns the original `Location`: the original transaction as it appears on the
+  caller's account (`GET .../accounts/{account_id}/transactions/{transaction_id}`), read with
+  the same historical calculation as the replayed body (ADR 0012).

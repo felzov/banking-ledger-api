@@ -35,3 +35,16 @@ must demonstrate production engineering judgement without unnecessary infrastruc
 - Async ORM forbids implicit lazy loading; relationships must be loaded explicitly.
 - An `AsyncSession` must never be shared between concurrent tasks: one session per unit of work.
 - Layer boundaries are enforced by review, not tooling.
+
+## Amendment (Phase 7, 2026-10-11): every service owns its transaction
+
+Services own their transaction boundaries, reads included: each one runs in
+`async with session.begin():` and returns the session outside any transaction, with its
+connection back in the pool. Until Phase 7 the read services (`get_user`,
+`get_customer_account`, `list_customer_accounts`, `get_statement`) relied on SQLAlchemy's
+autobegin and left a transaction open: a write service called next on the same session failed
+with "A transaction is already begun", and its failure audit event was lost. Phase 8's
+router-level authorization dependency will read on the request session before the route's
+service runs, so this had to hold first. A service never calls another service that opens a
+transaction; it calls data-layer functions instead. A regression test runs every read service
+on a one-connection pool.

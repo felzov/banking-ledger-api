@@ -5,18 +5,19 @@ through its owner. Every request needs an Idempotency-Key header. A retry with t
 the same request returns the original result (201, `Idempotent-Replayed: true`), rebuilt from
 the ledger; the same key with a different request is refused (422 idempotency_key_mismatch).
 
-There is no Location header: transactions have no GET endpoint yet (Phase 7).
+Every 201, replays included, has a Location header: the transaction as it appears on the
+caller's account (GET .../accounts/{account_id}/transactions/{transaction_id}).
 """
 
 import uuid
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Response, status
+from fastapi import APIRouter, Request, Response, status
 from pydantic import BaseModel, ConfigDict, StrictInt
 
 from ledger_api.api.dependencies import IdempotencyKeyDep, SessionDep
-from ledger_api.api.errors import VALIDATION_ERROR_RESPONSE, ErrorResponse
+from ledger_api.api.errors import VALIDATION_OR_RULE_ERROR_RESPONSE, ErrorResponse
 from ledger_api.domain.transaction import TransactionKind
 from ledger_api.services.posting import PostingResult, deposit, transfer, withdraw
 
@@ -26,12 +27,22 @@ REPLAYED_HEADER = "Idempotent-Replayed"
 
 ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     status.HTTP_404_NOT_FOUND: {"model": ErrorResponse},
-    **VALIDATION_ERROR_RESPONSE,
+    **VALIDATION_OR_RULE_ERROR_RESPONSE,
     status.HTTP_428_PRECONDITION_REQUIRED: {"model": ErrorResponse},
     status.HTTP_503_SERVICE_UNAVAILABLE: {"model": ErrorResponse},
 }
-CREATED_OR_REPLAYED = {
-    "description": "Posted, or replayed: then with the header `Idempotent-Replayed: true`."
+CREATED_OR_REPLAYED: dict[str, Any] = {
+    "description": "Posted, or replayed: then with the header `Idempotent-Replayed: true`.",
+    "headers": {
+        "Location": {
+            "description": "The transaction as it appears on the caller's account.",
+            "schema": {"type": "string"},
+        },
+        REPLAYED_HEADER: {
+            "description": "`true` when an earlier request with the same key had posted this.",
+            "schema": {"type": "string", "enum": ["true"]},
+        },
+    },
 }
 
 
@@ -74,7 +85,27 @@ def _fields(result: PostingResult, account_id: uuid.UUID, amount_minor: int) -> 
     }
 
 
-def _mark_replay(response: Response, result: PostingResult) -> None:
+def _created(
+    request: Request,
+    response: Response,
+    result: PostingResult,
+    *,
+    user_id: uuid.UUID,
+    account_id: uuid.UUID,
+) -> None:
+    """Location and the replay marker of a 201.
+
+    Location names the transaction as it appears on the caller's account. Every part is
+    already validated: user_id and account_id are the request's parsed path parameters (the
+    account the service checked ownership of and posted on), and the transaction id comes from
+    the service, the original one on a replay. It is never built from raw client text.
+    """
+    response.headers["Location"] = request.app.url_path_for(
+        "get_account_transaction",
+        user_id=str(user_id),
+        account_id=str(account_id),
+        transaction_id=str(result.transaction_id),
+    )
     if result.replayed:
         response.headers[REPLAYED_HEADER] = "true"
 
@@ -90,6 +121,7 @@ async def create_deposit(
     body: AmountRequest,
     idempotency_key: IdempotencyKeyDep,
     session: SessionDep,
+    request: Request,
     response: Response,
 ) -> PostingResponse:
     result = await deposit(
@@ -99,7 +131,7 @@ async def create_deposit(
         amount_minor=body.amount_minor,
         idempotency_key=idempotency_key,
     )
-    _mark_replay(response, result)
+    _created(request, response, result, user_id=user_id, account_id=account_id)
     return PostingResponse(**_fields(result, account_id, body.amount_minor))
 
 
@@ -114,6 +146,7 @@ async def create_withdrawal(
     body: AmountRequest,
     idempotency_key: IdempotencyKeyDep,
     session: SessionDep,
+    request: Request,
     response: Response,
 ) -> PostingResponse:
     result = await withdraw(
@@ -123,7 +156,7 @@ async def create_withdrawal(
         amount_minor=body.amount_minor,
         idempotency_key=idempotency_key,
     )
-    _mark_replay(response, result)
+    _created(request, response, result, user_id=user_id, account_id=account_id)
     return PostingResponse(**_fields(result, account_id, body.amount_minor))
 
 
@@ -138,6 +171,7 @@ async def create_transfer(
     body: TransferRequest,
     idempotency_key: IdempotencyKeyDep,
     session: SessionDep,
+    request: Request,
     response: Response,
 ) -> TransferResponse:
     result = await transfer(
@@ -148,7 +182,7 @@ async def create_transfer(
         amount_minor=body.amount_minor,
         idempotency_key=idempotency_key,
     )
-    _mark_replay(response, result)
+    _created(request, response, result, user_id=user_id, account_id=account_id)
     return TransferResponse(
         **_fields(result, account_id, body.amount_minor),
         destination_account_id=body.destination_account_id,

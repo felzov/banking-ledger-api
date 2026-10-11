@@ -1,6 +1,5 @@
-"""Account statements: an owner's entries, newest first, with running balances (ADR 0012).
-
-Service only in Phase 5; the HTTP endpoint arrives with the financial API in Phase 7.
+"""Account statements: an owner's entries, newest first, with running balances (ADR 0012), and
+single transactions as they appear on one of the owner's accounts.
 
 Pagination is keyset-based. The cursor is the entry id of the last row of the previous page;
 the next page continues with strictly older entries (lower sequence_number). Because an
@@ -23,12 +22,13 @@ from datetime import datetime
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ledger_api.data.accounts import get_owned_account
-from ledger_api.data.statements import find_cursor_position, read_statement
+from ledger_api.data.statements import find_cursor_position, find_posted_entry, read_statement
 from ledger_api.domain.errors import (
     AccountNotFoundError,
     InvalidStatementCursorError,
     InvalidStatementLimitError,
     StatementInconsistencyError,
+    TransactionNotFoundError,
 )
 from ledger_api.domain.transaction import TransactionKind
 
@@ -72,17 +72,20 @@ async def get_statement(
     # type() rather than isinstance(): bool is a subclass of int, and True is not a page size.
     if type(limit) is not int or not 1 <= limit <= MAX_LIMIT:
         raise InvalidStatementLimitError
-    if await get_owned_account(session, owner_id=owner_id, account_id=account_id) is None:
-        # Missing, someone else's, or a system account: indistinguishable (ADR 0009).
-        raise AccountNotFoundError
+    # Reads own their transaction: the session is returned outside any transaction, with its
+    # connection back in the pool. The page itself is still ONE statement (one snapshot).
+    async with session.begin():
+        if await get_owned_account(session, owner_id=owner_id, account_id=account_id) is None:
+            # Missing, someone else's, or a system account: indistinguishable (ADR 0009).
+            raise AccountNotFoundError
 
-    before = None
-    if cursor is not None:
-        before = await find_cursor_position(session, account_id=account_id, entry_id=cursor)
-        if before is None:
-            raise InvalidStatementCursorError
+        before = None
+        if cursor is not None:
+            before = await find_cursor_position(session, account_id=account_id, entry_id=cursor)
+            if before is None:
+                raise InvalidStatementCursorError
 
-    snapshot = await read_statement(session, account_id=account_id, before=before, limit=limit)
+        snapshot = await read_statement(session, account_id=account_id, before=before, limit=limit)
     if snapshot.balance_minor != snapshot.entries_total_minor:
         logger.error(
             "statement refused: account %s has balance_minor=%d but its entries sum to %d",
@@ -109,4 +112,36 @@ async def get_statement(
             for row in rows
         ),
         next_cursor=rows[-1].entry_id if has_more else None,
+    )
+
+
+async def get_account_transaction(
+    session: AsyncSession,
+    *,
+    owner_id: uuid.UUID,
+    account_id: uuid.UUID,
+    transaction_id: uuid.UUID,
+) -> StatementEntry:
+    """One transaction as it appears on owner_id's account: that account's entry only, with the
+    balance right after it (historical, the statement's calculation), never a counterparty.
+
+    Ownership first, as everywhere (ADR 0009): someone else's, a system or a missing account is
+    account_not_found. Then the lookup is scoped to this account's entries: a missing
+    transaction and one with no entry on this account are the same transaction_not_found.
+    """
+    async with session.begin():
+        if await get_owned_account(session, owner_id=owner_id, account_id=account_id) is None:
+            raise AccountNotFoundError
+        entry = await find_posted_entry(
+            session, transaction_id=transaction_id, account_id=account_id
+        )
+    if entry is None:
+        raise TransactionNotFoundError
+    return StatementEntry(
+        entry_id=entry.entry_id,
+        transaction_id=entry.transaction_id,
+        kind=entry.kind,
+        amount_minor=entry.amount_minor,
+        balance_after_minor=entry.balance_after_minor,
+        created_at=entry.created_at,
     )

@@ -99,7 +99,9 @@ async def test_deposit_returns_201_with_the_posting(api_client: AsyncClient) -> 
     assert body["account_id"] == account_id
     assert (body["amount_minor"], body["balance_after_minor"]) == (2_500, 2_500)
     assert "idempotent-replayed" not in response.headers
-    assert "location" not in response.headers  # no GET for transactions until Phase 7
+    assert response.headers["location"] == (
+        f"/users/{user_id}/accounts/{account_id}/transactions/{body['transaction_id']}"
+    )
 
 
 async def test_withdrawal_returns_201_with_the_posting(api_client: AsyncClient) -> None:

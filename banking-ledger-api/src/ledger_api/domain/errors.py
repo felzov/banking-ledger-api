@@ -46,6 +46,13 @@ class AccountNotFoundError(NotFoundError):
     message = "Account not found."
 
 
+class TransactionNotFoundError(NotFoundError):
+    # No entry of this transaction is on the requested account: whether the transaction does
+    # not exist or belongs only to other accounts is deliberately indistinguishable.
+    code = "transaction_not_found"
+    message = "Transaction not found."
+
+
 class EmailAlreadyRegisteredError(ConflictError):
     code = "email_already_registered"
     message = "A user with this email address already exists."
