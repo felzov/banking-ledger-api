@@ -20,7 +20,8 @@ from ledger_api.domain.errors import (
 from ledger_api.services import audit as audit_service
 from ledger_api.services.accounts import open_customer_account
 from ledger_api.services.users import register_user
-from tests.conftest import TEST_PASSWORD, SessionFactory
+from tests.auth_helpers import TEST_PASSWORD, signup
+from tests.conftest import SessionFactory
 
 
 class InjectedAuditFailureError(Exception):
@@ -152,10 +153,7 @@ async def test_failed_account_opening_never_names_the_rolled_back_account(
 async def test_reads_and_malformed_requests_are_not_audited(
     api_client: AsyncClient, db_session: AsyncSession
 ) -> None:
-    response = await api_client.post(
-        "/users", json={"email": "reader@example.com", "password": TEST_PASSWORD}
-    )
-    user_id = response.json()["id"]
+    user_id = (await signup(api_client, "reader@example.com")).user_id
     since = await _latest_event_id(db_session)
 
     assert (await api_client.get(f"/users/{user_id}")).status_code == 200

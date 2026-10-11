@@ -16,7 +16,7 @@ from ledger_api.api.routes import accounts as accounts_routes
 from ledger_api.domain.currency import Currency
 from ledger_api.domain.errors import StatementInconsistencyError
 from ledger_api.services.statements import DEFAULT_LIMIT, MAX_LIMIT, StatementPage
-from tests.conftest import TEST_PASSWORD
+from tests.auth_helpers import OWNER_TOKENS, signup
 from tests.factories import get_settlement_account
 
 ENTRY_FIELDS = {
@@ -31,11 +31,7 @@ NOT_FOUND = {"code": "account_not_found", "detail": "Account not found."}
 
 
 async def _customer(client: AsyncClient, currency: str = "GBP") -> tuple[str, str]:
-    response = await client.post(
-        "/users", json={"email": f"u-{uuid.uuid7().hex}@example.com", "password": TEST_PASSWORD}
-    )
-    assert response.status_code == 201, response.text
-    user_id: str = response.json()["id"]
+    user_id = (await signup(client)).user_id
     response = await client.post(f"/users/{user_id}/accounts", json={"currency": currency})
     assert response.status_code == 201, response.text
     account_id: str = response.json()["id"]
@@ -296,10 +292,16 @@ async def test_missing_foreign_and_system_accounts_are_the_same_404(
         (user_id, str(uuid.uuid7())),  # missing
         (user_id, other_account),  # someone else's
         (user_id, str(settlement.id)),  # the system settlement account
-        (str(uuid.uuid7()), account_id),  # an unknown user
     ]:
         status_code, body = await _statement(api_client, owner, account)
         assert (status_code, body) == (404, NOT_FOUND), (owner, account)
+
+    # Another user id in the path, with the caller's token: 403 before any lookup (Phase 8).
+    response = await api_client.get(
+        f"/users/{uuid.uuid7()}/accounts/{account_id}/statement",
+        headers={"Authorization": f"Bearer {OWNER_TOKENS[api_client][user_id]}"},
+    )
+    assert (response.status_code, response.json()["code"]) == (403, "forbidden")
 
 
 async def test_ownership_is_checked_before_the_cursor(api_client: AsyncClient) -> None:

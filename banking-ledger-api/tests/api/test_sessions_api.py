@@ -14,7 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ledger_api.data.models import AuthSession
 from ledger_api.domain.tokens import generate_token, hash_token, is_well_formed_token
-from tests.conftest import TEST_PASSWORD
+from tests.auth_helpers import TEST_PASSWORD
 
 INVALID_CREDENTIALS = {"code": "invalid_credentials", "detail": "Invalid email or password."}
 INVALID_TOKEN = {

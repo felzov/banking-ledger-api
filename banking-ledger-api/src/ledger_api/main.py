@@ -1,9 +1,11 @@
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from typing import Any
 
-from fastapi import APIRouter, FastAPI
+from fastapi import APIRouter, Depends, FastAPI, status
 
-from ledger_api.api.errors import register_error_handlers
+from ledger_api.api.dependencies import require_path_user
+from ledger_api.api.errors import ErrorResponse, register_error_handlers
 from ledger_api.api.routes import accounts, health, postings, sessions, users
 from ledger_api.config import Settings
 from ledger_api.data.engine import create_engine, create_sessionmaker
@@ -41,16 +43,31 @@ def create_app(settings: Settings | None = None) -> FastAPI:
 
 USER_SCOPE = "/users/{user_id}"
 
+# Documented once for every user-scoped route.
+AUTHENTICATION_RESPONSES: dict[int | str, dict[str, Any]] = {
+    status.HTTP_401_UNAUTHORIZED: {
+        "model": ErrorResponse,
+        "description": "authentication_required or invalid_token, with a WWW-Authenticate "
+        "Bearer challenge.",
+    },
+    status.HTTP_403_FORBIDDEN: {
+        "model": ErrorResponse,
+        "description": "forbidden: {user_id} is not the authenticated user.",
+    },
+}
+
 
 def _user_scoped_router() -> APIRouter:
     """Every route that acts on one user's data lives under /users/{user_id}.
 
-    UNAUTHENTICATED until Phase 8, which adds a single router-level dependency to `scoped`
-    requiring the caller to be {user_id}; every route included below inherits it (ADR 0009).
-    Built per app because include_router copies routes: a module-level router would
-    accumulate duplicates across create_app() calls.
+    One router-level dependency authenticates the bearer token and requires the caller to be
+    {user_id} (ADR 0009, ADR 0013); every route included below inherits it, and it runs before
+    the route's own dependencies and body validation. Built per app because include_router
+    copies routes: a module-level router would accumulate duplicates across create_app() calls.
     """
-    scoped = APIRouter()
+    scoped = APIRouter(
+        dependencies=[Depends(require_path_user)], responses=AUTHENTICATION_RESPONSES
+    )
     scoped.include_router(users.user_router, prefix=USER_SCOPE)
     scoped.include_router(accounts.router, prefix=USER_SCOPE)
     scoped.include_router(postings.router, prefix=USER_SCOPE)

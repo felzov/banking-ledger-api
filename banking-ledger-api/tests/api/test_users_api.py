@@ -5,13 +5,17 @@ import pytest
 from fastapi import FastAPI
 from httpx import ASGITransport, AsyncClient
 
-from tests.conftest import TEST_PASSWORD
+from tests.auth_helpers import TEST_PASSWORD, log_in, signup
+
+FORBIDDEN = {"code": "forbidden", "detail": "You may only access your own resources."}
 
 
 async def _create_user(client: AsyncClient, email: str) -> dict[str, Any]:
+    """Register (the response body is returned) and log in, so the client may act as them."""
     response = await client.post("/users", json={"email": email, "password": TEST_PASSWORD})
     assert response.status_code == 201, response.text
     body: dict[str, Any] = response.json()
+    await log_in(client, body["email"], body["id"])
     return body
 
 
@@ -119,18 +123,30 @@ async def test_get_user_returns_the_user(api_client: AsyncClient) -> None:
     assert response.json() == created
 
 
-async def test_unknown_user_returns_404(api_client: AsyncClient) -> None:
-    response = await api_client.get(f"/users/{uuid.uuid7()}")
+async def test_another_user_id_is_forbidden(api_client: AsyncClient) -> None:
+    # Since Phase 8 a caller can only read themselves: any other id, existing or not, is 403
+    # (it used to be 404 user_not_found for an unknown id).
+    caller = await signup(api_client)
+    other = await signup(api_client)
 
-    assert response.status_code == 404
-    assert response.json() == {"code": "user_not_found", "detail": "User not found."}
+    for user_id in (other.user_id, str(uuid.uuid7())):
+        response = await api_client.get(f"/users/{user_id}", headers=caller.headers)
+        assert (response.status_code, response.json()) == (403, FORBIDDEN)
 
 
-async def test_malformed_user_id_returns_422(api_client: AsyncClient) -> None:
-    response = await api_client.get("/users/not-a-uuid")
+async def test_malformed_user_id_returns_422_once_authenticated(api_client: AsyncClient) -> None:
+    caller = await signup(api_client)
+
+    response = await api_client.get("/users/not-a-uuid", headers=caller.headers)
 
     assert response.status_code == 422
     _assert_validation_error_without_echo(response.json(), "not-a-uuid")
+
+
+async def test_reading_a_user_without_a_token_is_401(anonymous_client: AsyncClient) -> None:
+    for user_id in (str(uuid.uuid7()), "not-a-uuid"):
+        response = await anonymous_client.get(f"/users/{user_id}")
+        assert (response.status_code, response.json()["code"]) == (401, "authentication_required")
 
 
 # --- unexpected errors -------------------------------------------------------------------------

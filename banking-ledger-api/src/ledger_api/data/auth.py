@@ -98,3 +98,18 @@ async def revoke_live_session(session: AsyncSession, *, token_hash: bytes) -> St
         )
     ).one_or_none()
     return None if row is None else StoredSession(row.id, row.user_id, row.expires_at)
+
+
+async def find_live_session(session: AsyncSession, *, token_hash: bytes) -> StoredSession | None:
+    """The session with this token digest if it is live: not revoked and not expired by the
+    database's clock. Unknown, revoked and expired are indistinguishable (None)."""
+    row = (
+        await session.execute(
+            select(AuthSession.id, AuthSession.user_id, AuthSession.expires_at).where(
+                AuthSession.token_hash == token_hash,
+                AuthSession.revoked_at.is_(None),
+                AuthSession.expires_at > func.now(),
+            )
+        )
+    ).one_or_none()
+    return None if row is None else StoredSession(row.id, row.user_id, row.expires_at)

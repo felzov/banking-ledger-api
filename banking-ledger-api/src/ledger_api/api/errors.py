@@ -74,6 +74,14 @@ class InvalidIdempotencyKeyError(ApiError):
     message = "The Idempotency-Key header must be one value of 1-255 visible ASCII characters."
 
 
+class ForbiddenError(ApiError):
+    # Authenticated, but {user_id} in the path is not the caller. Decided from the path and the
+    # token alone, with no lookup, so it reveals nothing about whether that user exists.
+    status_code = status.HTTP_403_FORBIDDEN
+    code = "forbidden"
+    message = "You may only access your own resources."
+
+
 class ErrorResponse(BaseModel):
     code: str
     detail: str

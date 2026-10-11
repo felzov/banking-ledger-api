@@ -13,6 +13,10 @@ Logout revokes the caller's live session and audits it, in one transaction. A re
 (or any unknown, expired or malformed token) is 401 invalid_token and is not audited, like any
 unauthenticated request (ADR 0007).
 
+Authentication (every protected request) looks the token's digest up in its own short
+transaction and returns a plain Principal: the session is back outside any transaction, with
+its connection in the pool, before the route's services open theirs (ADR 0001).
+
 Never logged or audited: the password, the token, the token's hash, the email address.
 """
 
@@ -25,6 +29,7 @@ from argon2 import PasswordHasher
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ledger_api.data.auth import (
+    find_live_session,
     find_login_candidate,
     insert_session,
     replace_password_hash,
@@ -39,6 +44,7 @@ from ledger_api.domain.passwords import (
     needs_rehash,
     verify_password,
 )
+from ledger_api.domain.principal import Principal
 from ledger_api.domain.tokens import generate_token, hash_token, is_well_formed_token
 from ledger_api.services.audit import AuditContext, audited, record_in_transaction
 
@@ -133,3 +139,16 @@ async def logout(session: AsyncSession, *, token: str) -> None:
         await record_in_transaction(
             session, context.succeeded(created={"session_id": revoked.session_id})
         )
+
+
+async def authenticate(session: AsyncSession, *, token: str) -> Principal:
+    """The caller behind a bearer token, or InvalidTokenError (malformed, unknown, revoked or
+    expired by the database's clock: one answer). Not audited: a request is authenticated, not
+    an action taken. Runs in its own transaction and returns a plain value."""
+    if not is_well_formed_token(token):
+        raise InvalidTokenError
+    async with session.begin():
+        live = await find_live_session(session, token_hash=hash_token(token))
+    if live is None:
+        raise InvalidTokenError
+    return Principal(user_id=live.user_id, session_id=live.session_id)
