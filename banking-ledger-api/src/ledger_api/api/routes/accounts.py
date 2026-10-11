@@ -1,19 +1,21 @@
 import uuid
 from datetime import datetime
-from typing import Any
+from typing import Annotated, Any
 
-from fastapi import APIRouter, Request, Response, status
+from fastapi import APIRouter, Query, Request, Response, status
 from pydantic import BaseModel, ConfigDict
 
 from ledger_api.api.dependencies import SessionDep
 from ledger_api.api.errors import VALIDATION_ERROR_RESPONSE, ErrorResponse
 from ledger_api.data.models import Account
 from ledger_api.domain.currency import Currency
+from ledger_api.domain.transaction import TransactionKind
 from ledger_api.services.accounts import (
     get_customer_account,
     list_customer_accounts,
     open_customer_account,
 )
+from ledger_api.services.statements import DEFAULT_LIMIT, MAX_LIMIT, StatementPage, get_statement
 
 # Mounted under /users/{user_id} (see main.py): accounts are only reachable through their owner.
 router = APIRouter(prefix="/accounts", tags=["accounts"])
@@ -88,3 +90,85 @@ async def read_account(
 ) -> AccountResponse:
     account = await get_customer_account(session, owner_id=user_id, account_id=account_id)
     return AccountResponse.of(account)
+
+
+class StatementEntryResponse(BaseModel):
+    entry_id: uuid.UUID
+    transaction_id: uuid.UUID
+    kind: TransactionKind
+    # Signed, for this account: negative debits it, positive credits it.
+    amount_minor: int
+    # The account's balance right after this entry: computed from the history, never stored.
+    balance_after_minor: int
+    # The posting transaction's start time. Entries are ordered by commit order, not by this.
+    created_at: datetime
+    # Deliberately no counterparty: a statement reveals only the owner's own account.
+
+
+class StatementResponse(BaseModel):
+    account_id: uuid.UUID
+    # The current balance, from the same snapshot as the entries.
+    balance_minor: int
+    # Newest first.
+    entries: list[StatementEntryResponse]
+    # Pass as `cursor` for the next (older) page; null on the last page.
+    next_cursor: uuid.UUID | None
+
+    @classmethod
+    def of(cls, page: StatementPage) -> StatementResponse:
+        return cls(
+            account_id=page.account_id,
+            balance_minor=page.balance_minor,
+            entries=[
+                StatementEntryResponse(
+                    entry_id=entry.entry_id,
+                    transaction_id=entry.transaction_id,
+                    kind=entry.kind,
+                    amount_minor=entry.amount_minor,
+                    balance_after_minor=entry.balance_after_minor,
+                    created_at=entry.created_at,
+                )
+                for entry in page.entries
+            ],
+            next_cursor=page.next_cursor,
+        )
+
+
+@router.get(
+    "/{account_id}/statement",
+    responses={
+        **NOT_FOUND,
+        **VALIDATION_ERROR_RESPONSE,
+        status.HTTP_500_INTERNAL_SERVER_ERROR: {"model": ErrorResponse},
+    },
+)
+async def read_statement(
+    user_id: uuid.UUID,
+    account_id: uuid.UUID,
+    session: SessionDep,
+    # Range checks stay in the service (invalid_statement_limit), as for posting amounts; the
+    # bounds are documented here, not enforced twice.
+    limit: Annotated[
+        int,
+        Query(description=f"Entries per page, 1-{MAX_LIMIT} (422 invalid_statement_limit)."),
+    ] = DEFAULT_LIMIT,
+    cursor: Annotated[
+        uuid.UUID | None,
+        Query(
+            description=(
+                "The previous page's next_cursor. An unknown id or another account's entry: "
+                "422 invalid_statement_cursor."
+            )
+        ),
+    ] = None,
+) -> StatementResponse:
+    """The account's history, newest first, with the balance after each entry (ADR 0012).
+
+    Keyset pagination: follow next_cursor until it is null. Postings made between page
+    requests appear only on a fresh first page; following the cursor never repeats or skips an
+    entry. Someone else's, a system or a missing account is 404 account_not_found.
+    """
+    page = await get_statement(
+        session, owner_id=user_id, account_id=account_id, limit=limit, cursor=cursor
+    )
+    return StatementResponse.of(page)
