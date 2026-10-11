@@ -12,6 +12,8 @@ from dataclasses import dataclass, field
 from enum import StrEnum
 from types import MappingProxyType
 
+from ledger_api.domain.idempotency import is_valid_idempotency_key
+
 
 class AuditAction(StrEnum):
     USER_REGISTER = "user.register"
@@ -82,6 +84,9 @@ class AuditRecord:
     reason: str | None = None
     transaction_id: uuid.UUID | None = None
     details: Mapping[str, DetailValue] = field(default_factory=dict)
+    # The request's Idempotency-Key, if it had one (ADR 0006). Stored in its own column, never
+    # in details.
+    idempotency_key: str | None = None
 
     def __post_init__(self) -> None:
         # Inconsistent events are programming errors, like a malformed Posting: ValueError.
@@ -94,6 +99,9 @@ class AuditRecord:
             raise ValueError("only a successful posting references a transaction")
         if succeeded and self.actor_user_id is None:
             raise ValueError("a successful operation always has an actor")
+        # Stricter than ck_audit_events_idempotency_key_length (1-255): the key format itself.
+        if self.idempotency_key is not None and not is_valid_idempotency_key(self.idempotency_key):
+            raise ValueError("an idempotency key must be 1-255 visible ASCII characters")
 
         details = {key: _json_scalar(value) for key, value in self.details.items()}
         if not all(isinstance(key, str) for key in details):

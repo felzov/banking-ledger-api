@@ -78,7 +78,8 @@ class AuditEvent(Base):
     transaction_id: Mapped[uuid.UUID | None] = mapped_column(
         ForeignKey("transactions.id", ondelete="RESTRICT")
     )
-    # Reserved: request correlation (Phase 10) and idempotency keys (Phase 6). NULL until then.
+    # Reserved for request correlation (Phase 10): NULL until then.
     request_id: Mapped[str | None] = mapped_column(Text)
+    # A posting request's Idempotency-Key, on every outcome (Phase 6, ADR 0006).
     idempotency_key: Mapped[str | None] = mapped_column(Text)
     details: Mapped[dict[str, Any]] = mapped_column(JSONB, server_default=text("'{}'::jsonb"))

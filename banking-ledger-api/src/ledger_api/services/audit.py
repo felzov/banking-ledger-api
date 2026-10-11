@@ -43,6 +43,8 @@ class AuditContext:
     details: dict[str, DetailValue] = field(default_factory=dict)
     # Postings only: the transaction id of the latest attempt, once its header was flushed.
     attempted_transaction_id: uuid.UUID | None = None
+    # Postings only: the request's Idempotency-Key, recorded on every outcome (ADR 0006).
+    idempotency_key: str | None = None
 
     def succeeded(
         self,
@@ -61,6 +63,7 @@ class AuditContext:
             actor_user_id=actor_user_id or self.actor_user_id,
             transaction_id=transaction_id,
             details={**self.details, **(created or {})},
+            idempotency_key=self.idempotency_key,
         )
 
     def rejected(self, error: DomainError) -> AuditRecord:
@@ -70,6 +73,7 @@ class AuditContext:
             actor_user_id=self.actor_user_id,
             reason=error.code,
             details=self.details,
+            idempotency_key=self.idempotency_key,
         )
 
     def failed(self, error: Exception) -> AuditRecord:
@@ -83,13 +87,18 @@ class AuditContext:
             actor_user_id=self.actor_user_id,
             reason=reason,
             details=details,
+            idempotency_key=self.idempotency_key,
         )
 
 
 def _failure_details(error: Exception) -> dict[str, DetailValue]:
     """Identifies the failure without its message: messages can quote data."""
     details: dict[str, DetailValue] = {"error_type": type(error).__name__}
-    # A TemporarilyUnavailableError wraps the database error that caused it.
+    # A TemporarilyUnavailableError or CommitOutcomeUnknownError wraps what caused it. Its type is
+    # kept even when that is not a database error (a connection reset, a driver failure): the
+    # class name only, never its message, which can quote connection details.
+    if isinstance(error, UnavailableError) and error.__cause__ is not None:
+        details["cause_type"] = type(error.__cause__).__name__
     database_error = error.__cause__ if isinstance(error, UnavailableError) else error
     if isinstance(database_error, DBAPIError):
         details["sqlstate"] = sqlstate(database_error)
@@ -122,14 +131,17 @@ async def record_outside_transaction(session: AsyncSession, record: AuditRecord)
 
 def _log_lost(record: AuditRecord, cause: str, error: Exception | None = None) -> None:
     # The log line is the fallback audit sink. The record's fields are safe by construction
-    # (stable codes, ids and amounts); nothing from the request body or the database URL.
+    # (stable codes, ids and amounts); nothing from the request body or the database URL. The
+    # idempotency key is client text, but validated visible ASCII: it cannot break the line.
     logger.error(
-        "audit event not written (%s): action=%s outcome=%s reason=%s actor_user_id=%s details=%s",
+        "audit event not written (%s): action=%s outcome=%s reason=%s actor_user_id=%s "
+        "idempotency_key=%s details=%s",
         cause,
         record.action,
         record.outcome,
         record.reason,
         record.actor_user_id,
+        record.idempotency_key,
         dict(record.details),
         exc_info=error,
     )

@@ -115,10 +115,13 @@ async def audit_events_about(session: AsyncSession, account_id: uuid.UUID) -> li
 SEQUENCE_HELPER = "public.ledger_entries_last_issued_sequence_number()"
 
 
-def posting_role_grants(role: str, *, helper: bool = True) -> list[str]:
+def posting_role_grants(role: str, *, helper: bool = True, idempotency: bool = True) -> list[str]:
     """The privileges a least-privilege role needs to run the posting services (ADR 0012):
     table privileges, plus EXECUTE on the sequence helper (migration 0007). Deliberately no
     privilege on any sequence: inserting into an identity column does not need one.
+
+    `idempotency=False` leaves out idempotency_keys (migration 0010), for schemas older than
+    0010 and for the test showing that a keyed posting then fails loudly.
     """
     grants = [
         f'GRANT SELECT ON users, ledgers TO "{role}"',
@@ -131,6 +134,10 @@ def posting_role_grants(role: str, *, helper: bool = True) -> list[str]:
         # SELECT: RETURNING clauses and the deferred COMMIT-time checks.
         f'GRANT SELECT, INSERT ON transactions, ledger_entries, audit_events TO "{role}"',
     ]
+    if idempotency:
+        # INSERT: the claim. SELECT: the claim's ON CONFLICT check and the replay lookup. Never
+        # UPDATE or DELETE: a consumed key is permanent (ADR 0006).
+        grants.append(f'GRANT SELECT, INSERT ON idempotency_keys TO "{role}"')
     if helper:
         grants.append(f'GRANT EXECUTE ON FUNCTION {SEQUENCE_HELPER} TO "{role}"')
     return grants

@@ -3,16 +3,18 @@
 A production-oriented banking backend built around a **double-entry ledger**: ACID money
 movement, concurrency control, idempotent APIs, and an append-only audit trail.
 
-> **Status: Phase 5 of 10. Audit trail, statements and reconciliation.**
-> Users can be registered and customer accounts opened and read. A concurrency-safe posting
-> engine moves money (deposits, withdrawals, transfers) at the service layer, every attempt is
-> recorded in an append-only audit trail, and account statements with running balances are
-> available at the service layer. HTTP endpoints for money movement and statements arrive in
-> Phases 6 and 7. The full design is documented in the [ADRs](docs/adr/).
+> **Status: Phase 6 of 10. Idempotency and the HTTP posting API.**
+> Users can be registered and customer accounts opened and read. Deposits, withdrawals and
+> transfers are exposed over HTTP, each requiring an `Idempotency-Key`: a retried request never
+> moves money twice, and an unknown COMMIT outcome is recoverable. Every attempt is recorded in
+> an append-only audit trail. Account statements with running balances exist at the service
+> layer; their HTTP endpoint arrives in Phase 7. The full design is documented in the
+> [ADRs](docs/adr/).
 
 > [!WARNING]
 > **The API is unauthenticated until Phase 8.** Anyone who knows a user ID can act as that
-> user. Do not expose it to untrusted clients. See [ADR 0009](docs/adr/0009-owner-scoped-access-and-error-responses.md).
+> user, including moving that user's money and replaying their keyed requests. Do not expose it
+> to untrusted clients. See [ADR 0009](docs/adr/0009-owner-scoped-access-and-error-responses.md).
 >
 > **The application connects to PostgreSQL as a superuser** (the Compose bootstrap role). The
 > append-only triggers protect against application bugs, not against that role, which can
@@ -88,6 +90,9 @@ banking-ledger-api/.venv/bin/pre-commit install
 | POST | `/users/{user_id}/accounts` | Open a customer account: `{"currency": "GBP" \| "EUR"}`. Balance starts at 0. `409` if the user already has one in that currency |
 | GET | `/users/{user_id}/accounts` | List the user's accounts: `{"items": [...]}` |
 | GET | `/users/{user_id}/accounts/{account_id}` | Get one of the user's accounts |
+| POST | `/users/{user_id}/accounts/{account_id}/deposits` | Money in from outside: `{"amount_minor"}`. Requires `Idempotency-Key`. `201` |
+| POST | `/users/{user_id}/accounts/{account_id}/withdrawals` | Money out to outside: `{"amount_minor"}`. Requires `Idempotency-Key`. `201` |
+| POST | `/users/{user_id}/accounts/{account_id}/transfers` | To any customer account in the same currency: `{"destination_account_id", "amount_minor"}`. Requires `Idempotency-Key`. `201` |
 
 Interactive documentation, including every request and response schema:
 <http://localhost:8000/docs>.
@@ -102,6 +107,15 @@ curl -s -X POST localhost:8000/users -H 'content-type: application/json' \
 curl -s -X POST localhost:8000/users/<user_id>/accounts -H 'content-type: application/json' \
   -d '{"currency": "GBP"}'
 # 201 {"id": "<uuid>", "currency": "GBP", "balance_minor": 0, "created_at": "..."}
+
+curl -si -X POST localhost:8000/users/<user_id>/accounts/<account_id>/deposits \
+  -H 'content-type: application/json' -H 'Idempotency-Key: deposit-2026-10-10-001' \
+  -d '{"amount_minor": 2500}'
+# 201 {"transaction_id": "<uuid>", "kind": "deposit", "account_id": "<uuid>",
+#      "amount_minor": 2500, "balance_after_minor": 2500, "created_at": "..."}
+
+# The same request again (e.g. after a timeout): nothing is posted twice.
+# 201, same body, plus the header  Idempotent-Replayed: true
 ```
 
 ### Rules
@@ -114,6 +128,9 @@ curl -s -X POST localhost:8000/users/<user_id>/accounts -H 'content-type: applic
 - **Emails** are stored in one canonical form: trimmed, syntax-checked, lowercased.
   ASCII-only addresses are a deliberate MVP boundary. No provider-specific rules (Gmail dots
   and `+tags` are kept).
+- **Amounts** are whole minor units (`2500` is £25.00), JSON integers only: `"2500"`, `25.0`
+  and `true` are rejected. Valid amounts are 1–100,000,000 per posting.
+- **Responses show only the caller's balance**, never a counterparty's.
 
 ### Errors
 
@@ -121,9 +138,16 @@ Every error body is `{"code": "...", "detail": ...}`:
 
 | Status | `code` | When |
 |---|---|---|
-| 404 | `user_not_found`, `account_not_found` | Unknown user; account missing or not the user's |
+| 404 | `user_not_found`, `account_not_found` | Unknown user; account missing or not the user's (a posting for an unknown user is `account_not_found`) |
+| 404 | `destination_account_not_found` | A transfer's destination is missing or not a customer account |
 | 409 | `email_already_registered`, `account_already_exists` | Uniqueness rules (enforced by the database) |
 | 422 | `validation_error` | Invalid request. `detail` lists `{type, loc, msg}`; submitted values are never echoed |
+| 422 | `invalid_amount`, `same_account_transfer`, `currency_mismatch`, `insufficient_funds` | Posting rules |
+| 422 | `idempotency_key_mismatch` | The `Idempotency-Key` was already used for a different request |
+| 422 | `invalid_idempotency_key` | The header is not one value of 1–255 visible ASCII characters (never echoed) |
+| 428 | `idempotency_key_required` | A posting without an `Idempotency-Key` header |
+| 503 | `temporarily_unavailable` | Lock or statement timeout, or contention retries exhausted. Nothing was posted |
+| 503 | `outcome_unknown` | The connection was lost during COMMIT: the posting may or may not have been applied. **Retry with the same `Idempotency-Key`** |
 | 500 | `internal_error` | Anything unexpected. No details are returned; the traceback goes to the server log |
 
 ## Database
@@ -141,13 +165,17 @@ lets that check work for a least-privilege role (a narrow `SECURITY DEFINER` seq
 [`0008`](migrations/versions/0008_pin_entry_sequence_trigger_search_path.py) and
 [`0009`](migrations/versions/0009_pin_transaction_balance_check_search_path.py) pin the
 `search_path` of the ordering and double-entry checks so temporary tables cannot shadow the
-tables they read.
+tables they read; [`0010`](migrations/versions/0010_add_idempotency_keys.py) adds the
+append-only idempotency keys and
+[`0011`](migrations/versions/0011_link_transactions_to_idempotency_keys.py) makes each keyed
+transaction and its key reference each other.
 
 ```
 users 1 ── 0..* accounts *── 1 ledgers 1 ── * transactions ── 0..1 audit_events (succeeded)
-  │               │                              │
-  │               └──── * ledger_entries * ──────┘
-  └── 0..* audit_events (actor)
+  │               │                              │  │
+  │               └──── * ledger_entries * ──────┘  └── 0..1 idempotency_keys
+  ├── 0..* audit_events (actor)                                   │
+  └── 0..* idempotency_keys ──────────────────────────────────────┘
 ```
 
 | Table | Purpose |
@@ -155,9 +183,10 @@ users 1 ── 0..* accounts *── 1 ledgers 1 ── * transactions ── 0.
 | `users` | Identity only (lowercase, unique email) |
 | `ledgers` | One per currency: the boundary money cannot cross |
 | `accounts` | `customer` (owned by a user, one per currency) or `system` (settlement, one per ledger). `balance_minor` is a cached projection of the entries |
-| `transactions` | A posted transaction: `deposit`, `withdrawal` or `transfer`, sealed with its `entry_count`. Append-only |
+| `transactions` | A posted transaction: `deposit`, `withdrawal` or `transfer`, sealed with its `entry_count`; a keyed posting also names its idempotency key. Append-only |
 | `ledger_entries` | One signed `amount_minor` on one account, with a `sequence_number` that orders each account's entries in commit order. Append-only |
-| `audit_events` | One row per audited attempt: action, outcome (`succeeded`, `rejected`, `failed`), reason code, safe JSON details. Append-only |
+| `audit_events` | One row per audited attempt: action, outcome (`succeeded`, `rejected`, `failed`), reason code, idempotency key, safe JSON details. Append-only |
+| `idempotency_keys` | One row per key a user consumed with a **committed** posting: the request fingerprint and the transaction it produced. Append-only, kept indefinitely |
 
 Conventions: UUIDv7 primary keys (exception: `audit_events.id` is a `BIGINT` identity, never
 exposed; its values have gaps); money is `BIGINT` minor units named `*_minor`; timestamps are
@@ -178,6 +207,9 @@ Invariants enforced by PostgreSQL itself, so every code path is bound by them:
 | An account's history is a total order, and can only be appended to | Unique `(account_id, sequence_number)`, `GENERATED ALWAYS AS IDENTITY (CACHE 1)`, and a `BEFORE INSERT` trigger rejecting a number not after the account's latest or never issued by the sequence. `GENERATED ALWAYS` alone is not enough: `OVERRIDING SYSTEM VALUE` bypasses it |
 | An audit event is well-formed: reason exactly when not succeeded, a transaction exactly for successful postings (at most one event per transaction), an actor for every success, details a JSON object of at most 2048 bytes | CHECK and unique constraints on `audit_events` |
 | Audit evidence is not dropped by a routine downgrade | Migration 0004 refuses to drop a non-empty `audit_events` |
+| A key is used once per user, by exactly one committed transaction, and never changes | Primary key `(user_id, key)`, unique `transaction_id` with a foreign key checked at `COMMIT`, append-only triggers; 0010's downgrade refuses a non-empty table |
+| A key is 1–255 visible ASCII characters; a fingerprint is 32 bytes | CHECK constraints |
+| A key and its transaction reference each other, and the transaction is the key owner's own posting: no key can be attached to an existing or another user's transaction | Columns on the immutable `transactions` row, unique and foreign-key constraints, and a link check at `COMMIT` on both tables (migration 0011) |
 
 Triggers bind ordinary sessions only. A superuser or the table owner can disable them, and the
 application currently connects as a superuser, so these rules guard against application bugs,
@@ -210,7 +242,36 @@ each run in one database transaction ([ADR 0010](docs/adr/0010-posting-protocol.
 
 Deadlocks and serialization failures retry the whole transaction (3 attempts at most); lock
 or statement timeouts and exhausted retries report `temporarily_unavailable`. Amounts are
-limited to 100,000,000 minor units per transaction.
+limited to 100,000,000 minor units per transaction. A keyed posting first claims its
+idempotency key, right after `BEGIN` and before any lock (next section).
+
+## Idempotency
+
+Every money-moving request carries an `Idempotency-Key`
+([ADR 0006](docs/adr/0006-idempotency-inside-the-posting-transaction.md)). PostgreSQL is the
+only source of truth; Redis is never involved.
+
+- **The claim is part of the posting.** `INSERT ... ON CONFLICT (user_id, key) DO NOTHING` is
+  the first write of the posting transaction, so the key commits with the posting or not at
+  all. A rejected or failed request leaves no key: its retry with the same key runs normally.
+- **Same key, same request:** the original `201` body is returned again with
+  `Idempotent-Replayed: true`, and nothing is written or audited. The body is rebuilt from the
+  ledger: `balance_after_minor` is the balance right after the original entry (the statements'
+  running-balance calculation), never today's balance.
+- **Same key, different request:** `422 idempotency_key_mismatch`, audited as rejected. The
+  comparison uses a SHA-256 fingerprint of the business fields: operation, user, source
+  account, destination (transfers) and amount. Formatting differences never count.
+- **Keys are scoped per user.** The same key from two users means two requests.
+- **Concurrent duplicates** wait on the first request's uncommitted key (up to the 2 s
+  `lock_timeout`), then replay it, or run if it rolled back. Past the timeout they get `503
+  temporarily_unavailable` and can retry. Keys are claimed before accounts are locked, so they
+  add no deadlocks.
+- **Unknown outcome.** If the connection drops during `COMMIT`, the API answers `503
+  outcome_unknown`. It never claims the posting failed. Retrying with the same key consults the
+  durable key row through the claim itself. If the original is still finishing its `COMMIT`,
+  its row is invisible to a plain `SELECT`, but the claim waits for it, so the retry learns the
+  real result: a replay, or a fresh, single execution.
+- **Retention:** indefinite (MVP). Rows cannot be updated, deleted or truncated.
 
 ## Audit trail
 
@@ -302,6 +363,30 @@ Audit and statement tests:
 - **Migrations**: up/down/up on an empty database; the downgrade refuses to drop a non-empty
   `audit_events`; the sequence backfill on its own database.
 
+Idempotency tests:
+
+- **Duplicates and conflicts** with real commits: replays return the original result and
+  write nothing, replayed balances are historical even after later postings, and every changed
+  field (amount, operation, account, destination) is a mismatch. Rejected requests leave no key,
+  and their retry runs.
+- **Rollback**: a failure after the entries, a deferred-trigger failure at `COMMIT`, a failed
+  success audit and a deadlock retry each leave no stray key, and the retry posts once.
+- **Unknown `COMMIT` outcomes**, checked against the persisted state: a lost acknowledgement
+  (committed: the retry replays it, and reconciliation reports the failed/committed pair) and a
+  backend terminated before `COMMIT` through the real driver (not committed: the retry runs
+  once). A test-only deferred trigger keeps a `COMMIT` in progress server-side, showing that a
+  plain `SELECT` sees no key yet while the retry's claim waits, then replays, or runs if that
+  `COMMIT` fails.
+- **Concurrency** (retries disabled): 10 identical requests post once and replay 9 times;
+  mixed requests under one key post one; a waiter runs when the holder rolls back, and gets
+  `503` (then a replay) when the holder outlives `lock_timeout`; keyed opposite transfers never
+  deadlock.
+- **Least privilege**: a role with `SELECT, INSERT` on `idempotency_keys` claims, posts and
+  replays; it cannot update, delete or truncate keys; without the grant, a keyed posting fails
+  loudly (`42501`).
+- **API contract**: `428`/`422` for the header, strict integer amounts, every error code, and the
+  OpenAPI schema.
+
 CI runs the same suite against a PostgreSQL service container and smoke-tests the Compose
 stack.
 
@@ -329,8 +414,8 @@ stack.
 3. ✅ Users and accounts
 4. ✅ Ledger and transaction posting
 5. ✅ Audit trail, statements (service layer) and reconciliation
-6. Idempotency and concurrency hardening
-7. REST API, including the statement endpoint
+6. ✅ Idempotency and the HTTP posting API (deposits, withdrawals, transfers)
+7. REST API: statements and the remaining read endpoints
 8. Authentication and authorization
 9. Reliability
 10. Security and observability (including least-privilege database roles)

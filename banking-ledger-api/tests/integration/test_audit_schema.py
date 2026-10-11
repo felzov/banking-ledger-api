@@ -228,6 +228,23 @@ async def test_unknown_actor_becomes_null_and_is_kept_in_details(db_session: Asy
     assert event.details == {"currency": "EUR", "requested_user_id": str(claimed)}
 
 
+async def test_idempotency_key_is_stored_in_its_own_column(db_session: AsyncSession) -> None:
+    user = await create_user(db_session)
+    record = AuditRecord(
+        AuditAction.POSTING_WITHDRAWAL,
+        AuditOutcome.REJECTED,
+        actor_user_id=user.id,
+        reason="insufficient_funds",
+        details={"amount_minor": 100},
+        idempotency_key="withdraw-42",
+    )
+
+    event = await _only_event(db_session, record)
+
+    assert event.idempotency_key == "withdraw-42"
+    assert event.details == {"amount_minor": 100}
+
+
 async def test_success_for_an_unknown_actor_is_refused(db_session: AsyncSession) -> None:
     # A success always has a real actor; resolving an unknown one to NULL must not hide a bug.
     record = AuditRecord(

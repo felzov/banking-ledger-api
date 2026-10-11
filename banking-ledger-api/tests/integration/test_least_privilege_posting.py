@@ -1,10 +1,10 @@
-"""Postings under a least-privilege role (migration 0007, ADR 0012).
+"""Postings under a least-privilege role (migrations 0007 and 0010, ADR 0012).
 
 posting_role_grants() (tests/database.py) is the privilege contract of a role that can run
-the posting services: table privileges plus EXECUTE on the sequence helper, and NOTHING on the
-entries' identity sequence (inserting into an identity column does not need it). Before 0007
-the ordering trigger read the sequence with the caller's privileges, got NULL, and rejected
-every entry.
+the posting services: table privileges (only SELECT and INSERT on idempotency_keys) plus
+EXECUTE on the sequence helper, and NOTHING on the entries' identity sequence (inserting into
+an identity column does not need it). Before 0007 the ordering trigger read the sequence with
+the caller's privileges, got NULL, and rejected every entry.
 
 Roles are cluster-wide. The rolled-back tests create theirs inside the test transaction; the
 concurrent tests commit one and drop it afterwards.
@@ -38,7 +38,7 @@ from ledger_api.data.errors import sqlstate, violated_constraint
 from ledger_api.data.models import Account, AuditEvent, LedgerEntry
 from ledger_api.domain.audit import AuditOutcome
 from ledger_api.domain.currency import Currency
-from ledger_api.domain.errors import InsufficientFundsError
+from ledger_api.domain.errors import IdempotencyKeyMismatchError, InsufficientFundsError
 from ledger_api.services import audit as audit_service
 from ledger_api.services import posting as posting_service
 from ledger_api.services.posting import PostingResult, deposit, transfer, withdraw
@@ -61,9 +61,11 @@ def _role_name() -> str:
     return f"ledger_posting_{uuid.uuid7().hex}"
 
 
-async def _create_role(connection: AsyncConnection, role: str, *, helper: bool = True) -> None:
+async def _create_role(
+    connection: AsyncConnection, role: str, *, helper: bool = True, idempotency: bool = True
+) -> None:
     await connection.execute(text(f'CREATE ROLE "{role}" NOLOGIN'))
-    for grant in posting_role_grants(role, helper=helper):
+    for grant in posting_role_grants(role, helper=helper, idempotency=idempotency):
         await connection.execute(text(grant))
 
 
@@ -135,7 +137,7 @@ async def _fund(new_session: SessionFactory, account: Account, amount: int) -> P
 
 
 async def _switch_to_new_posting_role(
-    db_connection: AsyncConnection, *, helper: bool = True
+    db_connection: AsyncConnection, *, helper: bool = True, idempotency: bool = True
 ) -> str:
     """Create a posting role inside the test transaction and become it (SET LOCAL ROLE).
 
@@ -146,7 +148,7 @@ async def _switch_to_new_posting_role(
     inside a transaction; the committed tests below run as the role only.)
     """
     role = _role_name()
-    await _create_role(db_connection, role, helper=helper)
+    await _create_role(db_connection, role, helper=helper, idempotency=idempotency)
     await db_connection.execute(text(f'SET LOCAL ROLE "{role}"'))
     assert await db_connection.scalar(text("SELECT current_user")) == role
     return role
@@ -622,6 +624,141 @@ async def test_role_cannot_reassign_a_customers_account(
     await check_deferred_constraints(db_session)  # the funding still passes, as the role
 
 
+# --- idempotency keys (migration 0010) ------------------------------------------------------------
+
+
+async def test_posting_role_claims_replays_and_refuses_idempotency_keys(
+    db_connection: AsyncConnection,
+    db_session: AsyncSession,
+    new_session: SessionFactory,
+    pair: tuple[Account, Account],
+    role_witness: RoleWitness,
+) -> None:
+    payer, payee = pair
+    assert payer.user_id is not None
+    role = await _switch_to_new_posting_role(db_connection)
+    await _fund(new_session, payer, 1_000)
+
+    async def keyed_deposit(amount: int, key: str) -> PostingResult:
+        assert payer.user_id is not None
+        return await deposit(
+            new_session(),
+            owner_id=payer.user_id,
+            account_id=payer.id,
+            amount_minor=amount,
+            idempotency_key=key,
+        )
+
+    async def keyed_transfer(amount: int, key: str) -> PostingResult:
+        assert payer.user_id is not None
+        return await transfer(
+            new_session(),
+            owner_id=payer.user_id,
+            source_account_id=payer.id,
+            destination_account_id=payee.id,
+            amount_minor=amount,
+            idempotency_key=key,
+        )
+
+    posted = await keyed_deposit(500, "role-deposit")
+    moved = await keyed_transfer(300, "role-transfer")
+    replayed = await keyed_deposit(500, "role-deposit")  # SELECT: the conflict, then the replay
+    replayed_transfer = await keyed_transfer(300, "role-transfer")
+    with pytest.raises(IdempotencyKeyMismatchError):  # and its rejected audit, as the role
+        await keyed_deposit(501, "role-deposit")
+
+    # Postings lock (and audit); replays neither lock nor audit; the mismatch only audits.
+    role_witness.assert_ran_as(role, attempts=3, audits=4)
+    assert (replayed.replayed, replayed.transaction_id) == (True, posted.transaction_id)
+    assert replayed.balances == posted.balances == {payer.id: 1_500}
+    assert replayed_transfer.balances == moved.balances == {payer.id: 1_200}
+    await check_deferred_constraints(db_session)  # incl. the keys' deferred foreign key
+    await assert_reconciled(db_session)
+
+
+@pytest.mark.parametrize(
+    "statement",
+    [
+        "UPDATE public.idempotency_keys SET key = 'other'",
+        "DELETE FROM public.idempotency_keys",
+        "TRUNCATE public.idempotency_keys",
+    ],
+)
+async def test_posting_role_cannot_rewrite_or_remove_keys(
+    db_connection: AsyncConnection,
+    new_session: SessionFactory,
+    pair: tuple[Account, Account],
+    statement: str,
+) -> None:
+    payer, _ = pair
+    assert payer.user_id is not None
+    role = await _switch_to_new_posting_role(db_connection)
+    await deposit(
+        new_session(),
+        owner_id=payer.user_id,
+        account_id=payer.id,
+        amount_minor=10,
+        idempotency_key="permanent",
+    )
+
+    await _running_as(db_connection, role)
+    # Refused for lack of privilege, before the append-only trigger is even reached.
+    assert await _refused(db_connection, statement) == "42501"
+
+
+async def test_posting_role_cannot_attach_a_key_to_an_existing_transaction(
+    db_connection: AsyncConnection,
+    db_session: AsyncSession,
+    new_session: SessionFactory,
+    pair: tuple[Account, Account],
+) -> None:
+    # The role may INSERT into both tables, but the reciprocal link (migration 0011) still
+    # binds it: an existing transaction names no key, and can never be made to.
+    payer, _ = pair
+    assert payer.user_id is not None
+    role = await _switch_to_new_posting_role(db_connection)
+    existing = await _fund(new_session, payer, 100)  # an ordinary, unkeyed posting
+
+    await _running_as(db_connection, role)
+    await db_connection.execute(
+        text(
+            "INSERT INTO public.idempotency_keys (user_id, key, request_fingerprint, "
+            "transaction_id) VALUES (:u, 'forged', decode(repeat('ab', 32), 'hex'), :t)"
+        ),
+        {"u": payer.user_id, "t": existing.transaction_id},
+    )
+
+    async with raises_violation("ck_idempotency_keys_transaction_link"):
+        await check_deferred_constraints(db_session)  # as the role
+
+
+async def test_role_without_idempotency_grants_fails_loudly_on_a_keyed_posting(
+    db_connection: AsyncConnection,
+    new_session: SessionFactory,
+    pair: tuple[Account, Account],
+) -> None:
+    payer, _ = pair
+    assert payer.user_id is not None
+    await _switch_to_new_posting_role(db_connection, idempotency=False)
+
+    with pytest.raises(DBAPIError) as excinfo:
+        await deposit(
+            new_session(),
+            owner_id=payer.user_id,
+            account_id=payer.id,
+            amount_minor=1,
+            idempotency_key="no-grant",
+        )
+
+    assert sqlstate(excinfo.value) == "42501"
+    assert "idempotency_keys" in str(excinfo.value.orig)
+    # Unkeyed postings never touch the table: the rest of the contract still works.
+    unkeyed = await deposit(
+        new_session(), owner_id=payer.user_id, account_id=payer.id, amount_minor=1
+    )
+    assert unkeyed.balances == {payer.id: 1}
+
+
 # --- the helper's boundary -----------------------------------------------------------------------
 
 
@@ -957,6 +1094,38 @@ async def test_role_commits_valid_deposits_withdrawals_and_transfers(
             select(Account.balance_minor).where(Account.id == payee.account_id)
         )
         assert balance == 301
+        await assert_reconciled(session)
+
+
+@pytest.mark.concurrency
+async def test_role_commits_and_replays_keyed_postings(
+    engine: AsyncEngine, posting_role: RoleSessions, role_witness: RoleWitness
+) -> None:
+    # Real COMMITs: the keys' deferred foreign key is checked at COMMIT, as the role.
+    superuser = create_sessionmaker(engine)
+    payer = await commit_funded_account(superuser, 1_000)
+    role_witness.forget_setup()
+    key = f"role-{uuid.uuid7().hex}"
+
+    results = []
+    for _ in range(2):
+        async with posting_role.sessionmaker() as session:
+            results.append(
+                await withdraw(
+                    session,
+                    owner_id=payer.owner_id,
+                    account_id=payer.account_id,
+                    amount_minor=400,
+                    idempotency_key=key,
+                )
+            )
+
+    original, replayed = results
+    assert (original.replayed, replayed.replayed) == (False, True)
+    assert replayed.transaction_id == original.transaction_id
+    assert replayed.balances == original.balances == {payer.account_id: 600}
+    role_witness.assert_ran_as(posting_role.role, attempts=1, audits=1)
+    async with superuser() as session:
         await assert_reconciled(session)
 
 

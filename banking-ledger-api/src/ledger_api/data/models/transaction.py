@@ -7,6 +7,7 @@ from sqlalchemy import (
     ForeignKeyConstraint,
     Identity,
     SmallInteger,
+    Text,
     UniqueConstraint,
 )
 from sqlalchemy.orm import Mapped, mapped_column
@@ -20,6 +21,11 @@ class Transaction(Base):
 
     The database rejects UPDATE and DELETE, and at COMMIT it requires at least two entries
     that sum to zero and whose number equals entry_count (triggers, migrations 0001 and 0002).
+
+    A keyed posting names its idempotency key here, and the key names this transaction: at
+    COMMIT both must reference each other, and the key's user must own the posting's own
+    account (migration 0011). Rows are immutable, so an existing transaction can never be
+    attached to a new key.
     """
 
     __tablename__ = "transactions"
@@ -28,6 +34,27 @@ class Transaction(Base):
         CheckConstraint("entry_count >= 2", name="entry_count_min"),
         # Target of the composite foreign key from ledger_entries.
         UniqueConstraint("id", "ledger_id"),
+        # Unkeyed (both NULL, including every row from before 0011) or keyed (both set).
+        CheckConstraint(
+            "(idempotency_user_id IS NULL) = (idempotency_key IS NULL)",
+            name="idempotency_key_pair",
+        ),
+        # Explicit names: the conventional ones would exceed PostgreSQL's 63 characters.
+        UniqueConstraint(
+            "idempotency_user_id", "idempotency_key", name="uq_transactions_idempotency_key"
+        ),
+        # Checked at COMMIT, like the key's own reference to this transaction. The two tables
+        # reference each other; use_alter breaks the cycle for table ordering (the constraint is
+        # added by ALTER TABLE, as migration 0011 does).
+        ForeignKeyConstraint(
+            ["idempotency_user_id", "idempotency_key"],
+            ["idempotency_keys.user_id", "idempotency_keys.key"],
+            name="fk_transactions_idempotency_keys",
+            ondelete="RESTRICT",
+            deferrable=True,
+            initially="DEFERRED",
+            use_alter=True,
+        ),
     )
 
     id: Mapped[UUIDPrimaryKey]
@@ -37,6 +64,9 @@ class Transaction(Base):
     # so entries appended later make the actual count exceed it and COMMIT fails.
     entry_count: Mapped[int] = mapped_column(SmallInteger)
     created_at: Mapped[CreatedAt]
+    # The idempotency key this transaction was posted under (ADR 0006), or NULL for both.
+    idempotency_user_id: Mapped[uuid.UUID | None]
+    idempotency_key: Mapped[str | None] = mapped_column(Text)
 
 
 class LedgerEntry(Base):

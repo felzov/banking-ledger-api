@@ -19,7 +19,7 @@ guarantee.
 |---|---|
 | `user.register` | succeeded; rejected (`email_already_registered`); failed |
 | `account.open` | succeeded; rejected (`account_already_exists`, `user_not_found`); failed |
-| `posting.deposit`, `posting.withdrawal`, `posting.transfer` | succeeded; rejected (`account_not_found`, `destination_account_not_found`, `currency_mismatch`, `insufficient_funds`, `invalid_amount`, `same_account_transfer`); failed (`temporarily_unavailable`, `internal_error`) |
+| `posting.deposit`, `posting.withdrawal`, `posting.transfer` | succeeded; rejected (`account_not_found`, `destination_account_not_found`, `currency_mismatch`, `insufficient_funds`, `invalid_amount`, `same_account_transfer`, `idempotency_key_mismatch`); failed (`temporarily_unavailable`, `outcome_unknown`, `internal_error`) |
 
 Not audited, logs only: reads (users, accounts, statements), health checks, malformed HTTP
 bodies (422 before any service runs), and cancelled requests. There are no unauthenticated
@@ -34,7 +34,8 @@ requests to distinguish until Phase 8.
 | `actor_user_id` | Nullable FK to `users` |
 | `action`, `outcome`, `reason` | Stable identifiers. `reason` is a `DomainError` code or `internal_error` |
 | `transaction_id` | Nullable FK to `transactions`, unique |
-| `request_id`, `idempotency_key` | Reserved, NULL until Phases 10 and 6 |
+| `request_id` | Reserved, NULL until Phase 10 |
+| `idempotency_key` | The posting request's `Idempotency-Key`, on every outcome (Phase 6, ADR 0006); NULL for other actions and unkeyed internal calls |
 | `details` | `JSONB` object of safe metadata: ids, amounts, currencies, error type, SQLSTATE, constraint name. Never an email address, an exception message or a request body |
 
 Database-enforced rules: `reason IS NULL` exactly for `succeeded`; `transaction_id` present
@@ -121,3 +122,15 @@ future hardening work for Phase 10 and are not part of Phase 5.
   ADR 0008) and a retention policy are future work.
 - ERROR logs currently reach stderr through Python's last-resort handler; structured logging
   is Phase 10.
+
+## Amendment (Phase 6, 2026-10-10)
+
+- `audit_events.idempotency_key` is filled for posting events (all outcomes). `AuditRecord`
+  validates it like the key itself (visible ASCII, 1–255), stricter than the column's length
+  check. The fallback ERROR log line includes it; a validated key cannot break the line.
+- New reasons: `idempotency_key_mismatch` (rejected) and `outcome_unknown` (failed), see
+  ADR 0006 and ADR 0007.
+- Failed events for `temporarily_unavailable` and `outcome_unknown` also carry `cause_type`,
+  the class name of the underlying error, including when it is not a database error (e.g.
+  `ConnectionResetError` during COMMIT). The class name only, never its message, which can
+  quote connection details.

@@ -28,11 +28,15 @@ from ledger_api.data.engine import create_sessionmaker
 from ledger_api.data.models import AuditEvent, Transaction
 from ledger_api.domain.audit import AuditAction, AuditOutcome, AuditRecord
 from ledger_api.domain.currency import Currency
-from ledger_api.domain.errors import InsufficientFundsError, UserNotFoundError
+from ledger_api.domain.errors import (
+    IdempotencyKeyMismatchError,
+    InsufficientFundsError,
+    UserNotFoundError,
+)
 from ledger_api.services import audit as audit_service
 from ledger_api.services import posting as posting_service
 from ledger_api.services.accounts import open_customer_account
-from ledger_api.services.posting import withdraw
+from ledger_api.services.posting import PostingResult, withdraw
 from tests.database import audit_events_about
 from tests.factories import FundedAccount, commit_funded_account
 
@@ -118,6 +122,40 @@ async def test_rejection_on_a_single_connection(
     assert await _latest_event(sessionmaker, funded.account_id) == (
         AuditOutcome.REJECTED,
         "insufficient_funds",
+    )
+    assert caplog.records == []
+    assert _checked_out(single_connection_engine) == 0
+
+
+async def test_keyed_posting_replay_and_mismatch_on_a_single_connection(
+    sessionmaker: async_sessionmaker[AsyncSession],
+    single_connection_engine: AsyncEngine,
+    funded: FundedAccount,
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    # The claim, the replay lookup and the mismatch's rejected audit all use the one connection.
+    key = f"single-{uuid.uuid7().hex}"
+
+    async def keyed_withdraw(amount: int) -> PostingResult:
+        async with sessionmaker() as session:
+            return await withdraw(
+                session,
+                owner_id=funded.owner_id,
+                account_id=funded.account_id,
+                amount_minor=amount,
+                idempotency_key=key,
+            )
+
+    with caplog.at_level(logging.ERROR, logger=AUDIT_LOGGER):
+        posted = await keyed_withdraw(1)
+        replayed = await keyed_withdraw(1)
+        with pytest.raises(IdempotencyKeyMismatchError):
+            await keyed_withdraw(2)
+
+    assert (posted.replayed, replayed.replayed) == (False, True)
+    assert await _latest_event(sessionmaker, funded.account_id) == (
+        AuditOutcome.REJECTED,
+        "idempotency_key_mismatch",
     )
     assert caplog.records == []
     assert _checked_out(single_connection_engine) == 0

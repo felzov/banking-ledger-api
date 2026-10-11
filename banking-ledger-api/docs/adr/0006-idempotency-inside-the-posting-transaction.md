@@ -39,3 +39,107 @@ must not move money twice.
   needed (for example 30–90 days with a cleanup job). Once a key is purged, a captured old
   request could execute again, so retention length is a security decision, not just storage
   housekeeping.
+
+## Amendment (Phase 6, 2026-10-10)
+
+Implemented in migration 0010, `domain/idempotency.py`, `data/idempotency.py` and
+`services/posting.py`, with these refinements:
+
+- **Endpoints.** The keyed operations are `POST /users/{user_id}/accounts/{account_id}/deposits`,
+  `/withdrawals` and `/transfers` (ADR 0009's owner scope), not one `POST /transactions`.
+- **The header.** `Idempotency-Key` is required: missing is `428 idempotency_key_required`;
+  malformed or sent twice is `422 invalid_idempotency_key`. A key is 1–255 **visible ASCII**
+  characters (0x21–0x7E), checked by the API, the service and a `CHECK` constraint. Neither
+  case reaches a service, so neither is audited, and the value is never echoed. The service
+  parameter is optional, for internal callers; a malformed one there is a `ValueError`.
+- **The fingerprint replaces "method, path and canonical body".** It is SHA-256 over a
+  versioned canonical JSON of the **business fields**: operation, `user_id`, the caller's
+  (source) account, the destination (transfers only, `null` otherwise) and `amount_minor`.
+  It is built from validated values, so JSON spelling (whitespace, key order) cannot make a
+  retry look different, and every field that changes the posting's meaning is covered. It is
+  computed **after** pre-validation (amount, distinct accounts), so an invalid request is
+  rejected for what it is, even with a key that is already in use. The same key with a
+  different fingerprint is `422 idempotency_key_mismatch`.
+- **The claim** is `INSERT ... ON CONFLICT (user_id, key) DO NOTHING RETURNING`, the first
+  statement after `BEGIN`, before the settlement lookup and every account lock. A duplicate never
+  raises `23505`, so the transaction is never left aborted. If no row comes back, a second
+  statement (a fresh READ COMMITTED snapshot) reads the committed row the conflict was with.
+  The global lock order becomes "key, then accounts". A request waiting on a key holds no account
+  lock, so keys add no deadlock cycle; the concurrency tests run with retries disabled.
+- **What is stored.** `idempotency_keys(user_id, key, request_fingerprint, transaction_id,
+  created_at)`. The transaction id is generated before the header exists (UUIDv7 in Python), so
+  its foreign key is `DEFERRABLE INITIALLY DEFERRED`: a committed key always references a
+  committed transaction, and each transaction has at most one key.
+- **Replays are rebuilt, not stored.** No response snapshot is kept. A replay reads the stored
+  transaction and the caller's entry, and computes the balance right after that entry as the
+  sum of the account's entries up to it in `sequence_number` order, the statements' calculation
+  (ADR 0012). `accounts.balance_minor` is never used, so a replay after later postings still
+  shows the original balance. The response is `201` with the original body and
+  `Idempotent-Replayed: true`. Replays write nothing and are not audited.
+- **Only committed postings own a key.** A rejected or failed request rolls its claim back with
+  everything else, so its retry with the same key runs normally, and may succeed. This is
+  deliberate: a rejection means nothing happened, and caching it would need a write outside the
+  posting transaction.
+- **Unknown COMMIT outcome.** If COMMIT fails without PostgreSQL reporting why (a lost
+  connection, a driver or network error), the posting may have been applied. The service
+  responds `503 outcome_unknown` and tells the client to retry with the **same** key. It never
+  says the request failed, and never retries by itself. A COMMIT is a **definite rollback**
+  only if PostgreSQL itself answered it with severity `ERROR` (not `FATAL` or `PANIC`) on a
+  connection that is still open: the server then aborted the transaction and kept the session.
+  This holds whatever the SQLSTATE, except `40003` (statement_completion_unknown), `08007`
+  (transaction_resolution_unknown) and class `08`, which stay unknown. The SQLSTATE alone is not
+  enough: asyncpg's client-side errors carry class-level codes (a connection closed mid-COMMIT
+  reports `08003`) but no server severity. Definite rollbacks keep their handling (a deadlock is
+  retried, a timeout is `503 temporarily_unavailable`, anything else is `500`).
+  Recovery consults the durable record through the claim, never through a plain
+  `SELECT`. While the original backend is still inside its COMMIT, its row is invisible: a
+  `SELECT` would find nothing and wrongly conclude "not posted". The retry's `INSERT` instead
+  waits for that transaction to end, then replays it, or runs if that COMMIT failed. The wait is
+  bounded by `lock_timeout` (2 s). Beyond it the retry gets `503 temporarily_unavailable` and
+  can retry again.
+- **Unknown users.** Before Phase 8 the URL names the user. A key for a user that does not
+  exist violates `fk_idempotency_keys_user_id_users`, which is translated (by exact name) to
+  `404 account_not_found`, as for any account that is not the caller's (ADR 0009).
+- **Retention.** Keys are kept indefinitely (MVP). The table is append-only like the ledger:
+  `UPDATE`, `DELETE` and `TRUNCATE` raise `idempotency_keys_immutable`, and the downgrade of
+  0010 refuses to drop a non-empty table. A deleted key would let a retried request run twice.
+  The production concern above (unbounded growth, and retention as a security decision) stands.
+- **Least privilege.** A posting role needs `SELECT, INSERT` on `idempotency_keys` and nothing
+  more (ADR 0012's contract, asserted by tests).
+- **Audit.** Every audited posting event carries the key in `audit_events.idempotency_key`
+  (ADR 0011).
+
+## Amendment (Phase 6 review, 2026-10-11): the key and its transaction reference each other
+
+Migration 0010's foreign key proved only that a key's transaction *existed*. A database client
+with `INSERT` on `idempotency_keys` (the posting role has it) could attach a new key to an
+unrelated, older transaction, or to another user's; a later legitimate request with that key
+would then "replay" it instead of posting. Migration 0011 closes this in the database:
+
+- `transactions.idempotency_user_id` and `transactions.idempotency_key` name the key the
+  transaction was posted under: both NULL (unkeyed postings, and every row from before 0011) or
+  both set (`ck_transactions_idempotency_key_pair`); at most one transaction per key
+  (`uq_transactions_idempotency_key`); the key exists (`fk_transactions_idempotency_keys`,
+  checked at COMMIT). `insert_posting` fills them from the claim.
+- `assert_idempotency_link()` runs at COMMIT from a constraint trigger on each side (every new
+  key; every new transaction that names a key). It requires that the key references exactly
+  this transaction and the transaction names exactly this key
+  (`ck_idempotency_keys_transaction_link`), and that the key's user owns the posting's own
+  customer account: credited by a deposit, debited by a withdrawal or a transfer
+  (`ck_idempotency_keys_transaction_owner`).
+- **Why it is sound:** transactions are append-only (trigger, and no `UPDATE` privilege), so an
+  existing transaction can never come to name a new key; a new transaction cannot name an
+  existing key either, because that key must point back at it. Neither `xmin` nor timestamps
+  are involved: `xmin` comparisons are not a proof across transaction-id wraparound and break
+  under savepoints (ADR 0010), and `created_at` is client-settable.
+- The function is `SECURITY INVOKER` (it reads only what a posting role already reads, so the
+  privilege contract is unchanged) with `search_path = pg_catalog, pg_temp` and schema-qualified
+  tables, so temporary tables cannot shadow what it reads (as in 0008 and 0009).
+- Keys committed under 0010 keep pointing at transactions that name nothing. The upgrade checks
+  no existing row, so they stay valid; they cannot be hijacked, because a new transaction
+  naming such a key fails the link check.
+- 0011's downgrade refuses while any transaction names a key: the columns are the proof of
+  which key a transaction was posted under.
+- What it does not stop: a role that can insert transactions can still insert a complete, new,
+  balanced posting with its own key, exactly as it could before; restricting that needs a
+  `SECURITY DEFINER` posting function (ADR 0010, Phase 10). A superuser can disable triggers.

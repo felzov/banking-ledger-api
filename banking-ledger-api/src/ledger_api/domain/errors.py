@@ -85,6 +85,13 @@ class InsufficientFundsError(RuleViolationError):
     message = "The account balance is insufficient."
 
 
+class IdempotencyKeyMismatchError(RuleViolationError):
+    # The key was already consumed by a different request of the same user (ADR 0006). Keys are
+    # scoped per user, so this reveals nothing about anyone else's keys.
+    code = "idempotency_key_mismatch"
+    message = "This Idempotency-Key was already used for a different request."
+
+
 class InvalidStatementLimitError(RuleViolationError):
     code = "invalid_statement_limit"
     message = "The page size must be a whole number within the allowed range."
@@ -101,6 +108,17 @@ class StatementInconsistencyError(InternalError):
     # message as any unexpected error: what was detected stays in the server log.
     code = "internal_error"
     message = "Internal server error."
+
+
+class CommitOutcomeUnknownError(UnavailableError):
+    # The connection was lost (or the COMMIT failed in a way PostgreSQL did not report) after
+    # COMMIT was sent: the posting may or may not have been applied. Never claim it failed.
+    # The durable idempotency record decides, when the client retries with the same key.
+    code = "outcome_unknown"
+    message = (
+        "The outcome of the request is unknown: it may or may not have been applied. "
+        "Retry with the same Idempotency-Key to get the definitive result."
+    )
 
 
 class TemporarilyUnavailableError(UnavailableError):
