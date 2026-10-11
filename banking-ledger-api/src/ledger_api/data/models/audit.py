@@ -35,7 +35,8 @@ class AuditEvent(Base):
     __table_args__ = (
         CheckConstraint(
             "action IN ('user.register', 'account.open', "
-            "'posting.deposit', 'posting.withdrawal', 'posting.transfer')",
+            "'posting.deposit', 'posting.withdrawal', 'posting.transfer', "
+            "'auth.login', 'auth.logout')",
             name="action",
         ),
         CheckConstraint("outcome IN ('succeeded', 'rejected', 'failed')", name="outcome"),
