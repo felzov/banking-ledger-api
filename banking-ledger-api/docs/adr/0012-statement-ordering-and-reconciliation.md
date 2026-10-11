@@ -143,7 +143,8 @@ commit-order guarantee holds for entries written after migration 0005.
 
 ### Statements (`services.statements.get_statement`)
 
-Service only; the HTTP endpoint comes with the financial API in Phase 7.
+Service only; the HTTP endpoint comes with the financial API in Phase 7. *(Superseded: the
+endpoint now exists; see "Amendment (Phase 7, 2026-10-11): the read API" below.)*
 
 `StatementPage(account_id, balance_minor, entries, next_cursor)`, each entry
 `(entry_id, transaction_id, kind, amount_minor, balance_after_minor, created_at)`. No

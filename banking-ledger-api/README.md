@@ -126,7 +126,7 @@ curl -si -X POST localhost:8000/users/<user_id>/accounts/<account_id>/deposits \
 # The same request again (e.g. after a timeout): nothing is posted twice.
 # 201, same body, same Location, plus the header  Idempotent-Replayed: true
 
-curl -s localhost:8000/users/<user_id>/accounts/<account_id>/statement?limit=2
+curl -s 'localhost:8000/users/<user_id>/accounts/<account_id>/statement?limit=2'
 # 200 {"account_id": "<uuid>", "balance_minor": 2500,
 #      "entries": [{"entry_id": "<uuid>", "transaction_id": "<uuid>", "kind": "deposit",
 #                   "amount_minor": 2500, "balance_after_minor": 2500, "created_at": "..."}],
@@ -356,6 +356,12 @@ historical balance calculation (also used by idempotent replays).
   or skips an entry.
 - No counterparty is shown. If the balance does not equal the sum of the entries, the service
   refuses (`internal_error`) and logs an ERROR instead of returning a possibly wrong statement.
+- **Cost (known limitation):** running balances are recomputed on every read. Each statement
+  page scans the account's whole history, and a single-transaction read sums the account's
+  entries up to that one, so both grow linearly with the account's history. Acceptable for the
+  MVP; the documented upgrade path is persisted running balances with a gapless per-account
+  sequence ([ADR 0012](docs/adr/0012-statement-ordering-and-reconciliation.md), "Alternatives
+  considered").
 
 ## Testing
 
