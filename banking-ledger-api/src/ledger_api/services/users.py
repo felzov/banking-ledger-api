@@ -5,6 +5,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ledger_api.data.errors import violated_constraint
 from ledger_api.data.models import User
+from ledger_api.data.users import find_user
 from ledger_api.domain.audit import AuditAction
 from ledger_api.domain.errors import EmailAlreadyRegisteredError, UserNotFoundError
 from ledger_api.services.audit import AuditContext, audited, record_in_transaction
@@ -42,7 +43,10 @@ async def register_user(session: AsyncSession, *, email: str) -> User:
 
 
 async def get_user(session: AsyncSession, *, user_id: uuid.UUID) -> User:
-    user = await session.get(User, user_id)
+    # Reads own their transaction like writes do: the session is returned outside any
+    # transaction, with its connection back in the pool, ready for the next service call.
+    async with session.begin():
+        user = await find_user(session, user_id=user_id)
     if user is None:
         raise UserNotFoundError
     return user

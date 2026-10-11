@@ -7,6 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ledger_api.data.accounts import get_ledger_by_currency, get_owned_account, list_owned_accounts
 from ledger_api.data.errors import violated_constraint
 from ledger_api.data.models import Account
+from ledger_api.data.users import find_user
 from ledger_api.domain.account import AccountKind
 from ledger_api.domain.audit import AuditAction
 from ledger_api.domain.currency import Currency
@@ -16,7 +17,6 @@ from ledger_api.domain.errors import (
     UserNotFoundError,
 )
 from ledger_api.services.audit import AuditContext, audited, record_in_transaction
-from ledger_api.services.users import get_user
 
 ONE_ACCOUNT_PER_CURRENCY = "uq_accounts_user_id_ledger_id"
 OWNER_MUST_EXIST = "fk_accounts_user_id_users"
@@ -62,7 +62,10 @@ async def open_customer_account(
 async def get_customer_account(
     session: AsyncSession, *, owner_id: uuid.UUID, account_id: uuid.UUID
 ) -> Account:
-    account = await get_owned_account(session, owner_id=owner_id, account_id=account_id)
+    # Reads own their transaction: the session is returned outside any transaction. The ledger
+    # is loaded eagerly, so the account stays usable afterwards.
+    async with session.begin():
+        account = await get_owned_account(session, owner_id=owner_id, account_id=account_id)
     if account is None:
         # Same error whether the account is missing, another user's, or a system account.
         raise AccountNotFoundError
@@ -72,5 +75,8 @@ async def get_customer_account(
 async def list_customer_accounts(
     session: AsyncSession, *, owner_id: uuid.UUID
 ) -> Sequence[Account]:
-    await get_user(session, user_id=owner_id)  # unknown user: 404, not an empty list
-    return await list_owned_accounts(session, owner_id=owner_id)
+    async with session.begin():
+        # Data-layer lookups only: calling the get_user service here would nest its transaction.
+        if await find_user(session, user_id=owner_id) is None:
+            raise UserNotFoundError  # unknown user: 404, not an empty list
+        return await list_owned_accounts(session, owner_id=owner_id)

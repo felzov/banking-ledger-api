@@ -72,17 +72,20 @@ async def get_statement(
     # type() rather than isinstance(): bool is a subclass of int, and True is not a page size.
     if type(limit) is not int or not 1 <= limit <= MAX_LIMIT:
         raise InvalidStatementLimitError
-    if await get_owned_account(session, owner_id=owner_id, account_id=account_id) is None:
-        # Missing, someone else's, or a system account: indistinguishable (ADR 0009).
-        raise AccountNotFoundError
+    # Reads own their transaction: the session is returned outside any transaction, with its
+    # connection back in the pool. The page itself is still ONE statement (one snapshot).
+    async with session.begin():
+        if await get_owned_account(session, owner_id=owner_id, account_id=account_id) is None:
+            # Missing, someone else's, or a system account: indistinguishable (ADR 0009).
+            raise AccountNotFoundError
 
-    before = None
-    if cursor is not None:
-        before = await find_cursor_position(session, account_id=account_id, entry_id=cursor)
-        if before is None:
-            raise InvalidStatementCursorError
+        before = None
+        if cursor is not None:
+            before = await find_cursor_position(session, account_id=account_id, entry_id=cursor)
+            if before is None:
+                raise InvalidStatementCursorError
 
-    snapshot = await read_statement(session, account_id=account_id, before=before, limit=limit)
+        snapshot = await read_statement(session, account_id=account_id, before=before, limit=limit)
     if snapshot.balance_minor != snapshot.entries_total_minor:
         logger.error(
             "statement refused: account %s has balance_minor=%d but its entries sum to %d",
