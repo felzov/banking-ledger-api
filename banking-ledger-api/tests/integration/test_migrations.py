@@ -346,6 +346,76 @@ async def test_0011_keeps_0010_keys_valid_and_unhijackable() -> None:
         await engine.dispose()
 
 
+LEGACY_KEYS = text(
+    "SELECT user_id, key, request_fingerprint, transaction_id, created_at FROM idempotency_keys"
+)
+
+
+async def _version(engine: AsyncEngine) -> str | None:
+    async with engine.connect() as connection:
+        version = await connection.scalar(text("SELECT version_num FROM alembic_version"))
+    return version if isinstance(version, str) else None
+
+
+async def test_downgrade_from_head_keeps_0010_keys_behind_0010s_guard() -> None:
+    # A head database holding only a legacy (0010-era, unlinked) key. Downgrading to 0009:
+    # 0011 has no links to protect and downgrades; 0010 then refuses to drop a populated
+    # idempotency_keys. Alembic runs one call in one transaction, so a single call from head
+    # is refused as a whole (still at 0011); step by step, 0011 commits and 0010 refuses.
+    server_url = configured_database_url()
+    url = disposable_database_url(server_url, "_legacy_downgrade")
+    assert url.database is not None
+    await recreate_database(server_url, url.database)
+    engine = create_async_engine(url, poolclass=NullPool)
+    ids = {"user": uuid.uuid7(), "account": uuid.uuid7(), "transaction": uuid.uuid7()}
+    try:
+        await run_alembic(engine, lambda config: command.upgrade(config, "0010"))
+        async with engine.begin() as connection:
+            for statement in COMMITTED_KEYED_DEPOSIT:
+                await connection.execute(text(statement.format(**ids)))
+        await run_alembic(engine, lambda config: command.upgrade(config, "head"))
+        async with engine.connect() as connection:
+            legacy = [tuple(row) for row in await connection.execute(LEGACY_KEYS)]
+            columns_0011 = list((await connection.execute(TRANSACTION_COLUMNS)).scalars())
+        assert [row[3] for row in legacy] == [ids["transaction"]]
+        rows = await _snapshot(engine)
+
+        # One call, head -> 0009: refused by 0010's guard (0011's guard found no link).
+        with pytest.raises(DBAPIError) as excinfo:
+            await run_alembic(engine, lambda config: command.downgrade(config, "0009"))
+        assert sqlstate(excinfo.value) == "2BP01"
+        assert "refusing to drop idempotency_keys" in str(excinfo.value.orig)
+        assert "idempotency links" not in str(excinfo.value.orig)  # not 0011's refusal
+        # Atomic: nothing of 0011's downgrade survived the refusal.
+        assert await _version(engine) == "0011"
+        async with engine.connect() as connection:
+            assert list((await connection.execute(TRANSACTION_COLUMNS)).scalars()) == columns_0011
+            assert [tuple(row) for row in await connection.execute(LEGACY_KEYS)] == legacy
+        assert await _snapshot(engine) == rows
+
+        # Step by step: 0011 downgrades (it has no links to protect)...
+        await run_alembic(engine, lambda config: command.downgrade(config, "0010"))
+        assert await _version(engine) == "0010"
+        async with engine.connect() as connection:
+            columns_0010 = set((await connection.execute(TRANSACTION_COLUMNS)).scalars())
+            assert [tuple(row) for row in await connection.execute(LEGACY_KEYS)] == legacy
+        assert columns_0010 == set(columns_0011) - {"idempotency_user_id", "idempotency_key"}
+        assert "assert_idempotency_link" not in await _public_functions(engine)
+
+        # ...and 0010 refuses to drop the populated table, leaving everything in place.
+        with pytest.raises(DBAPIError) as excinfo:
+            await run_alembic(engine, lambda config: command.downgrade(config, "0009"))
+        assert sqlstate(excinfo.value) == "2BP01"
+        assert "refusing to drop idempotency_keys" in str(excinfo.value.orig)
+        assert await _version(engine) == "0010"
+        async with engine.connect() as connection:
+            assert [tuple(row) for row in await connection.execute(LEGACY_KEYS)] == legacy
+        assert await _snapshot(engine) == rows
+        assert "idempotency_keys" in await _public_tables(engine)
+    finally:
+        await engine.dispose()
+
+
 # Every row a 0009 database can hold, in a stable order: compared before and after 0010.
 SNAPSHOT_0009 = {
     "users": "SELECT id, email, created_at FROM users ORDER BY id",

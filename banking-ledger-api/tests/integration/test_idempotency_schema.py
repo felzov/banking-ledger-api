@@ -12,10 +12,10 @@ from typing import Any
 
 import pytest
 from sqlalchemy import delete, insert, text, update
-from sqlalchemy.exc import DBAPIError, IntegrityError
+from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ledger_api.data.errors import sqlstate, violated_constraint
+from ledger_api.data.errors import sqlstate
 from ledger_api.data.models import Account, IdempotencyKey, Transaction, User
 from ledger_api.domain.currency import Currency
 from ledger_api.domain.transaction import TransactionKind
@@ -375,37 +375,57 @@ async def test_deposits_and_withdrawals_link_on_the_owners_side(
     await check_deferred_constraints(db_session)  # credited by a deposit, debited by a withdrawal
 
 
+LINK_TRIGGERS = "idempotency_keys_linked, transactions_idempotency_linked"
+
+
+async def _mismatched_pair(session: AsyncSession) -> None:
+    """A header naming key-b, while key-b references a DIFFERENT existing transaction.
+
+    Every other rule is satisfied, so only the link check can object: both foreign keys
+    resolve (key-b exists; its transaction exists), each key and each transaction is unique,
+    the key's own transaction is a valid posting of its user, and every transaction balances.
+    """
+    owner, payer, _ = await _keyed_posting(session, key="key-a")
+    payee = await create_customer_account(session)
+    impostor = await _header(session, payer.ledger_id, names=(owner.id, "key-b"))
+    add_entries(session, impostor, (payer, -10), (payee, 10))
+    elsewhere = await _header(session, payer.ledger_id)  # unkeyed, the owner's own posting
+    add_entries(session, elsewhere, (payer, -10), (payee, 10))
+    await session.flush()
+    await _insert_key(session, owner.id, "key-b", elsewhere.id)
+
+
 async def test_a_key_must_reference_the_transaction_that_names_it(
     db_session: AsyncSession,
 ) -> None:
-    # Mismatched pair: the header names key-a, but key-a references another transaction.
-    owner, payer, _ = await _keyed_posting(db_session, key="key-a")
-    payee = await create_customer_account(db_session)
-    impostor = await _header(db_session, payer.ledger_id, names=(owner.id, "key-b"))
-    add_entries(db_session, impostor, (payer, -10), (payee, 10))
-    await db_session.flush()
-    # key-b exists, but points at a different (fresh) transaction id.
-    await _insert_key(db_session, owner.id, "key-b", uuid.uuid7())
+    await _mismatched_pair(db_session)
 
-    with pytest.raises(IntegrityError) as excinfo:
-        await check_deferred_constraints(db_session)
-    # Whichever COMMIT-time check fires first, the pair is refused.
-    assert violated_constraint(excinfo.value) in {
-        LINK,
-        "fk_idempotency_keys_transaction_id_transactions",
-    }
+    # Only the link triggers run here, so the violation can only be theirs.
+    async with raises_violation(LINK):
+        await db_session.execute(text(f"SET CONSTRAINTS {LINK_TRIGGERS} IMMEDIATE"))
 
 
-async def test_a_header_that_names_a_key_without_it_referencing_back_is_refused(
+async def test_only_the_link_check_refuses_a_mismatched_pair(db_session: AsyncSession) -> None:
+    # Control for the test above: with the link triggers removed (inside this rolled-back
+    # transaction only; DDL is transactional), every other COMMIT-time check accepts the very
+    # same rows. The link check is therefore the one and only thing refusing them.
+    await db_session.execute(text("DROP TRIGGER idempotency_keys_linked ON idempotency_keys"))
+    await db_session.execute(text("DROP TRIGGER transactions_idempotency_linked ON transactions"))
+    await _mismatched_pair(db_session)
+
+    await check_deferred_constraints(db_session)  # passes: nothing else objects
+
+
+async def test_a_second_transaction_cannot_name_an_already_used_key(
     db_session: AsyncSession,
 ) -> None:
-    # Hijacking an existing key: the header names it, but the key references its own posting.
+    # At most one transaction names a given key: refused at INSERT by the unique constraint.
+    # (This does not exercise the reverse-link check; a new transaction naming a key that
+    # points elsewhere is test_0011_keeps_0010_keys_valid_and_unhijackable.)
     owner, payer, _ = await _keyed_posting(db_session, key="taken")
-    payee = await create_customer_account(db_session)
 
     async with raises_violation("uq_transactions_idempotency_key"):
         await _header(db_session, payer.ledger_id, names=(owner.id, "taken"))
-    assert payee is not None
 
 
 async def test_a_header_cannot_name_a_key_that_does_not_exist(db_session: AsyncSession) -> None:
@@ -416,9 +436,9 @@ async def test_a_header_cannot_name_a_key_that_does_not_exist(db_session: AsyncS
     add_entries(db_session, header, (payer, -100), (payee, 100))
     await db_session.flush()
 
-    with pytest.raises(IntegrityError) as excinfo:
-        await check_deferred_constraints(db_session)
-    assert violated_constraint(excinfo.value) in {"fk_transactions_idempotency_keys", LINK}
+    # The link trigger would refuse this too; checking only the foreign key isolates it.
+    async with raises_violation("fk_transactions_idempotency_keys"):
+        await db_session.execute(text("SET CONSTRAINTS fk_transactions_idempotency_keys IMMEDIATE"))
 
 
 @pytest.mark.parametrize(
