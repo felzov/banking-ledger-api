@@ -45,7 +45,7 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ledger_api.data.errors import server_severity, sqlstate, violated_constraint
-from ledger_api.data.idempotency import claim_idempotency_key, find_posted_entry
+from ledger_api.data.idempotency import claim_idempotency_key
 from ledger_api.data.posting import (
     LockedAccount,
     apply_balance_deltas,
@@ -53,6 +53,7 @@ from ledger_api.data.posting import (
     insert_posting,
     lock_accounts,
 )
+from ledger_api.data.statements import find_posted_entry
 from ledger_api.domain.account import AccountKind
 from ledger_api.domain.audit import AuditAction, DetailValue
 from ledger_api.domain.errors import (

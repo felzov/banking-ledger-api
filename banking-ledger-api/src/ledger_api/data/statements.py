@@ -15,6 +15,7 @@ from datetime import datetime
 
 from sqlalchemy import func, select, true
 from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy.orm import aliased
 
 from ledger_api.data.models import Account, LedgerEntry, Transaction
 from ledger_api.domain.transaction import TransactionKind
@@ -108,3 +109,61 @@ async def read_statement(
         if row.entry_id is not None
     ]
     return StatementSnapshot(first.balance_minor, int(first.entries_total_minor), rows)
+
+
+@dataclass(frozen=True, slots=True)
+class PostedEntry:
+    """One account's side of a committed transaction, as it was when it was posted."""
+
+    entry_id: uuid.UUID
+    transaction_id: uuid.UUID
+    kind: TransactionKind
+    created_at: datetime
+    amount_minor: int
+    # The account's balance right after this entry: computed from the entries, never stored.
+    balance_after_minor: int
+
+
+async def find_posted_entry(
+    session: AsyncSession, *, transaction_id: uuid.UUID, account_id: uuid.UUID
+) -> PostedEntry | None:
+    """`account_id`'s entry in committed transaction `transaction_id`, with the balance right
+    after it, or None if the transaction has no entry on that account.
+
+    Entries are immutable and an account's committed history only grows at the end (ADR 0012),
+    so the result is the same whenever it is read: later postings never change it. Used by the
+    single-transaction read and by idempotent replays. The lookup is scoped to the account: an
+    entry of any other account is never read.
+    """
+    entry, history = aliased(LedgerEntry), aliased(LedgerEntry)
+    balance_after = (
+        select(func.sum(history.amount_minor))
+        .where(
+            history.account_id == entry.account_id,
+            history.sequence_number <= entry.sequence_number,
+        )
+        .scalar_subquery()
+    )
+    statement = (
+        select(
+            entry.id.label("entry_id"),
+            Transaction.id,
+            Transaction.kind,
+            Transaction.created_at,
+            entry.amount_minor,
+            balance_after.label("balance_after_minor"),
+        )
+        .join(entry, entry.transaction_id == Transaction.id)
+        .where(Transaction.id == transaction_id, entry.account_id == account_id)
+    )
+    row = (await session.execute(statement)).one_or_none()
+    if row is None:
+        return None
+    return PostedEntry(
+        entry_id=row.entry_id,
+        transaction_id=row.id,
+        kind=TransactionKind(row.kind),
+        created_at=row.created_at,
+        amount_minor=row.amount_minor,
+        balance_after_minor=int(row.balance_after_minor),
+    )

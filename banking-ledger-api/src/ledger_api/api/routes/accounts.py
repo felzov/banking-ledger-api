@@ -15,7 +15,14 @@ from ledger_api.services.accounts import (
     list_customer_accounts,
     open_customer_account,
 )
-from ledger_api.services.statements import DEFAULT_LIMIT, MAX_LIMIT, StatementPage, get_statement
+from ledger_api.services.statements import (
+    DEFAULT_LIMIT,
+    MAX_LIMIT,
+    StatementEntry,
+    StatementPage,
+    get_account_transaction,
+    get_statement,
+)
 
 # Mounted under /users/{user_id} (see main.py): accounts are only reachable through their owner.
 router = APIRouter(prefix="/accounts", tags=["accounts"])
@@ -104,6 +111,17 @@ class StatementEntryResponse(BaseModel):
     created_at: datetime
     # Deliberately no counterparty: a statement reveals only the owner's own account.
 
+    @classmethod
+    def of(cls, entry: StatementEntry) -> StatementEntryResponse:
+        return cls(
+            entry_id=entry.entry_id,
+            transaction_id=entry.transaction_id,
+            kind=entry.kind,
+            amount_minor=entry.amount_minor,
+            balance_after_minor=entry.balance_after_minor,
+            created_at=entry.created_at,
+        )
+
 
 class StatementResponse(BaseModel):
     account_id: uuid.UUID
@@ -119,17 +137,7 @@ class StatementResponse(BaseModel):
         return cls(
             account_id=page.account_id,
             balance_minor=page.balance_minor,
-            entries=[
-                StatementEntryResponse(
-                    entry_id=entry.entry_id,
-                    transaction_id=entry.transaction_id,
-                    kind=entry.kind,
-                    amount_minor=entry.amount_minor,
-                    balance_after_minor=entry.balance_after_minor,
-                    created_at=entry.created_at,
-                )
-                for entry in page.entries
-            ],
+            entries=[StatementEntryResponse.of(entry) for entry in page.entries],
             next_cursor=page.next_cursor,
         )
 
@@ -172,3 +180,23 @@ async def read_statement(
         session, owner_id=user_id, account_id=account_id, limit=limit, cursor=cursor
     )
     return StatementResponse.of(page)
+
+
+@router.get(
+    "/{account_id}/transactions/{transaction_id}",
+    name="get_account_transaction",
+    responses={**NOT_FOUND, **VALIDATION_ERROR_RESPONSE},
+)
+async def read_account_transaction(
+    user_id: uuid.UUID, account_id: uuid.UUID, transaction_id: uuid.UUID, session: SessionDep
+) -> StatementEntryResponse:
+    """One transaction as it appears on this account: the account's own entry, signed, with the
+    balance right after it (historical, as on the statement). No counterparty.
+
+    Someone else's, a system or a missing account is 404 account_not_found. A transaction that
+    does not exist, or has no entry on this account, is the same 404 transaction_not_found.
+    """
+    entry = await get_account_transaction(
+        session, owner_id=user_id, account_id=account_id, transaction_id=transaction_id
+    )
+    return StatementEntryResponse.of(entry)
