@@ -6,7 +6,9 @@ from fastapi import FastAPI, Request, status
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
+from ledger_api.data.errors import DatabaseUnavailableError, is_acquisition_failure
 from ledger_api.domain.errors import (
     AuthenticationError,
     ConflictError,
@@ -15,6 +17,7 @@ from ledger_api.domain.errors import (
     InvalidTokenError,
     NotFoundError,
     RuleViolationError,
+    TemporarilyUnavailableError,
     UnavailableError,
 )
 
@@ -136,6 +139,19 @@ async def _validation_error(request: Request, exc: Exception) -> JSONResponse:
     )
 
 
+async def _database_unavailable(request: Request, exc: Exception) -> JSONResponse:
+    # No connection could be obtained (unreachable database, pool timeout), so the request's
+    # transaction never sent a statement: the same answer as TemporarilyUnavailableError. A
+    # connection lost mid-transaction is not this (only postings can tell whether COMMIT was
+    # sent) and stays internal_error.
+    if not is_acquisition_failure(exc):  # registered for acquisition failures only
+        raise exc
+    body = ErrorResponse(
+        code=TemporarilyUnavailableError.code, detail=TemporarilyUnavailableError.message
+    )
+    return JSONResponse(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, content=body.model_dump())
+
+
 async def _unexpected_error(request: Request, exc: Exception) -> JSONResponse:
     # Starlette re-raises the exception after sending this response, so the server logs the
     # traceback; nothing about it reaches the client.
@@ -149,6 +165,8 @@ def register_error_handlers(app: FastAPI) -> None:
     app.add_exception_handler(DomainError, _domain_error)
     app.add_exception_handler(ApiError, _api_error)
     app.add_exception_handler(RequestValidationError, _validation_error)
+    app.add_exception_handler(DatabaseUnavailableError, _database_unavailable)
+    app.add_exception_handler(PoolTimeoutError, _database_unavailable)
     app.add_exception_handler(Exception, _unexpected_error)
 
 

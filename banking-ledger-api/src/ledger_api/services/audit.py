@@ -20,7 +20,7 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ledger_api.data.audit import insert_audit_event
-from ledger_api.data.errors import sqlstate, violated_constraint
+from ledger_api.data.errors import is_acquisition_failure, sqlstate, violated_constraint
 from ledger_api.domain.audit import (
     ATTEMPTED_TRANSACTION_ID,
     INTERNAL_ERROR,
@@ -29,7 +29,12 @@ from ledger_api.domain.audit import (
     AuditRecord,
     DetailValue,
 )
-from ledger_api.domain.errors import DomainError, InternalError, UnavailableError
+from ledger_api.domain.errors import (
+    DomainError,
+    InternalError,
+    TemporarilyUnavailableError,
+    UnavailableError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +82,7 @@ class AuditContext:
         )
 
     def failed(self, error: Exception) -> AuditRecord:
-        reason = error.code if isinstance(error, DomainError) else INTERNAL_ERROR
+        reason = _failure_reason(error)
         details = {**self.details, **_failure_details(error)}
         if self.attempted_transaction_id is not None:
             details[ATTEMPTED_TRANSACTION_ID] = self.attempted_transaction_id
@@ -89,6 +94,16 @@ class AuditContext:
             details=details,
             idempotency_key=self.idempotency_key,
         )
+
+
+def _failure_reason(error: Exception) -> str:
+    """The code the caller is answered with. A connection that could not be obtained reaches
+    the API as itself (only postings translate it), which answers temporarily_unavailable."""
+    if isinstance(error, DomainError):
+        return error.code
+    if is_acquisition_failure(error):
+        return TemporarilyUnavailableError.code
+    return INTERNAL_ERROR
 
 
 def _failure_details(error: Exception) -> dict[str, DetailValue]:

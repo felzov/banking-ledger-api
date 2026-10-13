@@ -22,8 +22,10 @@ own (services.audit.audited), and its original error is re-raised unchanged.
 Transient failures retry the WHOLE transaction (steps 2-7), never a part of it: a deadlock
 or serialization failure up to MAX_ATTEMPTS in total, with jittered backoff. A lock or
 statement timeout is not retried (the caller already waited); it, and exhausted retries,
-become TemporarilyUnavailableError. Retrying is safe because a failed attempt committed
-nothing, its key claim included: rejected and failed postings never leave a key behind.
+become TemporarilyUnavailableError. So does a database connection that could not be obtained
+(unreachable database, pool timeout) or that was lost before COMMIT was sent, also without a
+retry. Retrying is safe because a failed attempt committed nothing, its key claim included:
+rejected and failed postings never leave a key behind.
 
 A failure DURING COMMIT is different: unless PostgreSQL itself answered the COMMIT with a
 non-fatal ERROR on a connection that is still open, the posting may have been applied, e.g.
@@ -44,7 +46,13 @@ from datetime import datetime
 from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ledger_api.data.errors import server_severity, sqlstate, violated_constraint
+from ledger_api.data.errors import (
+    is_acquisition_failure,
+    is_connection_lost,
+    server_severity,
+    sqlstate,
+    violated_constraint,
+)
 from ledger_api.data.idempotency import claim_idempotency_key
 from ledger_api.data.posting import (
     LockedAccount,
@@ -337,6 +345,10 @@ async def _in_transaction(
         except Exception as error:
             if committing and not _definitely_rolled_back(error):
                 raise CommitOutcomeUnknownError from error
+            if not committing and (is_acquisition_failure(error) or is_connection_lost(error)):
+                # COMMIT was never sent: either no connection was ever obtained, or PostgreSQL
+                # rolls back the open transaction of a connection that ends. Not retried here.
+                raise TemporarilyUnavailableError from error
             if not isinstance(error, DBAPIError):
                 raise
             # session.begin() has rolled back: nothing of this attempt was committed.

@@ -146,6 +146,6 @@ class CommitOutcomeUnknownError(UnavailableError):
 
 
 class TemporarilyUnavailableError(UnavailableError):
-    # Lock timeout, statement timeout or exhausted deadlock retries. Nothing was written.
+    # Timeouts, exhausted retries, no DB connection, a posting's connection lost before COMMIT.
     code = "temporarily_unavailable"
     message = "The service is temporarily unavailable. Please retry."
