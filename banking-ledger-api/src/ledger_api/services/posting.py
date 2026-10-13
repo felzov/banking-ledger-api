@@ -342,6 +342,18 @@ async def _in_transaction(
                     result = await attempt(transaction_id)
                 committing = True  # from here on, only the COMMIT itself can fail
                 return result
+        except asyncio.CancelledError:
+            # A replay's transaction wrote nothing (its claim found the key taken), so its
+            # COMMIT decides nothing: no warning. `result` is set whenever `committing` is.
+            if committing and result is not None and not result.replayed:
+                # COMMIT may have been applied; the caller will never hear. Ids only: never
+                # the idempotency key. A same-key retry finds the durable record.
+                logger.warning(
+                    "posting cancelled during COMMIT: its outcome is unknown to the caller "
+                    "(attempted transaction %s)",
+                    transaction_id,
+                )
+            raise
         except Exception as error:
             if committing and not _definitely_rolled_back(error):
                 raise CommitOutcomeUnknownError from error
