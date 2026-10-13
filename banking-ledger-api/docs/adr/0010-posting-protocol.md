@@ -130,3 +130,18 @@ timeout would post twice.
   invalidated connection, a client-side driver or network error, a `FATAL` or `PANIC`) is
   `outcome_unknown` (503): never retried in-process, never reported as a failure. The known limitation above ("the client cannot know whether the
   posting committed") is resolved by retrying with the same key.
+
+## Amendment (Phase 9, 2026-10-13): connection failures and cancellation (ADR 0014)
+
+- **Two more rows in the failure table**, both `temporarily_unavailable` (503), not retried
+  in-process: no connection could be obtained (the database is unreachable, or the pool timed
+  out), and a connection lost **before** COMMIT was sent. Nothing was committed in either case,
+  the key claim included, so a same-key retry is a fresh attempt, never a second posting. A
+  connection lost **during** COMMIT
+  stays `outcome_unknown`, exactly as in the Phase 6 amendment: the check for it runs first,
+  and the two cases raise the same driver error, so only the service's own `committing` flag
+  tells them apart.
+- **Cancellation** (`asyncio.CancelledError`) is outside the table: it always propagates, and
+  nothing is written for it. Cancelled before COMMIT, nothing is committed. Cancelled during
+  COMMIT, the posting may be committed (with its succeeded event); a WARNING names the attempted
+  transaction (never the key), except for a replay, whose transaction wrote nothing.

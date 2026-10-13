@@ -3,13 +3,15 @@
 A production-oriented banking backend built around a **double-entry ledger**: ACID money
 movement, concurrency control, idempotent APIs, and an append-only audit trail.
 
-> **Status: Phase 8 of 10. Authentication and authorization.**
+> **Status: Phase 9 of 10 (in progress). Reliability.**
 > Users register with a password and log in for a 30-minute bearer token. Every user-scoped
 > route requires that token, and only its owner may use it on their own data. Deposits,
 > withdrawals and transfers require an `Idempotency-Key`: a retried request never moves money
-> twice, and an unknown COMMIT outcome is recoverable. Statements and single transactions are
-> read from the owner's side. Every attempt is recorded in an append-only audit trail. The full
-> design is documented in the [ADRs](docs/adr/).
+> twice, and an unknown COMMIT outcome is recoverable. An unreachable database answers `503`,
+> not `500`, and cancelled requests are tested to leave the ledger consistent (see
+> [Reliability](#reliability)). Statements and single transactions are read from the owner's
+> side. Every attempt is recorded in an append-only audit trail. The full design is documented
+> in the [ADRs](docs/adr/).
 
 > [!WARNING]
 > **Not production-ready.** Authentication and authorization are implemented (see
@@ -229,12 +231,21 @@ Every error body is `{"code": "...", "detail": ...}`:
 | 422 | `invalid_statement_limit`, `invalid_statement_cursor` | A `limit` outside 1–100; a cursor that is not an entry of this account. (A non-integer `limit` or a malformed cursor is `validation_error`) |
 | 422 | `invalid_idempotency_key` | The header is not one value of 1–255 visible ASCII characters (never echoed) |
 | 428 | `idempotency_key_required` | A posting without an `Idempotency-Key` header |
-| 503 | `temporarily_unavailable` | Lock or statement timeout, or contention retries exhausted. Nothing was posted |
+| 503 | `temporarily_unavailable` | Lock or statement timeout, or contention retries exhausted; the database could not be reached, or no pooled connection was free in time (any route); a posting's connection was lost before its `COMMIT` was sent. The request changed nothing (a failed audit event may still be recorded). Retry later (postings: with the same `Idempotency-Key`) |
 | 503 | `outcome_unknown` | The connection was lost during COMMIT: the posting may or may not have been applied. **Retry with the same `Idempotency-Key`** |
 | 500 | `internal_error` | Anything unexpected, including a statement whose balance does not match its entries (refused rather than returned). No details are returned; the traceback goes to the server log |
 
 Two body shapes share `422`, and the OpenAPI schema documents both where both can occur:
 `validation_error` carries a list of `{type, loc, msg}`; every other code carries a string.
+
+**`503` versus `500` for database failures.** `503 temporarily_unavailable` is reserved for
+failures where the request's own changes cannot have been applied: no connection was ever
+obtained, or (for postings) the connection was lost before `COMMIT` was sent. Everything PostgreSQL itself
+reports (a constraint, a misconfigured database name or password, any other server error)
+keeps answering `500`, as do unrelated errors. A connection lost in the middle of a
+non-posting request (login, registration, account opening, reads) also stays `500`: only the
+posting service tracks whether `COMMIT` was already sent. See [Reliability](#reliability) and
+[ADR 0014](docs/adr/0014-failure-handling-unavailability-cancellation-and-shutdown.md).
 
 ## Database
 
@@ -379,9 +390,13 @@ Requests refused with `401` or `403` are not audited (no service runs):
   or an unexpected error) events are written *after* the business transaction has rolled back
   and released its connection, in a new transaction on the same session. One operation never
   holds two connections.
-- The audit writer never raises. If it cannot write, it logs an ERROR with the event (the log
-  is the fallback sink), and the caller still gets its original error. Rejected and failed
-  events are therefore best-effort.
+- The audit writer never raises (except to let a cancellation through). If it cannot write, it
+  logs an ERROR with the event (the log is the fallback sink), and the caller still gets its
+  original error. Rejected and failed events are therefore best-effort. A fallback line is not
+  an audit record; see [Audit events and fallback log lines](#audit-events-and-fallback-log-lines)
+  for what each line does and does not prove.
+- A failure to obtain a database connection is recorded with reason `temporarily_unavailable`,
+  the code the caller receives, when the event can still be written.
 - Details hold ids, amounts, currencies and error identifiers only: never an email address, an
   exception message or a request body. A claimed user that does not exist is stored as a NULL
   actor, with its id in `details.requested_user_id`.
@@ -389,6 +404,113 @@ Requests refused with `401` or `403` are not audited (no service runs):
 
 Under connection-pool exhaustion the post-rollback audit write waits for a connection (up to
 the pool timeout) before giving up, which delays the error response. This is accepted for now.
+
+## Reliability
+
+How the service behaves when something other than a business rule fails
+([ADR 0014](docs/adr/0014-failure-handling-unavailability-cancellation-and-shutdown.md); unknown
+`COMMIT` outcomes: [ADR 0006](docs/adr/0006-idempotency-inside-the-posting-transaction.md)).
+
+### Retry with the same `Idempotency-Key`
+
+A posting's outcome lives in the database, not in the HTTP response. Whenever the response is
+missing or inconclusive (a client timeout, `503 outcome_unknown`, `503
+temporarily_unavailable`, a dropped connection), retry the **same request with the same key**.
+If the original committed, the retry replays it (`201`, `Idempotent-Replayed: true`, the
+original transaction). If nothing was committed, the retry is a fresh attempt: it may succeed,
+be rejected or fail like any request, and if the original is still finishing its `COMMIT` it may
+wait and then answer `503 temporarily_unavailable` (retry again, still with the same key). In
+every case the posting is applied at most once per key. A **new** key is a new request:
+retrying with a different key after a lost response can move the money twice.
+
+The service retries only deadlocks and serialization failures, inside one request
+([ADR 0010](docs/adr/0010-posting-protocol.md)). There is no HTTP-layer retry: retrying is the
+client's decision, with its key.
+
+### A posting can commit even when the client never receives the response
+
+A posting is committed the moment PostgreSQL applies its `COMMIT`, together with its succeeded
+audit event. Nothing that happens afterwards undoes it: a lost acknowledgement, a client that
+disconnects, a cancelled request, a killed process. The client then sees `503
+outcome_unknown`, a dropped connection, or nothing at all, while the money has moved. The
+converse also holds: a posting that does not reach a successful `COMMIT` changes no ledger
+data (no transaction, entries, balance change or idempotency key); at most its rejected or
+failed audit event is recorded. A statement shows the account's postings but cannot tie one to
+a request whose response was lost; a retry with the same key can, which is why the rule above
+is the way to learn the outcome.
+
+### Client disconnects and cancelled requests
+
+- **A client disconnect does not cancel the request** with the current server stack (uvicorn,
+  and no middleware that cancels on disconnect). This is a property of that stack, not something
+  the application enforces, and it was verified by a probe against uvicorn 0.54, not by the test
+  suite. The posting runs to completion, commits or is rejected as usual, and is audited as
+  usual. The client learns the result by retrying with the same key.
+- **A cancelled request** (`asyncio.CancelledError`, e.g. a server that cancels in-flight
+  requests while shutting down) always propagates, and no audit event is written for the
+  cancellation itself:
+  - **before `COMMIT`**: nothing is committed. SQLAlchemy rolls the transaction back, or ends
+    the backend so that PostgreSQL does; the connection is returned to the pool or closed. A
+    posting waiting for a row lock stops waiting; it cannot acquire the lock later and carry on.
+  - **during `COMMIT`**: the outcome is unknown. If PostgreSQL had applied the `COMMIT`, the
+    posting and its succeeded event stand (tested); if it had not, nothing is committed. Either
+    way a WARNING `posting cancelled during COMMIT: its outcome is unknown to the caller
+    (attempted transaction <uuid>)` is logged (never the key), and a same-key retry tells which.
+    A replay logs nothing: it wrote nothing.
+  - **while a rejected or failed event is being written**: the event's fate is logged; see
+    [Audit events and fallback log lines](#audit-events-and-fallback-log-lines).
+
+### When the network stalls during `COMMIT`
+
+A known limitation. If a reply from PostgreSQL never arrives (packets lost without a reset),
+the request waits, holding its pooled connection, until the connection fails: how long that
+takes depends on the operating system's TCP settings, not on this application.
+PostgreSQL's `lock_timeout` and `statement_timeout` do not help once the server is idle, there
+is no client-side timeout yet, and cancelling the request does not free it (observed with a
+proxy that withholds `COMMIT`'s reply). When the connection does fail, a `COMMIT` in that state
+is reported as `outcome_unknown` (a posting's earlier statement as `temporarily_unavailable`,
+other requests' as `internal_error`), and the client retries with the same key. A client-side command timeout and TCP keepalives are deferred
+([ADR 0014](docs/adr/0014-failure-handling-unavailability-cancellation-and-shutdown.md)).
+
+### Shutdown
+
+As configured today (nothing here goes beyond `compose.yaml`, the `Dockerfile` and uvicorn's
+defaults):
+
+- `make down` or `docker compose stop` sends **SIGTERM** to the `api` container and, if it is
+  still running after Docker's default **10 seconds**, **SIGKILL**: `compose.yaml` sets no
+  `stop_grace_period` and no `stop_signal`. (In Compose the API runs with `--reload`; uvicorn's
+  reloader passes the SIGTERM on to its worker process.)
+- uvicorn runs without `--timeout-graceful-shutdown` (neither in `compose.yaml` nor in the
+  image's `CMD`). On a SIGTERM it stops accepting connections and waits for in-flight requests
+  with no time limit of its own, then the application's lifespan disposes the database engine;
+  it does not cancel requests. (A second Ctrl+C in a terminal forces an immediate exit instead.)
+- So a request that finishes within the grace period completes normally. One that does not is
+  killed with the process: its connection drops; once PostgreSQL notices, it rolls back anything
+  uncommitted; and a posting caught inside its `COMMIT` has an unknown outcome, which a
+  same-key retry resolves. **Graceful shutdown is not guaranteed beyond the grace period.**
+- These points come from the configuration and from uvicorn's source; the uvicorn behaviour was
+  also checked with an in-process server. The full `docker compose stop` sequence is not
+  exercised by the test suite.
+
+### Audit events and fallback log lines
+
+A rejected or failed event is written after its business transaction
+([Audit trail](#audit-trail)). When that write cannot complete, the writer logs an ERROR line
+carrying the event's fields instead:
+
+| What you find | What it means |
+|---|---|
+| A row in `audit_events` | The event is persisted. Succeeded events only ever exist this way: they commit with the operation or not at all |
+| `audit event not written (cancelled): ...` | The request was cancelled before the event's insert completed: the event is **not** in `audit_events` |
+| `audit event not written (the session is still in a transaction): ...` | The writer refused to write (a caller bug): the event is **not** in `audit_events` |
+| `audit event not written (<error class>): ...` | The write raised that error. Usually the insert failed or no connection was obtained (e.g. `TimeoutError`, `DatabaseUnavailableError`), and the event is not there. **Known gap:** if the error came from the event's own `COMMIT` (e.g. a lost connection), the row may exist despite the wording; check `audit_events` |
+| `audit event possibly not written (cancelled during COMMIT): ...` | The insert completed but its `COMMIT` was interrupted by a cancellation. The row **may exist**: check `audit_events` before treating the event as missing |
+
+A log line is a fallback, not an audit record: it is not append-only, cannot be queried with
+the events, and is only as durable as the process's stderr. No logging handler is configured,
+so WARNING and ERROR lines reach stderr through Python's last-resort handler (`make logs`
+includes the `api` container's output); structured logging is Phase 10.
 
 ## Statements
 
@@ -475,7 +597,9 @@ Posting is tested at every level:
   entries, midway through the balance updates, or at `COMMIT` leaves no trace.
 - **Concurrency** (`-m concurrency`), on real connections with **retries disabled** so a
   deadlock cannot be retried away: racing withdrawals never overdraw, opposite transfers
-  never deadlock, random concurrent transfers conserve money.
+  never deadlock, random concurrent transfers conserve money, and a mixed workload of
+  deposits, withdrawals and transfers sharing the settlement account ends with exact balances
+  and one audit event per posting.
 - **Property-based** ([Hypothesis](https://hypothesis.readthedocs.io/)): posting rules hold for
   generated inputs, and random sequences of postings match a pure-Python model step by step.
 - **Reconciliation** after every posting test: balances equal entries, ledgers sum to zero,
@@ -556,6 +680,25 @@ Authentication tests (Phase 8):
   appears in responses, logs or audit details. A full authenticated flow on a one-connection
   pool leaves no transaction open and no connection held after any request.
 
+Reliability tests (Phase 9):
+
+- **Unreachable database and exhausted pool**: connect failures are told apart from unrelated
+  `OSError`s and from refusals the server itself reports (an unknown database stays `500`);
+  login, an authenticated route and a posting answer `503 temporarily_unavailable` with the
+  database down; a posting that gets no pooled connection posts nothing; failure reasons are
+  recorded as `temporarily_unavailable` when the event can be written, and logged as lost when
+  it cannot.
+- **Connection lost before `COMMIT`**, through the real driver (a backend terminated after the
+  key claim): `503`, no key, no transaction, a failed event, and a same-key retry that posts
+  once. A connection lost *during* `COMMIT` stays `outcome_unknown` (the tests above).
+- **Cancellation**, with explicit synchronisation points, never sleeps: after the key claim, and
+  while waiting for a row lock, nothing is committed and no transaction or connection is left
+  behind; after PostgreSQL has committed (a TCP proxy, [`tests/tcp_proxy.py`](tests/tcp_proxy.py),
+  withholds the `COMMIT` acknowledgement), the posting and its succeeded event stand, one
+  WARNING names the transaction, and a same-key retry replays it; a replay cancelled during its
+  `COMMIT` logs no warning; a cancelled rejection-audit write is logged as "not written", or as
+  "possibly not written" when its own `COMMIT` was interrupted.
+
 CI runs the same suite against a PostgreSQL service container and smoke-tests the Compose
 stack.
 
@@ -576,6 +719,7 @@ stack.
 | [0011](docs/adr/0011-audit-trail.md) | Audit trail: schema, write protocol, scope and the limits of trigger protection |
 | [0012](docs/adr/0012-statement-ordering-and-reconciliation.md) | Commit-ordered entries, statements with computed running balances, independent reconciliation |
 | [0013](docs/adr/0013-authentication-and-authorization.md) | Password login (Argon2id) with opaque, database-backed bearer tokens; one router-level ownership check |
+| [0014](docs/adr/0014-failure-handling-unavailability-cancellation-and-shutdown.md) | Failure handling: `503` for unreachable databases and pre-`COMMIT` connection loss, cancellation, audit fallback logs, shutdown as configured |
 
 ## Roadmap
 
@@ -587,5 +731,5 @@ stack.
 6. ✅ Idempotency and the HTTP posting API (deposits, withdrawals, transfers)
 7. ✅ REST API: statements, single transactions, `Location` on postings
 8. ✅ Authentication and authorization (password login, bearer tokens, ownership on every user-scoped route)
-9. Reliability
-10. Security and observability (including least-privilege database roles)
+9. Reliability (in progress: database outages answer `503`, pre-`COMMIT` and cancellation behaviour tested, failure handling documented)
+10. Security and observability (including least-privilege database roles, structured logging)
