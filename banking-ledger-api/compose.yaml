@@ -72,5 +72,27 @@ services:
       migrate:
         condition: service_completed_successfully
 
+  # The test suite's own cluster (`make test`), never the development database: data on tmpfs, so
+  # nothing survives the container, and the tests may create the cluster-wide roles migrations
+  # grant to (tests/database.py checks LEDGER_TEST_CLUSTER=disposable first). Profile "test":
+  # `make up` does not start it.
+  test-db:
+    image: postgres:18-alpine
+    profiles: ["test"]
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:?set POSTGRES_USER in .env}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: ${POSTGRES_DB:?set POSTGRES_DB in .env}
+    tmpfs:
+      - /var/lib/postgresql
+    ports:
+      - "127.0.0.1:${POSTGRES_TEST_PORT:-5433}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
+      start_period: 5s
+
 volumes:
   pgdata:

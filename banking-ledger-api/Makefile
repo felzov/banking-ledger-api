@@ -33,8 +33,14 @@ revision: ## Create an empty migration: make revision m="add something"
 db-shell: ## Open psql inside the database container
 	docker compose exec db psql -U $(POSTGRES_USER) -d $(POSTGRES_DB)
 
-test: ## Run the test suite
-	uv run pytest
+# The test suite runs against its own disposable cluster (compose service test-db, data on tmpfs),
+# never the development database: this always overrides DATABASE_URL.
+POSTGRES_TEST_PORT ?= 5433
+TEST_DATABASE_URL = postgresql+asyncpg://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@127.0.0.1:$(POSTGRES_TEST_PORT)/$(POSTGRES_DB)
+
+test: ## Run the test suite against the disposable test cluster (started if needed)
+	docker compose --profile test up -d --wait test-db
+	DATABASE_URL='$(TEST_DATABASE_URL)' LEDGER_TEST_CLUSTER=disposable uv run pytest
 
 lint: ## Lint and check formatting
 	uv run ruff check .

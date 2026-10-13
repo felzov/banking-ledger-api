@@ -46,6 +46,9 @@ jobs:
           --health-retries 10
     env:
       DATABASE_URL: postgresql+asyncpg://ledger@localhost:5432/ledger
+      # The service container above is created for this job and discarded with it: the tests may
+      # create the cluster-wide roles migrations grant to (tests/database.py checks this).
+      LEDGER_TEST_CLUSTER: disposable
     steps:
       - uses: actions/checkout@v7
 
