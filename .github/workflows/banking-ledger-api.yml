@@ -47,10 +47,20 @@ jobs:
     env:
       DATABASE_URL: postgresql+asyncpg://ledger@localhost:5432/ledger
       # The service container above is created for this job and discarded with it: the tests may
-      # create the cluster-wide roles migrations grant to (tests/database.py checks this).
+      # create the cluster-wide roles migrations grant to (tests/database.py checks this, and the
+      # server's own marker, set below).
       LEDGER_TEST_CLUSTER: disposable
     steps:
       - uses: actions/checkout@v7
+
+      # The server's own disposable marker, set on the service container itself (by its id, not
+      # through DATABASE_URL): tests/database.py refuses any server without it.
+      - name: Mark the service database as a disposable test cluster
+        env:
+          POSTGRES_CONTAINER: ${{ job.services.postgres.id }}
+        run: >-
+          docker exec "$POSTGRES_CONTAINER" psql -U ledger -d ledger -v ON_ERROR_STOP=1 -q
+          -c "ALTER SYSTEM SET ledger.test_cluster = 'disposable'" -c "SELECT pg_reload_conf()"
 
       - uses: astral-sh/setup-uv@v7
         with:

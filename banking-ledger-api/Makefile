@@ -40,6 +40,12 @@ TEST_DATABASE_URL = postgresql+asyncpg://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@1
 
 test: ## Run the test suite against the disposable test cluster (started if needed)
 	docker compose --profile test up -d --wait test-db
+	@# Mark the test-db server itself, addressed by its service name (never through DATABASE_URL):
+	@# tests/database.py refuses any server without this marker. Data on tmpfs: the marker goes
+	@# with the container.
+	docker compose --profile test exec -T test-db psql -U $(POSTGRES_USER) -d $(POSTGRES_DB) \
+		-v ON_ERROR_STOP=1 -q -c "ALTER SYSTEM SET ledger.test_cluster = 'disposable'" \
+		-c "SELECT pg_reload_conf()" -o /dev/null
 	DATABASE_URL='$(TEST_DATABASE_URL)' LEDGER_TEST_CLUSTER=disposable uv run pytest
 
 lint: ## Lint and check formatting

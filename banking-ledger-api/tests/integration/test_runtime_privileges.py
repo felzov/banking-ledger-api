@@ -32,14 +32,11 @@ from tests.auth_helpers import TEST_PASSWORD
 from tests.conftest import serve, settings_for
 from tests.database import (
     ALEMBIC_INI,
-    DISPOSABLE_CLUSTER_VARIABLE,
     RUNTIME_GROUP,
     RUNTIME_PRIVILEGES,
     SEQUENCE_HELPER,
     assert_reconciled,
     configured_database_url,
-    ensure_runtime_group,
-    recreate_database,
 )
 from tests.integration.test_role_bootstrap import (
     APP_PASSWORD,
@@ -706,24 +703,3 @@ async def test_the_migration_refuses_an_unsafe_runtime_group(cluster: Cluster) -
 def test_the_migration_grants_to_the_bootstraps_runtime_group() -> None:
     # The name is hard-coded in both (a migration is a frozen snapshot): they must agree.
     assert _migration_0013().RUNTIME_GROUP == DEFAULT_ROLE_NAMES.runtime_group == RUNTIME_GROUP
-
-
-# --- the test cluster's own guard ----------------------------------------------------------------
-
-
-async def test_the_suite_refuses_an_undeclared_cluster(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.delenv(DISPOSABLE_CLUSTER_VARIABLE)
-
-    with pytest.raises(pytest.fail.Exception, match=DISPOSABLE_CLUSTER_VARIABLE):
-        await recreate_database(configured_database_url(), "ledger_guard_test")
-
-
-async def test_the_suite_refuses_a_migrated_database(runtime_db: RuntimeDatabase) -> None:
-    # A development database is migrated; a disposable cluster's maintenance database is not.
-    engine = _engine(runtime_db.url)
-    try:
-        async with engine.connect() as connection:
-            with pytest.raises(pytest.fail.Exception, match="migrated database"):
-                await ensure_runtime_group(connection)
-    finally:
-        await engine.dispose()

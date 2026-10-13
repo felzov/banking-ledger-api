@@ -33,8 +33,18 @@ DISPOSABLE_DATABASE_SUFFIX = "_test"
 # The cluster-wide group migration 0013 grants the application's privileges to. Roles belong to
 # the whole cluster, so the suite creates this one only on a cluster declared disposable.
 RUNTIME_GROUP = "ledger_runtime"
+
+# A disposable cluster is recognised by two markers set independently, both required:
+# - the client's environment (LEDGER_TEST_CLUSTER): this process means to test a throwaway server;
+# - the server's own configuration (the custom setting ledger.test_cluster): this server is one.
+#   Set out of band by whatever owns the throwaway server, addressed by name, never through
+#   DATABASE_URL: `make test` by `docker compose exec test-db`, CI by `docker exec` on its service
+#   container. A development server never has it, so a DATABASE_URL pointing at one is refused
+#   whatever the environment claims.
 DISPOSABLE_CLUSTER_VARIABLE = "LEDGER_TEST_CLUSTER"
 DISPOSABLE_CLUSTER_VALUE = "disposable"
+DISPOSABLE_SERVER_SETTING = "ledger.test_cluster"
+DISPOSABLE_SERVER_VALUE = "disposable"
 
 
 def configured_database_url() -> URL:
@@ -70,6 +80,7 @@ async def recreate_database(server_url: URL, database: str) -> None:
     engine = create_async_engine(server_url, isolation_level="AUTOCOMMIT", poolclass=NullPool)
     try:
         async with engine.connect() as connection:
+            await assert_disposable_cluster(connection)
             await ensure_runtime_group(connection)
             quoted = connection.dialect.identifier_preparer.quote(database)
             await connection.execute(text(f"DROP DATABASE IF EXISTS {quoted} WITH (FORCE)"))
@@ -78,20 +89,34 @@ async def recreate_database(server_url: URL, database: str) -> None:
         await engine.dispose()
 
 
-async def ensure_runtime_group(connection: AsyncConnection) -> None:
-    """Create the runtime group if it is missing, on a disposable cluster only.
+async def assert_disposable_cluster(connection: AsyncConnection) -> None:
+    """Mandatory guard before the suite creates a database or a role: fail unless `connection`
+    is to a disposable test cluster.
 
-    Mandatory guard before any role is created: the environment must declare the cluster
-    disposable (`make test`'s tmpfs cluster, CI's service container), and the database the
-    suite connects to must hold no application schema, which a development database would.
-    An existing group is used as is, never altered or dropped; one that could log in or is a
-    superuser is refused, because 0013's grants would then reach a login.
+    Three independent checks, all required, none sufficient alone:
+    1. the environment declares the intent (an environment variable proves nothing by itself:
+       it says nothing about which server DATABASE_URL reaches);
+    2. the server the connection actually reached carries the disposable marker in its own
+       configuration, set out of band by whatever owns it (see DISPOSABLE_SERVER_SETTING);
+    3. the database the suite connects to holds no application schema, which a development
+       database would.
     """
     if os.environ.get(DISPOSABLE_CLUSTER_VARIABLE) != DISPOSABLE_CLUSTER_VALUE:
         pytest.fail(
-            f"refusing to run database tests: set {DISPOSABLE_CLUSTER_VARIABLE}="
-            f"{DISPOSABLE_CLUSTER_VALUE} only for a throwaway cluster (`make test` starts one); "
-            "the suite creates cluster-wide roles",
+            f"refusing to run database tests: {DISPOSABLE_CLUSTER_VARIABLE} is not "
+            f"{DISPOSABLE_CLUSTER_VALUE!r}. Run them with `make test`, which starts and marks the "
+            "disposable test-db service; the suite creates databases and cluster-wide roles",
+            pytrace=False,
+        )
+    marker = await connection.scalar(
+        text("SELECT current_setting(:name, true)"), {"name": DISPOSABLE_SERVER_SETTING}
+    )
+    if marker != DISPOSABLE_SERVER_VALUE:
+        pytest.fail(
+            "refusing to run database tests: the server DATABASE_URL reaches is not marked as a "
+            f"disposable test cluster ({DISPOSABLE_SERVER_SETTING} is {marker!r}, not "
+            f"{DISPOSABLE_SERVER_VALUE!r}). Point DATABASE_URL at the test-db service, or use "
+            "`make test`, which marks it; never mark a server that holds data you keep",
             pytrace=False,
         )
     if await connection.scalar(text("SELECT to_regclass('public.alembic_version') IS NOT NULL")):
@@ -100,6 +125,14 @@ async def ensure_runtime_group(connection: AsyncConnection) -> None:
             "disposable test cluster never has (is it the development database?)",
             pytrace=False,
         )
+
+
+async def ensure_runtime_group(connection: AsyncConnection) -> None:
+    """Create the runtime group if it is missing. Call assert_disposable_cluster() first.
+
+    An existing group is used as is, never altered or dropped; one that could log in or is a
+    superuser is refused, because 0013's grants would then reach a login.
+    """
     role = (
         await connection.execute(
             text("SELECT rolcanlogin, rolsuper FROM pg_roles WHERE rolname = :role"),
