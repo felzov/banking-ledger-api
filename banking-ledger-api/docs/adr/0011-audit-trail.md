@@ -151,3 +151,20 @@ future hardening work for Phase 10 and are not part of Phase 5.
   failed logouts, and the per-request authentication lookup.
 - Never in `details`, the fallback log line or an error: a password, a bearer token, or a
   token's digest.
+
+## Amendment (Phase 9, 2026-10-13): unavailable databases and cancelled writes (ADR 0014)
+
+- **Reason for an acquisition failure.** When no connection could be obtained (an unreachable
+  database, a pool timeout), a failed event records reason `temporarily_unavailable`, the code
+  the caller is answered with, instead of `internal_error`. With the database unreachable the
+  event usually cannot be written at all: the fallback line is then the only trace.
+- **"Never raises" has one exception: a cancellation.** It is logged as lost, then propagates.
+  Nothing is written to the database while a request is being cancelled.
+- **The fallback line distinguishes a confirmed loss from an uncertain one, for
+  cancellations.** `audit event not written (cancelled)` means the request was cancelled before
+  the event's insert completed: the event is not in `audit_events`. `audit event possibly not
+  written (cancelled during COMMIT)` means the insert completed and its COMMIT was interrupted:
+  the row may exist, so check `audit_events` before treating it as missing.
+- **Known gap for other errors.** `audit event not written (<error class>)` usually means the
+  insert failed or no connection was obtained. If the error came from the event's own COMMIT
+  (e.g. a lost connection), the row may exist despite the wording.

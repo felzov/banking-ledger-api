@@ -5,11 +5,13 @@
 - **Rejected / failed**: the business transaction rolls back first. Its connection is then back
   in the pool, and record_outside_transaction() writes the event in a NEW transaction on the
   same session, so one operation never holds two connections. Best-effort: the writer never
-  raises. If it cannot write, it logs an ERROR and the caller re-raises its original error.
+  raises. If it cannot write, it logs an ERROR and the caller re-raises its original error. A
+  cancellation is logged the same way, then propagates.
 
 audited() applies the second rule to a whole service call.
 """
 
+import asyncio
 import logging
 import uuid
 from collections.abc import Awaitable, Callable, Mapping
@@ -20,7 +22,7 @@ from sqlalchemy.exc import DBAPIError, IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ledger_api.data.audit import insert_audit_event
-from ledger_api.data.errors import sqlstate, violated_constraint
+from ledger_api.data.errors import is_acquisition_failure, sqlstate, violated_constraint
 from ledger_api.domain.audit import (
     ATTEMPTED_TRANSACTION_ID,
     INTERNAL_ERROR,
@@ -29,7 +31,12 @@ from ledger_api.domain.audit import (
     AuditRecord,
     DetailValue,
 )
-from ledger_api.domain.errors import DomainError, InternalError, UnavailableError
+from ledger_api.domain.errors import (
+    DomainError,
+    InternalError,
+    TemporarilyUnavailableError,
+    UnavailableError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -77,7 +84,7 @@ class AuditContext:
         )
 
     def failed(self, error: Exception) -> AuditRecord:
-        reason = error.code if isinstance(error, DomainError) else INTERNAL_ERROR
+        reason = _failure_reason(error)
         details = {**self.details, **_failure_details(error)}
         if self.attempted_transaction_id is not None:
             details[ATTEMPTED_TRANSACTION_ID] = self.attempted_transaction_id
@@ -89,6 +96,16 @@ class AuditContext:
             details=details,
             idempotency_key=self.idempotency_key,
         )
+
+
+def _failure_reason(error: Exception) -> str:
+    """The code the caller is answered with. A connection that could not be obtained reaches
+    the API as itself (only postings translate it), which answers temporarily_unavailable."""
+    if isinstance(error, DomainError):
+        return error.code
+    if is_acquisition_failure(error):
+        return TemporarilyUnavailableError.code
+    return INTERNAL_ERROR
 
 
 def _failure_details(error: Exception) -> dict[str, DetailValue]:
@@ -116,26 +133,42 @@ async def record_in_transaction(session: AsyncSession, record: AuditRecord) -> N
 
 
 async def record_outside_transaction(session: AsyncSession, record: AuditRecord) -> None:
-    """Write a rejected or failed event in its own short transaction. Never raises."""
+    """Write a rejected or failed event in its own short transaction. Never raises, except to
+    propagate a cancellation, after logging the event as lost."""
     if session.in_transaction():
         # A bug in the caller: writing now would join (and be undone with) the rolled-back
         # work, or hold a second connection. Refuse, loudly, without failing the caller.
         _log_lost(record, "the session is still in a transaction")
         return
+    committing = False
     try:
         async with session.begin():
             await insert_audit_event(session, record)
+            committing = True  # the insert is done: only its COMMIT remains
+    except asyncio.CancelledError:
+        # The request is gone; the log line (synchronous, so it cannot be cancelled) is all
+        # that is left of the event. The cancellation itself is never swallowed. Cancelled
+        # during COMMIT, the event may have been written after all: the line says so.
+        if committing:
+            _log_lost(record, "cancelled during COMMIT", certain=False)
+        else:
+            _log_lost(record, "cancelled")
+        raise
     except Exception as error:
         _log_lost(record, type(error).__name__, error)
 
 
-def _log_lost(record: AuditRecord, cause: str, error: Exception | None = None) -> None:
+def _log_lost(
+    record: AuditRecord, cause: str, error: Exception | None = None, *, certain: bool = True
+) -> None:
     # The log line is the fallback audit sink. The record's fields are safe by construction
     # (stable codes, ids and amounts); nothing from the request body or the database URL. The
     # idempotency key is client text, but validated visible ASCII: it cannot break the line.
+    # certain=False: the event's COMMIT was interrupted, so it may exist after all.
     logger.error(
-        "audit event not written (%s): action=%s outcome=%s reason=%s actor_user_id=%s "
+        "audit event %s (%s): action=%s outcome=%s reason=%s actor_user_id=%s "
         "idempotency_key=%s details=%s",
+        "not written" if certain else "possibly not written",
         cause,
         record.action,
         record.outcome,

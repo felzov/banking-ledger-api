@@ -10,6 +10,7 @@ import random
 import uuid
 from collections import Counter
 from collections.abc import Awaitable, Callable
+from itertools import permutations
 
 import pytest
 from sqlalchemy import func, select
@@ -17,6 +18,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from ledger_api.data.engine import create_sessionmaker
 from ledger_api.data.models import Account, AuditEvent, LedgerEntry, Transaction
+from ledger_api.data.reconciliation import find_posted_transactions_without_success_audit
 from ledger_api.domain.audit import AuditAction, AuditOutcome
 from ledger_api.domain.currency import Currency
 from ledger_api.domain.errors import InsufficientFundsError
@@ -81,6 +83,24 @@ def _transfer(source: FundedAccount, destination: FundedAccount, amount: int) ->
             source_account_id=source.account_id,
             destination_account_id=destination.account_id,
             amount_minor=amount,
+        )
+
+    return operation
+
+
+def _deposit(account: FundedAccount, amount: int) -> Operation:
+    async def operation(session: AsyncSession) -> PostingResult:
+        return await deposit(
+            session, owner_id=account.owner_id, account_id=account.account_id, amount_minor=amount
+        )
+
+    return operation
+
+
+def _withdraw(account: FundedAccount, amount: int) -> Operation:
+    async def operation(session: AsyncSession) -> PostingResult:
+        return await withdraw(
+            session, owner_id=account.owner_id, account_id=account.account_id, amount_minor=amount
         )
 
     return operation
@@ -169,6 +189,75 @@ async def test_random_concurrent_transfers_conserve_money(
             )
         )
         assert audited == outcomes["PostingResult"]
+
+
+async def test_mixed_posting_kinds_on_the_settlement_account_do_not_deadlock(
+    sessionmaker: async_sessionmaker[AsyncSession],
+) -> None:
+    # One contended workload mixing every posting kind around the settlement account S: a
+    # deposit to X locks {X, S}, a transfer X -> Y locks {X, Y} and a withdrawal from Y locks
+    # {Y, S}, so all three kinds compete for the same rows. The shared lock order (one sorted
+    # FOR UPDATE) must keep them deadlock-free together, and balances, committed entries and
+    # audit events must stay exact across kinds.
+    accounts = [await commit_funded_account(sessionmaker, 10_000) for _ in range(3)]
+    customer_ids = [account.account_id for account in accounts]
+    async with sessionmaker() as session:
+        settlement_id = (await get_settlement_account(session, Currency.GBP)).id
+    before = await _balances(sessionmaker, [*customer_ids, settlement_id])
+
+    # Each round, every account sends at most 2 x 100 and is withdrawn from at most 2 x 100:
+    # 4 rounds can never take 10_000 below zero, in any interleaving. Nothing is rejected, and
+    # relative balance updates commute, so the final balances are exact whatever the lock order.
+    rng = random.Random(7)  # fixed seed: reproducible  # noqa: S311
+    operations: list[Operation] = []
+    expected = dict(before)
+    for _ in range(4):
+        for source, destination in permutations(accounts, 2):
+            deposited, transferred, withdrawn = (rng.randint(1, 100) for _ in range(3))
+            operations += [
+                _deposit(source, deposited),
+                _transfer(source, destination, transferred),
+                _withdraw(destination, withdrawn),
+            ]
+            expected[source.account_id] += deposited - transferred
+            expected[destination.account_id] += transferred - withdrawn
+            expected[settlement_id] += withdrawn - deposited
+    rng.shuffle(operations)
+
+    results = await _run_concurrently(sessionmaker, operations)
+
+    # With retries disabled, any deadlock would appear as TemporarilyUnavailableError.
+    assert _outcomes(results) == {"PostingResult": 72}
+    balances = await _balances(sessionmaker, [*customer_ids, settlement_id])
+    assert balances == expected
+    assert sum(balances.values()) == sum(before.values())  # moved between them, none created
+    posted = {result.transaction_id for result in results if isinstance(result, PostingResult)}
+    async with sessionmaker() as session:
+        # Exactly these postings were committed (plus the three funding deposits), each once.
+        committed = await session.execute(
+            select(Transaction.kind, func.count(func.distinct(Transaction.id)))
+            .join(LedgerEntry, LedgerEntry.transaction_id == Transaction.id)
+            .where(LedgerEntry.account_id.in_(customer_ids))
+            .group_by(Transaction.kind)
+        )
+        assert {kind: count for kind, count in committed} == {
+            TransactionKind.DEPOSIT: 24 + 3,
+            TransactionKind.TRANSFER: 24,
+            TransactionKind.WITHDRAWAL: 24,
+        }
+        await assert_reconciled(session)
+        assert (
+            await find_posted_transactions_without_success_audit(session, transaction_ids=posted)
+            == []
+        )
+        events = []
+        for account in accounts:
+            _funding, *rest = await audit_events_about(session, account.account_id)
+            events += rest
+    # Exactly one event per posting, each a success naming its own committed transaction.
+    assert len(events) == len(operations)
+    assert {event.outcome for event in events} == {AuditOutcome.SUCCEEDED}
+    assert {event.transaction_id for event in events} == posted
 
 
 async def test_concurrent_deposits_are_each_applied_exactly_once(
