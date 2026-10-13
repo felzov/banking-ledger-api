@@ -20,9 +20,10 @@ to them, with PUBLIC's privileges there and nothing more.)
 Everything runs in ONE transaction (role DDL is transactional in PostgreSQL): a refusal or a
 failure at any step leaves the cluster exactly as it was. Running it again converges to the same
 state: missing roles are created, drifted attributes, passwords, membership options and database
-or schema privileges of the three roles are reset. It refuses, before changing anything, to
-reuse a role that is a superuser or has any membership other than ledger_app in ledger_runtime,
-and to take over an object in public owned by any role other than the admin or the owner.
+or schema privileges of the three roles are reset. It refuses to reuse a superuser or a role
+with another membership before changing anything; objects in public owned by any role other
+than the admin or the owner are refused during the ownership step, which rolls back everything
+changed so far.
 
 Ownership transfer: the official PostgreSQL image makes POSTGRES_USER the bootstrap superuser,
 and REASSIGN OWNED refuses that role (it would also hand over shared objects such as the
@@ -533,6 +534,9 @@ async def _check_access_control(connection: AsyncConnection, names: RoleNames) -
     REVOKEs above. Such a grant is refused, naming its grantor, rather than revoked here: who
     delegated it, and why, is for an operator to decide. Grants to any other role are left
     alone (they are not this bootstrap's).
+
+    An intended privilege held WITH GRANT OPTION is refused too: the role could pass it on
+    (the app could grant CONNECT to PUBLIC), so it is not the privilege intended.
     """
     intended = {
         ("database", names.owner, "CONNECT"),
@@ -548,13 +552,16 @@ async def _check_access_control(connection: AsyncConnection, names: RoleNames) -
                     "SELECT g.object, "
                     "CASE WHEN g.grantee = 0 THEN 'PUBLIC' "
                     "ELSE pg_catalog.pg_get_userbyid(g.grantee) END AS grantee, "
-                    "g.privilege_type, pg_catalog.pg_get_userbyid(g.grantor) AS grantor "
+                    "g.privilege_type, g.is_grantable, "
+                    "pg_catalog.pg_get_userbyid(g.grantor) AS grantor "
                     "FROM ("
-                    "SELECT 'database' AS object, a.grantee, a.privilege_type, a.grantor "
+                    "SELECT 'database' AS object, a.grantee, a.privilege_type, a.is_grantable, "
+                    "a.grantor "
                     "FROM pg_catalog.pg_database d, pg_catalog.aclexplode(d.datacl) a "
                     "WHERE d.datname = current_database() AND a.grantee <> d.datdba "
                     "UNION ALL "
-                    "SELECT 'schema public', a.grantee, a.privilege_type, a.grantor "
+                    "SELECT 'schema public', a.grantee, a.privilege_type, a.is_grantable, "
+                    "a.grantor "
                     "FROM pg_catalog.pg_namespace n, pg_catalog.aclexplode(n.nspacl) a "
                     "WHERE n.nspname = 'public' AND a.grantee <> n.nspowner"
                     ") g ORDER BY 1, 2, 3, 4"
@@ -563,9 +570,11 @@ async def _check_access_control(connection: AsyncConnection, names: RoleNames) -
         ).all()
     governed = {"PUBLIC", *names.all()}
     unintended = [
-        f"{row.privilege_type} on {row.object} to {row.grantee} (granted by {row.grantor})"
+        f"{row.privilege_type} on {row.object} to {row.grantee}"
+        f"{' WITH GRANT OPTION' if row.is_grantable else ''} (granted by {row.grantor})"
         for row in grants
-        if row.grantee in governed and (row.object, row.grantee, row.privilege_type) not in intended
+        if row.grantee in governed
+        and (row.is_grantable or (row.object, row.grantee, row.privilege_type) not in intended)
     ]
     if unintended:
         raise BootstrapError(f"refusing unintended privileges: {'; '.join(unintended)}")

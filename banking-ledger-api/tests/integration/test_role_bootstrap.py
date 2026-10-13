@@ -828,8 +828,25 @@ async def test_the_commands_engine_pins_search_path_for_the_whole_session(
             'GRANT TEMPORARY ON DATABASE "{database}" TO "{app}"',
             r"TEMPORARY on database to {app} \(granted by {delegate}\)",
         ),
+        # An intended privilege, but delegable: the app could pass CONNECT on to PUBLIC.
+        (
+            'GRANT CONNECT ON DATABASE "{database}" TO "{delegate}" WITH GRANT OPTION',
+            'GRANT CONNECT ON DATABASE "{database}" TO "{app}" WITH GRANT OPTION',
+            r"CONNECT on database to {app} WITH GRANT OPTION \(granted by {delegate}\)",
+        ),
+        (
+            'GRANT USAGE ON SCHEMA public TO "{delegate}" WITH GRANT OPTION',
+            'GRANT USAGE ON SCHEMA public TO "{group}" WITH GRANT OPTION',
+            r"USAGE on schema public to {group} WITH GRANT OPTION \(granted by {delegate}\)",
+        ),
     ],
-    ids=["database-public", "schema-public", "database-app"],
+    ids=[
+        "database-public",
+        "schema-public",
+        "database-app",
+        "database-app-grantable",
+        "schema-group-grantable",
+    ],
 )
 async def test_refuses_privileges_another_grantor_gave(
     cluster: Cluster, delegation: str, grant: str, expected: str
@@ -837,11 +854,17 @@ async def test_refuses_privileges_another_grantor_gave(
     url = await cluster.database("grantor")
     names = cluster.role_names()
     delegate = cluster.role()
-    values = {"database": url.database, "delegate": delegate, "app": names.app}
+    values = {
+        "database": url.database,
+        "delegate": delegate,
+        "app": names.app,
+        "group": names.runtime_group,
+    }
     await _query_commit(
         url,
         f'CREATE ROLE "{delegate}" NOLOGIN',
         f'CREATE ROLE "{names.app}" NOLOGIN',
+        f'CREATE ROLE "{names.runtime_group}" NOLOGIN',
         delegation.format(**values),
         # A grant made BY the delegate: the bootstrap's REVOKEs (as the owner) cannot reach it.
         f'SET ROLE "{delegate}"',
@@ -854,7 +877,7 @@ async def test_refuses_privileges_another_grantor_gave(
         await _bootstrap(url, names)
 
     assert await _database_state(url) == before  # rolled back
-    assert await _roles_exist(url, names.all()) == {names.app}
+    assert await _roles_exist(url, names.all()) == {names.app, names.runtime_group}
 
 
 # --- F3: what the target roles may own, and default privileges ---------------------------------
