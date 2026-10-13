@@ -26,6 +26,9 @@ def create_engine(settings: Settings) -> AsyncEngine:
         settings.database_url.get_secret_value(),
         # Detects connections dropped by a database restart before handing them out.
         pool_pre_ping=True,
+        # Bound values (password hashes, token digests, emails) never appear in a database
+        # error's message, which ends up in tracebacks and the audit fallback log. The SQL stays.
+        hide_parameters=True,
         connect_args={
             "server_settings": {
                 "application_name": "banking-ledger-api",

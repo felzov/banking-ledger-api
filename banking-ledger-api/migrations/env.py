@@ -46,7 +46,8 @@ def do_run_migrations(connection: Connection) -> None:
 async def run_async_migrations() -> None:
     # Deliberately not the application's engine: no pool and no statement_timeout, because a
     # migration may legitimately run longer than any request.
-    engine = create_async_engine(_database_url(), poolclass=pool.NullPool)
+    # hide_parameters: a failed migration's error message shows its SQL, never bound values.
+    engine = create_async_engine(_database_url(), poolclass=pool.NullPool, hide_parameters=True)
     async with engine.connect() as connection:
         await connection.run_sync(do_run_migrations)
     await engine.dispose()
