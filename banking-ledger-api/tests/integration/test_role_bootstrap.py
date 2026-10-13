@@ -46,7 +46,9 @@ from tests.database import (
 
 OWNER_PASSWORD = SecretStr("synthetic-owner-password-0001")
 APP_PASSWORD = SecretStr("synthetic-app-password-000001")
-HEAD = "0012"
+HEAD = "0013"
+# Migration 0013 grants the helper to this cluster-wide group (created by tests.database).
+RUNTIME_GROUP = "ledger_runtime"
 PINNED_SEARCH_PATH = ["search_path=pg_catalog, pg_temp"]
 VERIFIER = re.compile(r"SCRAM-SHA-256\$(\d+):([A-Za-z0-9+/=]+)\$")
 
@@ -396,7 +398,8 @@ async def test_existing_volume_moves_every_object_to_the_owner(cluster: Cluster)
     assert helper.owner == helper.table_owner == names.owner
     assert helper.prosecdef is True
     assert helper.proconfig == PINNED_SEARCH_PATH
-    assert helper.acl == f"{{{names.owner}=X/{names.owner}}}"
+    # The owner, and since 0013 the runtime group, granted by the owner. Never PUBLIC.
+    assert helper.acl == f"{{{names.owner}=X/{names.owner},{RUNTIME_GROUP}=X/{names.owner}}}"
     # The trigger functions keep their pinned search_path (0008, 0009).
     configs = await _query(
         url,
@@ -436,7 +439,8 @@ async def test_fresh_volume_is_migrated_by_the_owner_without_a_superuser(
     assert await _owners_in_public(url) == {names.owner}
     helper = await _helper(url)
     assert helper.owner == helper.table_owner == names.owner
-    assert helper.acl == f"{{{names.owner}=X/{names.owner}}}"
+    # The owner, and since 0013 the runtime group, granted by the owner. Never PUBLIC.
+    assert helper.acl == f"{{{names.owner}=X/{names.owner},{RUNTIME_GROUP}=X/{names.owner}}}"
     # A second bootstrap of the migrated database finds nothing to transfer, and passes its
     # checks of the helper.
     assert (await _bootstrap(url, names)).transferred_objects == ()
@@ -446,7 +450,8 @@ async def test_runtime_role_has_nothing_before_migration_0013(cluster: Cluster) 
     url = await cluster.database("runtime")
     names = cluster.role_names()
     await _bootstrap(url, names)
-    await _migrate(_as(url, names.owner, OWNER_PASSWORD))
+    # Pinned to 0012: the schema as it was before any runtime grant existed.
+    await _migrate(_as(url, names.owner, OWNER_PASSWORD), "0012")
 
     engine = _engine(_as(url, names.app, APP_PASSWORD))
     try:
