@@ -53,7 +53,9 @@ async def engine(test_database_url: URL) -> AsyncIterator[AsyncEngine]:
     """
     assert test_database_url.database is not None
     await recreate_database(configured_database_url(), test_database_url.database)
-    engine = create_engine(settings_for(test_database_url))
+    # The suite's own superuser connection: the startup privilege guard (ADR 0015) would refuse
+    # it, by design; only this Python-level hook turns it off.
+    engine = create_engine(settings_for(test_database_url), privilege_guard=False)
     await run_alembic(engine, lambda config: command.upgrade(config, "head"))
     yield engine
     await engine.dispose()
@@ -119,7 +121,7 @@ async def serve(app: FastAPI) -> AsyncIterator[AsyncClient]:
 @pytest.fixture
 def app(engine: AsyncEngine, test_database_url: URL) -> FastAPI:
     # Depends on `engine` so the test database exists and is migrated; the app builds its own.
-    return create_app(settings_for(test_database_url))
+    return create_app(settings_for(test_database_url), privilege_guard=False)  # superuser
 
 
 @pytest.fixture

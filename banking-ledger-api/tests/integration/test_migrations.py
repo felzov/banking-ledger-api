@@ -449,7 +449,7 @@ async def test_0010_upgrades_a_populated_0009_database_and_keyed_postings_work()
     assert url.database is not None
     await recreate_database(server_url, url.database)
     engine = create_async_engine(url, poolclass=NullPool)
-    app_engine = create_engine(settings_for(url))
+    app_engine = create_engine(settings_for(url), privilege_guard=False)  # superuser
     try:
         await run_alembic(engine, lambda config: command.upgrade(config, "0009"))
         async with engine.begin() as connection:
@@ -655,7 +655,9 @@ async def _insert_entries_as_new_role(connection: AsyncConnection, *, helper: bo
     role = f"ledger_posting_{uuid.uuid7().hex}"
     await connection.execute(text(f'CREATE ROLE "{role}" NOLOGIN'))
     # idempotency=False: the schema under test may predate 0010; raw inserts never use keys.
-    for grant in posting_role_grants(role, helper=helper, idempotency=False):
+    for grant in posting_role_grants(
+        role, helper=helper, idempotency=False, schema_before_0011=True
+    ):
         await connection.execute(text(grant))
     await connection.execute(text(f'SET LOCAL ROLE "{role}"'))
     transaction_id = await connection.scalar(
@@ -786,7 +788,7 @@ async def _commit_check_unbalanced_behind_shadows(connection: AsyncConnection) -
     role = f"ledger_posting_{uuid.uuid7().hex}"
     await connection.execute(text(f'CREATE ROLE "{role}" NOLOGIN'))
     # idempotency=False: the schema under test may predate 0010; raw inserts never use keys.
-    for grant in posting_role_grants(role, idempotency=False):
+    for grant in posting_role_grants(role, idempotency=False, schema_before_0011=True):
         await connection.execute(text(grant))
     await connection.execute(text(f'SET LOCAL ROLE "{role}"'))
     transaction_id = await connection.scalar(

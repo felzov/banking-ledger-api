@@ -61,12 +61,25 @@ def _role_name() -> str:
     return f"ledger_posting_{uuid.uuid7().hex}"
 
 
+# What production does NOT grant since migration 0013: choosing an entry's number (INSERT ...
+# OVERRIDING SYSTEM VALUE needs INSERT on the identity column). The ordering trigger's tests give
+# it to their role anyway, to show that the trigger still holds against a role that has it.
+CHOOSE_ENTRY_NUMBERS = 'GRANT INSERT (sequence_number) ON ledger_entries TO "{role}"'
+
+
 async def _create_role(
-    connection: AsyncConnection, role: str, *, helper: bool = True, idempotency: bool = True
+    connection: AsyncConnection,
+    role: str,
+    *,
+    helper: bool = True,
+    idempotency: bool = True,
+    numbering: bool = False,
 ) -> None:
     await connection.execute(text(f'CREATE ROLE "{role}" NOLOGIN'))
     for grant in posting_role_grants(role, helper=helper, idempotency=idempotency):
         await connection.execute(text(grant))
+    if numbering:
+        await connection.execute(text(CHOOSE_ENTRY_NUMBERS.format(role=role)))
 
 
 # --- who actually ran it --------------------------------------------------------------------------
@@ -137,7 +150,11 @@ async def _fund(new_session: SessionFactory, account: Account, amount: int) -> P
 
 
 async def _switch_to_new_posting_role(
-    db_connection: AsyncConnection, *, helper: bool = True, idempotency: bool = True
+    db_connection: AsyncConnection,
+    *,
+    helper: bool = True,
+    idempotency: bool = True,
+    numbering: bool = False,
 ) -> str:
     """Create a posting role inside the test transaction and become it (SET LOCAL ROLE).
 
@@ -148,7 +165,9 @@ async def _switch_to_new_posting_role(
     inside a transaction; the committed tests below run as the role only.)
     """
     role = _role_name()
-    await _create_role(db_connection, role, helper=helper, idempotency=idempotency)
+    await _create_role(
+        db_connection, role, helper=helper, idempotency=idempotency, numbering=numbering
+    )
     await db_connection.execute(text(f'SET LOCAL ROLE "{role}"'))
     assert await db_connection.scalar(text("SELECT current_user")) == role
     return role
@@ -218,6 +237,8 @@ async def test_posting_role_deposits_withdraws_and_transfers(
     assert moved.balances == {payer.id: 1_000}
     await check_deferred_constraints(db_session)  # the COMMIT-time checks, run as the role
     await assert_reconciled(db_session)
+    # The role writes audit events but cannot read them (migration 0013): check as the superuser.
+    await db_connection.execute(text("RESET ROLE"))
     events = await audit_events_about(db_session, payer.id)
     assert [event.outcome for event in events] == [
         AuditOutcome.SUCCEEDED,  # the funding deposit
@@ -240,6 +261,38 @@ _INSERT_NUMBERED = text(
 )
 
 
+async def test_production_privileges_refuse_choosing_an_entry_number(
+    db_connection: AsyncConnection,
+    db_session: AsyncSession,
+    new_session: SessionFactory,
+    pair: tuple[Account, Account],
+) -> None:
+    # Since 0013 no INSERT on sequence_number: OVERRIDING SYSTEM VALUE is refused by privilege,
+    # before the ordering trigger is reached, whatever number is chosen.
+    payer, payee = pair
+    await _switch_to_new_posting_role(db_connection)
+    await _fund(new_session, payer, 100)
+    issued = await db_connection.scalar(text(f"SELECT {HELPER}"))
+    assert isinstance(issued, int)
+
+    transaction_id = await db_session.scalar(_INSERT_HEADER, {"ledger": payer.ledger_id})
+    nested = await db_connection.begin_nested()
+    with pytest.raises(DBAPIError) as excinfo:
+        await db_session.execute(
+            _INSERT_NUMBERED,
+            {
+                "t": transaction_id,
+                "l": payer.ledger_id,
+                "payer": payer.id,
+                "payee": payee.id,
+                "payer_number": issued + 1,
+                "payee_number": issued + 2,
+            },
+        )
+    await nested.rollback()
+    assert sqlstate(excinfo.value) == "42501"
+
+
 @pytest.mark.parametrize(("offset", "constraint"), [(-1_000_000, "monotonic"), (1_000, "issued")])
 async def test_backdated_and_unissued_numbers_stay_rejected_for_the_role(
     db_connection: AsyncConnection,
@@ -250,7 +303,7 @@ async def test_backdated_and_unissued_numbers_stay_rejected_for_the_role(
     constraint: str,
 ) -> None:
     payer, payee = pair
-    await _switch_to_new_posting_role(db_connection)
+    await _switch_to_new_posting_role(db_connection, numbering=True)
     await _fund(new_session, payer, 100)  # an existing history, posted as the role
     issued = await db_connection.scalar(text(f"SELECT {HELPER}"))
     assert isinstance(issued, int)
@@ -308,7 +361,7 @@ async def test_temporary_tables_cannot_hide_an_accounts_history(
     # accepted the backdated entry; the commit-time checks passed too (on the mirrored rows).
     payer, payee = pair
     newcomer = await create_customer_account(db_session)  # no entries: any number is "after"
-    await _switch_to_new_posting_role(db_connection)
+    await _switch_to_new_posting_role(db_connection, numbering=True)
     await _fund(new_session, payee, 100)  # numbers below the payer's...
     await _fund(new_session, payer, 100)  # ...latest one, unused on the payer's account
     backdated = await db_connection.scalar(
@@ -985,8 +1038,11 @@ async def test_role_cannot_backdate_behind_an_uncommitted_posting(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     # The F1 race, with the raw writer running as the least-privilege role: it waits on the
-    # trigger's account lock, then sees the committed entry and is rejected.
+    # trigger's account lock, then sees the committed entry and is rejected. The role may choose
+    # numbers here (production's may not, since 0013): the trigger is what is under test.
     superuser = create_sessionmaker(engine)
+    async with engine.begin() as connection:
+        await connection.execute(text(CHOOSE_ENTRY_NUMBERS.format(role=posting_role.role)))
     account = await commit_funded_account(superuser, 1_000)
     await commit_funded_account(superuser, 1_000)  # draws numbers: room after A's latest
     async with superuser() as session:

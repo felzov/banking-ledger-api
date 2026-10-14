@@ -123,3 +123,10 @@ boundaries (ADR 0001).
 - Users registered before Phase 8 cannot log in (no credentials were backfilled).
 - Registration still answers `409` for a registered email, which allows enumerating addresses
   (ADR 0008); login does not add a second way to do so.
+
+## Amendment (Phase 10, 2026-10-14): least-privilege database role (ADR 0015)
+
+The "least-privilege database role" gap above is closed: the API connects as `ledger_app`. It
+reads `user_credentials` and `auth_sessions` (login and token lookup need it), may update only
+`password_hash` and `updated_at` (a rehash) and `revoked_at` (logout), and may insert a session
+but not one already revoked or backdated. Rate limiting, session cleanup and TLS remain open.

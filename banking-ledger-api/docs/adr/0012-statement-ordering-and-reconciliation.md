@@ -228,3 +228,16 @@ database, using `session_replication_role = replica` where the schema itself wou
 - Cost: the transaction read sums the account's history up to the entry, O(entries before it),
   like a statement page. The persisted-running-balance upgrade path above would make both
   O(1).
+
+## Amendment (Phase 10, 2026-10-14): the posting role in production (ADR 0015)
+
+The privilege contract of a least-privilege posting role above is now production's: migration
+0013 grants it to `ledger_runtime`, the group of the API's role `ledger_app`, with `EXECUTE` on
+the sequence helper and nothing on the sequence. It is stricter in one respect: `INSERT` on
+`ledger_entries` excludes `sequence_number`, so `INSERT ... OVERRIDING SYSTEM VALUE` is refused
+by privilege before the ordering trigger runs; the trigger remains the second line, tested
+against a role given that column on purpose. `TEMPORARY` is revoked from `PUBLIC` (by the role
+bootstrap), and `PUBLIC` lost `EXECUTE` on the trigger functions. "The application role
+currently is one" (a superuser or owner, in the reconciliation section) no longer holds: the
+only roles that can still bypass the triggers, and against which reconciliation therefore
+remains necessary, are the admin and `ledger_owner`; the application's role is neither.

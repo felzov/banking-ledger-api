@@ -19,8 +19,9 @@ movement, concurrency control, idempotent APIs, and an append-only audit trail.
 > - **no rate limiting or lockout** against password guessing (Phase 10);
 > - **no HTTPS**: the local stack is plain HTTP on 127.0.0.1, and bearer tokens must only
 >   travel over TLS;
-> - **the application connects to PostgreSQL as a superuser** (the Compose bootstrap role),
->   which can disable the append-only triggers; least-privilege roles are Phase 10.
+> - **database roles are separated** (the API runs as an unprivileged `ledger_app`, see
+>   [Database roles](#database-roles)), but credentials come from a local `.env` file, not a
+>   secrets manager.
 >
 > Do not expose it to untrusted networks.
 
@@ -44,12 +45,25 @@ Prerequisites: Docker with Compose v2+, [uv](https://docs.astral.sh/uv/), and GN
 cd banking-ledger-api
 cp .env.example .env        # synthetic local-only values
 make install                # create .venv from uv.lock
-make up                     # start PostgreSQL, apply migrations, start the API
+make up                     # start PostgreSQL, create the roles, migrate, start the API
 curl localhost:8000/health/ready
 ```
 
-`make up` starts three services in order: `db`, then a one-shot `migrate` container
-(`alembic upgrade head`), then `api` once the migrations have succeeded.
+`make up` starts four services, each only once the previous one has succeeded, each with its
+own database identity ([Database roles](#database-roles)):
+
+1. `db`, PostgreSQL, until healthy;
+2. `bootstrap`, one-shot, as the admin: creates or reconciles the roles
+   (`python -m ledger_api.admin.bootstrap`);
+3. `migrate`, one-shot, as `ledger_owner`: `alembic upgrade head`;
+4. `api`, as `ledger_app`.
+
+**Existing volume** (created before Phase 10, where everything belongs to the admin): **back
+it up first** ([below](#back-up-before-upgrading-an-existing-database)). Then add
+`LEDGER_OWNER_PASSWORD` and `LEDGER_APP_PASSWORD` to `.env` (see `.env.example`), and run
+`make up`. The bootstrap transfers every object in `public` to `ledger_owner`, then migration
+0013 grants `ledger_app` its privileges; the data is untouched. Without those two variables
+Compose refuses to start and names the missing one.
 
 Interactive API docs: <http://localhost:8000/docs>
 
@@ -59,13 +73,41 @@ To enable the git hooks, run this once from the repository root:
 banking-ledger-api/.venv/bin/pre-commit install
 ```
 
+### Back up before upgrading an existing database
+
+Before `make up`, `make migrate` or any other upgrade of a database that already holds data,
+take a backup and rehearse restoring it with `scripts/rehearse-backup-restore.sh`:
+
+```bash
+mkdir -m 700 ~/ledger-backups   # outside the repository, owned by you, mode 700
+scripts/rehearse-backup-restore.sh --backup-dir ~/ledger-backups             # plan only
+scripts/rehearse-backup-restore.sh --backup-dir ~/ledger-backups --execute   # back up, rehearse
+```
+
+- **Default (no `--execute`):** checks the arguments and the backup directory and prints the
+  plan. It runs no Docker or database command.
+- **`--execute`:** dumps the development database `ledger` read-only (`pg_dump`, plus the roles
+  without passwords), restores the dump into a new, uniquely named database on the disposable
+  test cluster (`test-db`, which must be running and marked: run `make test` once), compares the
+  copy with the source (schema, ownership, privileges, sequences, data) and checks the ledger's
+  integrity. It then drops that copy, only after re-checking the containers, the cluster and the
+  database's OID. Nothing is written to the development database.
+- **The backup files are kept** in the backup directory (mode 600): they are the backup.
+  Protect them like the database itself.
+- **A logical dump of one database, not a physical backup of the cluster.** Database-level
+  permissions and settings (e.g. who may `CONNECT`) are not in it; after a restore, the role
+  bootstrap re-applies the database-level revokes. The script rehearses a restore into a
+  separate database; it never restores over an existing one.
+
 ## Environment variables
 
 | Variable | Used by | Default | Purpose |
 |---|---|---|---|
 | `APP_ENV` | api | `development` | One of `development`, `test`, `production`. Validated at startup |
-| `DATABASE_URL` | api, alembic, tests | (required) | `postgresql+asyncpg://…`. Validated at startup. Not set in `.env`: Compose and the Makefile derive it from the `POSTGRES_*` values |
-| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | db | (required) | Database bootstrap credentials |
+| `DATABASE_URL` | api, alembic, tests | (required) | `postgresql+asyncpg://…`. Validated at startup. Not set in `.env`: Compose and the Makefile build it per process, with `ledger_app`'s credentials for the API and `ledger_owner`'s for the migrations |
+| `POSTGRES_USER` / `POSTGRES_PASSWORD` / `POSTGRES_DB` | db, bootstrap | (required) | The database admin (the PostgreSQL bootstrap superuser). Given only to the `db` service and the role bootstrap |
+| `LEDGER_OWNER_PASSWORD` / `LEDGER_APP_PASSWORD` | bootstrap, migrate / api | (required) | Passwords of `ledger_owner` and `ledger_app`. 16+ characters; written into URLs unescaped, so letters, digits and `. _ ~ -` only |
+| `ADMIN_DATABASE_URL` | bootstrap | (required) | The admin's URL, for the role bootstrap only. Not set in `.env`: Compose and `make bootstrap` build it |
 | `POSTGRES_PORT` | compose | `5432` | Host port, bound to 127.0.0.1 |
 | `API_PORT` | compose | `8000` | Host port, bound to 127.0.0.1 |
 | `AUTH_SESSION_TTL_SECONDS` | api | `1800` | Absolute lifetime of a login session (30 minutes; 60–86,400) |
@@ -77,10 +119,12 @@ banking-ledger-api/.venv/bin/pre-commit install
 |---|---|
 | `make up` / `make down` | Start or stop the stack. Data is kept in the `pgdata` volume |
 | `make logs` | Follow container logs |
-| `make migrate` | Apply migrations from the host (the stack must be up) |
+| `make bootstrap` | Create or reconcile the database roles, as the admin (the `db` service must be up) |
+| `make migrate` | Apply migrations from the host, as `ledger_owner` (after `make bootstrap`) |
 | `make revision m="..."` | Create a new, empty migration |
 | `make db-shell` | Open `psql` in the database container |
-| `make test` | Run the test suite (needs PostgreSQL: run `make up` first) |
+| `make test` | Run the test suite on its own disposable PostgreSQL (`test-db`, started if needed) |
+| `make smoke` | Start-up smoke test in an isolated Compose project (own volume, ports and image), removed afterwards |
 | `make lint` / `make fmt` | Lint and format check, or auto-fix |
 | `make typecheck` | `mypy --strict` |
 | `make check` | All quality gates |
@@ -313,9 +357,11 @@ Invariants enforced by PostgreSQL itself, so every code path is bound by them:
 | A key and its transaction reference each other, and the transaction is the key owner's own posting: no key can be attached to an existing or another user's transaction | Columns on the immutable `transactions` row, unique and foreign-key constraints, and a link check at `COMMIT` on both tables (migration 0011) |
 | No plaintext password or token is stored; a session lasts at most 24 hours and can only be revoked once | An Argon2id-only `CHECK` on `user_credentials`; a unique 32-byte digest, an expiry-window `CHECK` and a revoke-only trigger on `auth_sessions` (migration 0012) |
 
-Triggers bind ordinary sessions only. A superuser or the table owner can disable them, and the
-application currently connects as a superuser, so these rules guard against application bugs,
-not against that role ([ADR 0004](docs/adr/0004-immutable-transactions-without-status.md)).
+Triggers bind ordinary sessions only: a superuser or the table owner can disable them
+([ADR 0004](docs/adr/0004-immutable-transactions-without-status.md)). Since Phase 10 the API is
+neither: it connects as `ledger_app`, which owns nothing and holds only migration 0013's
+privileges, so these rules hold against the application itself, not only against its bugs
+([Database roles](#database-roles)).
 
 `balance_minor` is maintained by the application inside the posting transaction, not by a
 constraint. Reconciliation queries ([`data/reconciliation.py`](src/ledger_api/data/reconciliation.py))
@@ -565,26 +611,66 @@ historical balance calculation (also used by idempotent replays).
   verification.
 - **Session cleanup** (expired rows accumulate), a **per-user session limit**, listing sessions,
   and "revoke all sessions".
-- **A least-privilege database role** (Phase 10). The application connects as a superuser,
-  which can disable the append-only and integrity triggers.
 - **Production HTTPS.** The local stack serves plain HTTP on 127.0.0.1; a deployment needs TLS
   termination, since bearer tokens must never travel unencrypted.
 - Password change and reset, email verification, MFA, roles and administrators.
 - Registration answers `409` for a registered email, which allows enumerating addresses; rate
   limiting is the intended mitigation.
 
+### Database roles
+
+Three identities, each holding only what its job needs
+([ADR 0015](docs/adr/0015-database-roles-and-least-privilege.md)):
+
+| Role | Used by | Can | Cannot |
+|---|---|---|---|
+| admin (`POSTGRES_USER`) | `db`, the one-shot role bootstrap | everything (the PostgreSQL bootstrap superuser) | — used by nothing else |
+| `ledger_owner` | migrations (`migrate`, `make migrate`) | own and change the schema | act as a superuser, create roles or databases, or serve the API (the startup guard refuses an owner) |
+| `ledger_app` (via the group `ledger_runtime`) | the API | exactly migration 0013's grants: column-level `INSERT`/`UPDATE`, `SELECT` where read, `INSERT` only on `audit_events` | read audit events, change history (`UPDATE`/`DELETE`/`TRUNCATE`), choose sequence numbers, own or create anything, disable triggers |
+
+- **Why migrations run as `ledger_owner`, not as a superuser:** the owner can create objects in
+  `public`. A superuser session resolving names through `public` would run anything placed
+  there (an operator, a function) with superuser privileges. `migrations/env.py` refuses to run
+  as a superuser; only Python code (the test suite) can exempt itself.
+- **Why the API uses `ledger_app`:** the append-only, double-entry and audit triggers bind every
+  role except a superuser or an owner. The API is neither, so a bug or an attacker in the API
+  cannot switch them off or read the audit trail.
+- **Startup privilege guard:** every new database connection the API opens is checked on the
+  server: superuser, `BYPASSRLS`, `CREATEROLE`, `CREATEDB`, `REPLICATION`, owning the database
+  or anything in `public`, or membership (inherited or by `SET ROLE`) in a role that does,
+  refuses it. Requests then answer `503 temporarily_unavailable`, `/health/ready` answers `503`,
+  and a CRITICAL log line names the role and the reason (never a URL or password).
+  `/health/live` keeps answering. A check that cannot complete refuses too.
+- **Credentials per service:** only the bootstrap gets the admin's URL, only `migrate` the
+  owner's, only `api` the app's (a test reads `compose.yaml` to keep it so; the smoke test
+  inspects the running containers).
+
 ## Testing
 
 Tests run against real PostgreSQL, never SQLite, because the invariants above live in
-triggers and constraints. The suite creates a disposable `<db>_test` database next to the one
-in `DATABASE_URL`, builds it with the Alembic migrations, and wraps each test in a transaction
-that is rolled back. As a safety guard, the suite refuses to drop any database whose name does
-not end in `_test`.
+triggers and constraints. They run on their **own disposable cluster**, never the development
+database: `make test` starts the `test-db` Compose service (data on tmpfs, `127.0.0.1:5433`),
+marks it, and points `DATABASE_URL` at it. The suite creates `<db>_test` databases there,
+builds them with the Alembic migrations, and wraps each test in a transaction that is rolled
+back.
 
 ```bash
-make up      # PostgreSQL must be running
 make test
 ```
+
+Safety guards, all required before the suite creates a database or a role (roles are
+cluster-wide):
+
+- the environment declares a disposable cluster (`LEDGER_TEST_CLUSTER=disposable`, set by
+  `make test` and CI);
+- the server `DATABASE_URL` reaches carries the marker `ledger.test_cluster = 'disposable'` in
+  its own configuration, set by `make test` and CI on the throwaway server itself, never through
+  `DATABASE_URL` (a development server never has it);
+- the database it connects to is not migrated;
+- and a database is only ever dropped if its name ends in `_test`.
+
+Running `uv run pytest` directly therefore needs a marked, disposable server and both settings;
+use `make test`.
 
 Negative tests assert the exact constraint or trigger that rejected the data, not just that
 some error occurred. API tests run each request in a fresh session on the test's rolled-back
@@ -699,8 +785,10 @@ Reliability tests (Phase 9):
   `COMMIT` logs no warning; a cancelled rejection-audit write is logged as "not written", or as
   "possibly not written" when its own `COMMIT` was interrupted.
 
-CI runs the same suite against a PostgreSQL service container and smoke-tests the Compose
-stack.
+CI runs the same suite against a PostgreSQL service container (marked disposable), and runs
+the start-up smoke test (`scripts/compose-smoke.sh`, `make smoke` locally) on its own Compose
+stack: `db` → `bootstrap` → `migrate` (`ledger_owner`) → `api` (`ledger_app`), an API flow, the
+API container's environment, and the server's view of who is connected and who owns the schema.
 
 ## Architecture decisions
 
@@ -720,6 +808,7 @@ stack.
 | [0012](docs/adr/0012-statement-ordering-and-reconciliation.md) | Commit-ordered entries, statements with computed running balances, independent reconciliation |
 | [0013](docs/adr/0013-authentication-and-authorization.md) | Password login (Argon2id) with opaque, database-backed bearer tokens; one router-level ownership check |
 | [0014](docs/adr/0014-failure-handling-unavailability-cancellation-and-shutdown.md) | Failure handling: `503` for unreachable databases and pre-`COMMIT` connection loss, cancellation, audit fallback logs, shutdown as configured |
+| [0015](docs/adr/0015-database-roles-and-least-privilege.md) | Database roles: admin bootstrap, `ledger_owner` migrations, `ledger_app` with column-level grants; migration and startup privilege guards |
 
 ## Roadmap
 
@@ -732,4 +821,4 @@ stack.
 7. ✅ REST API: statements, single transactions, `Location` on postings
 8. ✅ Authentication and authorization (password login, bearer tokens, ownership on every user-scoped route)
 9. Reliability (in progress: database outages answer `503`, pre-`COMMIT` and cancellation behaviour tested, failure handling documented)
-10. Security and observability (including least-privilege database roles, structured logging)
+10. Security and observability (in progress: least-privilege database roles and their guards ✅; structured logging, request correlation, rate limiting to come)

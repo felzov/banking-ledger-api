@@ -155,7 +155,7 @@ async def test_a_cancellation_while_waiting_for_a_row_lock_commits_nothing(
     # timeout, must be what ends the wait.
     monkeypatch.setattr(data_engine, "LOCK_TIMEOUT_MS", 60_000)
     monkeypatch.setattr(data_engine, "STATEMENT_TIMEOUT_MS", 60_000)
-    patient = create_engine(settings_for(test_database_url))
+    patient = create_engine(settings_for(test_database_url), privilege_guard=False)
     patient_sessions = create_sessionmaker(patient)
     key = f"cancel-lock-wait-{uuid.uuid7().hex}"
     try:
@@ -215,7 +215,8 @@ async def test_a_cancellation_after_postgresql_committed_keeps_the_posting(
 
     async with ReplyHoldingProxy(test_database_url.host, test_database_url.port) as proxy:
         proxied = create_engine(
-            settings_for(test_database_url.set(host="127.0.0.1", port=proxy.port))
+            settings_for(test_database_url.set(host="127.0.0.1", port=proxy.port)),
+            privilege_guard=False,
         )
 
         async def record_then_hold_replies(session: AsyncSession, record: AuditRecord) -> None:
@@ -311,7 +312,10 @@ async def test_a_cancelled_rejection_audit_is_logged_as_lost(
 
 
 def _proxied(test_database_url: URL, proxy: ReplyHoldingProxy) -> AsyncEngine:
-    return create_engine(settings_for(test_database_url.set(host="127.0.0.1", port=proxy.port)))
+    return create_engine(
+        settings_for(test_database_url.set(host="127.0.0.1", port=proxy.port)),
+        privilege_guard=False,
+    )
 
 
 async def _events_with_key(sessionmaker: Maker, key: str) -> list[AuditEvent]:

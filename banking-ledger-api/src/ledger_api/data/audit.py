@@ -28,8 +28,12 @@ async def insert_audit_event(session: AsyncSession, record: AuditRecord) -> None
             (exists().where(User.id == claimed), stored_details),
             else_=literal({**details, REQUESTED_USER_ID: str(claimed)}, JSONB),
         )
+    # inline(): no implicit RETURNING of the generated id, which nothing here needs. RETURNING
+    # requires SELECT, and the application's role may write audit events but never read them
+    # (migration 0013).
     await session.execute(
-        insert(AuditEvent).values(
+        insert(AuditEvent)
+        .values(
             action=record.action,
             outcome=record.outcome,
             actor_user_id=actor_user_id,
@@ -38,4 +42,5 @@ async def insert_audit_event(session: AsyncSession, record: AuditRecord) -> None
             idempotency_key=record.idempotency_key,
             details=stored_details,
         )
+        .inline()
     )

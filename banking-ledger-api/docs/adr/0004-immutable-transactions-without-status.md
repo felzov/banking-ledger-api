@@ -45,3 +45,14 @@ rails. The MVP has neither.
   future hardening work (Phase 10). Reconciliation re-checks the invariants independently
   (ADR 0012). The exact privileges a posting role needs, including `EXECUTE` on the sequence
   helper of migration 0007, are pinned by a test (ADR 0012, "Security boundary").
+
+## Amendment (Phase 10, 2026-10-14): the grant model is implemented (ADR 0015)
+
+The 2026-10-10 amendment recorded that the application connected as the bootstrap superuser,
+so append-only held against bugs but not against that role. That is no longer the case. The API
+connects as `ledger_app`, which owns nothing and holds only migration 0013's grants: no
+`UPDATE`, `DELETE` or `TRUNCATE` on `transactions`, `ledger_entries` or `audit_events`, and no
+power to disable a trigger. Such statements now fail with `42501` before any trigger runs. The
+API refuses to serve if its connection is a superuser or an owner. The tables belong to
+`ledger_owner`, which only the migrations use. A superuser or the owner can still disable the
+triggers; neither identity is given to the application.
