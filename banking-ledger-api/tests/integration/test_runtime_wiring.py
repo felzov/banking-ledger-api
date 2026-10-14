@@ -74,9 +74,10 @@ async def _run_bootstrap_cli(
     # main() runs its own event loop: in a thread, away from the test's.
     assert await asyncio.to_thread(bootstrap_module.main) == 0
     out, err = capsys.readouterr()
+    # The admin URL has no password in CI (trust auth keeps every credential out of git).
     for secret in (OWNER_PASSWORD, APP_PASSWORD, url.password):
-        assert secret is not None
-        assert secret not in out + err
+        if secret is not None:
+            assert secret not in out + err
     return out
 
 

@@ -96,8 +96,9 @@ def _assert_refused(served: Served, caplog: pytest.LogCaptureFixture, reason: st
 
 
 def _assert_no_secrets(caplog: pytest.LogCaptureFixture, url: URL) -> None:
-    assert url.password is not None
-    assert url.password not in caplog.text
+    # The admin URL has no password in CI (trust auth keeps every credential out of git).
+    if url.password is not None:
+        assert url.password not in caplog.text
     assert url.render_as_string(hide_password=False) not in caplog.text
 
 

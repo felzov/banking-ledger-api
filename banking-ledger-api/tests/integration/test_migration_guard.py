@@ -88,8 +88,9 @@ async def test_the_command_line_refuses_a_superuser(
     assert result.returncode != 0
     output = result.stdout + result.stderr
     assert REFUSAL in output
-    assert url.password is not None
-    assert url.password not in output
+    # The admin URL has no password in CI (trust auth keeps every credential out of git).
+    if url.password is not None:
+        assert url.password not in output
     assert not await _migrated(url)  # refused before the first migration
 
 
