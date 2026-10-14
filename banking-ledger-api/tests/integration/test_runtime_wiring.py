@@ -8,7 +8,9 @@ in its tmpfs data, until the container goes. Each database is a disposable one o
 """
 
 import asyncio
+import os
 import secrets
+import uuid
 from collections.abc import AsyncIterator
 
 import pytest
@@ -21,7 +23,15 @@ from ledger_api.admin.bootstrap import DEFAULT_ROLE_NAMES
 from ledger_api.main import create_app
 from tests.auth_helpers import TEST_PASSWORD
 from tests.conftest import serve, settings_for
-from tests.database import assert_reconciled, configured_database_url, run_alembic
+from tests.database import (
+    DISPOSABLE_CLUSTER_VARIABLE,
+    DISPOSABLE_SERVER_SETTING,
+    RUNTIME_PRIVILEGES,
+    assert_disposable_cluster,
+    assert_reconciled,
+    configured_database_url,
+    run_alembic,
+)
 from tests.integration.test_migration_guard import _alembic_cli
 from tests.integration.test_role_bootstrap import (
     Cluster,
@@ -31,6 +41,7 @@ from tests.integration.test_role_bootstrap import (
     _query_commit,
     _scalar,
 )
+from tests.integration.test_runtime_privileges import unexpected_runtime_grants
 
 OWNER_PASSWORD = "synthetic-real-owner-password"  # noqa: S105 (synthetic test value)
 APP_PASSWORD = "synthetic-real-app-password-1"  # noqa: S105 (synthetic test value)
@@ -105,6 +116,9 @@ async def _use_the_api_as_ledger_app(url: URL) -> str:
                 (await connection.execute(text("SELECT current_user, session_user"))).one()
             )
         assert identity == (DEFAULT_ROLE_NAMES.app, DEFAULT_ROLE_NAMES.app)
+        # Ready: the startup privilege guard accepted ledger_app's connection.
+        ready = await client.get("/health/ready")
+        assert (ready.status_code, ready.json()) == (200, {"status": "ok"})
 
         created = await client.post("/users", json={"email": email, "password": TEST_PASSWORD})
         assert created.status_code == 201, created.text
@@ -187,5 +201,184 @@ async def test_an_existing_volume_upgraded_in_place(
         await _scalar(url, "SELECT count(*) FROM users WHERE email = 'existing-user@example.com'")
         == 1
     )
+    user_id = await _use_the_api_as_ledger_app(url)
+    await _assert_consistent_and_audited(url, user_id)
+
+
+# --- the development volume's own path: 0007 -> bootstrap -> 0008-0013 ------------------------
+
+# Every table and routine migration 0007 leaves in public: what the bootstrap must transfer.
+OBJECTS_AT_0007 = {
+    ("table", "accounts"),
+    ("table", "alembic_version"),
+    ("table", "audit_events"),
+    ("table", "ledger_entries"),
+    ("table", "ledgers"),
+    ("table", "transactions"),
+    ("table", "users"),
+    ("function", "assert_entry_sequence_order"),
+    ("function", "assert_transaction_balanced"),
+    ("function", "forbid_audit_mutation"),
+    ("function", "forbid_ledger_mutation"),
+    ("function", "ledger_entries_last_issued_sequence_number"),
+}
+
+OWNED_TABLES_AND_ROUTINES = """
+SELECT 'table' AS kind, relname::text AS name, pg_get_userbyid(relowner) AS owner FROM pg_class
+ WHERE relnamespace = 'public'::regnamespace AND relkind = 'r'
+UNION ALL
+SELECT 'function', proname::text, pg_get_userbyid(proowner) FROM pg_proc
+ WHERE pronamespace = 'public'::regnamespace
+"""
+
+# The history seeded at 0007, read through the columns 0007 has (0011 adds more to transactions).
+SEEDED_HISTORY = """
+SELECT 'user' AS row_kind, u.id::text AS id, u.email AS detail, NULL::bigint AS amount
+  FROM users u
+UNION ALL SELECT 'account', a.id::text, a.kind, a.balance_minor FROM accounts a
+UNION ALL SELECT 'transaction', t.id::text, t.kind || '/' || t.entry_count, NULL FROM transactions t
+UNION ALL SELECT 'entry', e.id::text, e.account_id::text || '#' || e.sequence_number, e.amount_minor
+  FROM ledger_entries e
+ORDER BY 1, 2
+"""
+
+
+async def _seed_history_at_0007(url: URL) -> None:
+    """As the admin, at 0007: a user, their GBP account and a balanced deposit into it (header,
+    two entries, both balances), committed through the 0007 triggers."""
+    user, account, transaction = uuid.uuid4(), uuid.uuid4(), uuid.uuid4()
+    engine = _engine(url)
+    try:
+        async with engine.begin() as connection:
+            ledger = await connection.scalar(text("SELECT id FROM ledgers WHERE currency = 'GBP'"))
+            settlement = await connection.scalar(
+                text("SELECT id FROM accounts WHERE ledger_id = :l AND kind = 'system'"),
+                {"l": ledger},
+            )
+            values = {"u": user, "a": account, "t": transaction, "l": ledger, "s": settlement}
+            for statement in (
+                "INSERT INTO users (id, email) VALUES (:u, 'seeded-at-0007@example.com')",
+                "INSERT INTO accounts (id, ledger_id, user_id, kind) "
+                "VALUES (:a, :l, :u, 'customer')",
+                "INSERT INTO transactions (id, ledger_id, kind, entry_count) "
+                "VALUES (:t, :l, 'deposit', 2)",
+                "INSERT INTO ledger_entries (transaction_id, account_id, ledger_id, amount_minor) "
+                "VALUES (:t, :a, :l, 750), (:t, :s, :l, -750)",
+                "UPDATE accounts SET balance_minor = balance_minor + 750 WHERE id = :a",
+                "UPDATE accounts SET balance_minor = balance_minor - 750 WHERE id = :s",
+            ):
+                await connection.execute(text(statement), values)
+    finally:
+        await engine.dispose()
+
+
+async def _assert_runtime_privileges_are_the_matrix(url: URL) -> None:
+    """ledger_app holds exactly migration 0013's table and column privileges, nothing granted
+    by anyone else, nothing delegable, nothing to PUBLIC (tests.database.RUNTIME_PRIVILEGES)."""
+    rows = await _query(
+        url,
+        "SELECT c.relname AS table_name, a.attname AS column_name, p.privilege, "
+        "has_table_privilege(:app, c.oid, p.privilege) AS on_table, "
+        "has_column_privilege(:app, c.oid, a.attnum, p.privilege) AS on_column "
+        "FROM pg_class c JOIN pg_attribute a ON a.attrelid = c.oid AND a.attnum > 0 "
+        "AND NOT a.attisdropped, unnest(ARRAY['SELECT', 'INSERT', 'UPDATE']) p(privilege) "
+        "WHERE c.relnamespace = 'public'::regnamespace AND c.relkind = 'r'",
+        app=DEFAULT_ROLE_NAMES.app,
+    )
+    assert {row.table_name for row in rows} == set(RUNTIME_PRIVILEGES)
+    for row in rows:
+        expected = RUNTIME_PRIVILEGES[row.table_name]
+        allowed_columns = {"INSERT": expected.insert, "UPDATE": expected.update}.get(
+            row.privilege, frozenset()
+        )
+        on_table = row.privilege in expected.table
+        assert row.on_table == on_table, (row.table_name, row.privilege)
+        assert row.on_column == (on_table or row.column_name in allowed_columns), (
+            row.table_name,
+            row.column_name,
+            row.privilege,
+        )
+    for privilege in ("DELETE", "TRUNCATE", "REFERENCES", "TRIGGER"):
+        granted = await _scalar(
+            url,
+            "SELECT count(*) FROM pg_class c WHERE c.relnamespace = 'public'::regnamespace "
+            "AND c.relkind = 'r' AND has_table_privilege(:app, c.oid, :p)",
+            app=DEFAULT_ROLE_NAMES.app,
+            p=privilege,
+        )
+        assert granted == 0, privilege
+    assert await unexpected_runtime_grants(url) == []
+
+
+async def test_a_0007_volume_bootstrapped_and_upgraded_as_the_development_one_will_be(
+    cluster: Cluster, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    # The three disposable-cluster conditions of tests.database, checked explicitly here too:
+    # this test creates cluster-wide roles with the real names.
+    assert os.environ.get(DISPOSABLE_CLUSTER_VARIABLE) == "disposable"
+    server = _engine(cluster.server)
+    try:
+        async with server.connect() as connection:
+            marker = await connection.scalar(
+                text("SELECT current_setting(:name, true)"), {"name": DISPOSABLE_SERVER_SETTING}
+            )
+            assert marker == "disposable"
+            await assert_disposable_cluster(connection)  # also: not a migrated database
+    finally:
+        await server.dispose()
+
+    # The development database's state: migrated to 0007 by the admin superuser, with history.
+    url = await cluster.database("wiring_from_0007")  # unique; dropped by this test's cleanup
+    admin = _engine(url)
+    try:
+        await run_alembic(admin, lambda config: command.upgrade(config, "0007"))
+    finally:
+        await admin.dispose()
+    assert await _scalar(url, "SELECT version_num FROM alembic_version") == "0007"
+    await _seed_history_at_0007(url)
+    history = await _query(url, SEEDED_HISTORY)
+    # One user; three accounts (the two seeded settlement accounts, the user's); the deposit;
+    # its two entries.
+    assert len(history) == 1 + 3 + 1 + 2
+    before = {(r.kind, r.name): r.owner for r in await _query(url, OWNED_TABLES_AND_ROUTINES)}
+    assert set(before) == OBJECTS_AT_0007
+    assert set(before.values()) == {url.username}
+
+    # The real bootstrap CLI, the real names: exactly 0007's twelve objects change hands.
+    out = await _run_bootstrap_cli(url, monkeypatch, capsys)
+    assert f"objects transferred to {DEFAULT_ROLE_NAMES.owner}: {len(OBJECTS_AT_0007)}" in out
+    after_bootstrap = {
+        (r.kind, r.name): r.owner for r in await _query(url, OWNED_TABLES_AND_ROUTINES)
+    }
+    assert after_bootstrap == {key: DEFAULT_ROLE_NAMES.owner for key in OBJECTS_AT_0007}
+    assert await _scalar(url, "SELECT version_num FROM alembic_version") == "0007"
+
+    # 0008-0013, in one run of the real alembic command line, as ledger_owner.
+    await _migrate_as_owner(url)
+    await _assert_owned_by_ledger_owner(url)  # 0013, everything (new objects too) the owner's
+    # 0008/0009, run by the owner, pinned the search_path of the trigger functions that read
+    # tables (as 0010-0012 created theirs). The two that read nothing never needed it (ADR 0012).
+    configs = {
+        row.proname: row.proconfig
+        for row in await _query(
+            url,
+            "SELECT proname, proconfig FROM pg_proc WHERE pronamespace = 'public'::regnamespace "
+            "AND prorettype = 'trigger'::regtype",
+        )
+    }
+    reads_no_table = {"forbid_ledger_mutation", "forbid_audit_mutation"}
+    assert len(configs) == 7
+    assert {name: configs[name] for name in reads_no_table} == dict.fromkeys(reads_no_table)
+    assert all(
+        config == ["search_path=pg_catalog, pg_temp"]
+        for name, config in configs.items()
+        if name not in reads_no_table
+    ), configs
+
+    # The history from before survives, row for row.
+    assert await _query(url, SEEDED_HISTORY) == history
+    await _assert_runtime_privileges_are_the_matrix(url)
+
+    # The API, as ledger_app: guard passes, ready, and a full flow beside the old history.
     user_id = await _use_the_api_as_ledger_app(url)
     await _assert_consistent_and_audited(url, user_id)
