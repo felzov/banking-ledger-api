@@ -58,8 +58,9 @@ own database identity ([Database roles](#database-roles)):
 3. `migrate`, one-shot, as `ledger_owner`: `alembic upgrade head`;
 4. `api`, as `ledger_app`.
 
-**Existing volume** (created before Phase 10, where everything belongs to the admin): add
-`LEDGER_OWNER_PASSWORD` and `LEDGER_APP_PASSWORD` to `.env` (see `.env.example`), then
+**Existing volume** (created before Phase 10, where everything belongs to the admin): **back
+it up first** ([below](#back-up-before-upgrading-an-existing-database)). Then add
+`LEDGER_OWNER_PASSWORD` and `LEDGER_APP_PASSWORD` to `.env` (see `.env.example`), and run
 `make up`. The bootstrap transfers every object in `public` to `ledger_owner`, then migration
 0013 grants `ledger_app` its privileges; the data is untouched. Without those two variables
 Compose refuses to start and names the missing one.
@@ -71,6 +72,32 @@ To enable the git hooks, run this once from the repository root:
 ```bash
 banking-ledger-api/.venv/bin/pre-commit install
 ```
+
+### Back up before upgrading an existing database
+
+Before `make up`, `make migrate` or any other upgrade of a database that already holds data,
+take a backup and rehearse restoring it with `scripts/rehearse-backup-restore.sh`:
+
+```bash
+mkdir -m 700 ~/ledger-backups   # outside the repository, owned by you, mode 700
+scripts/rehearse-backup-restore.sh --backup-dir ~/ledger-backups             # plan only
+scripts/rehearse-backup-restore.sh --backup-dir ~/ledger-backups --execute   # back up, rehearse
+```
+
+- **Default (no `--execute`):** checks the arguments and the backup directory and prints the
+  plan. It runs no Docker or database command.
+- **`--execute`:** dumps the development database `ledger` read-only (`pg_dump`, plus the roles
+  without passwords), restores the dump into a new, uniquely named database on the disposable
+  test cluster (`test-db`, which must be running and marked: run `make test` once), compares the
+  copy with the source (schema, ownership, privileges, sequences, data) and checks the ledger's
+  integrity. It then drops that copy, only after re-checking the containers, the cluster and the
+  database's OID. Nothing is written to the development database.
+- **The backup files are kept** in the backup directory (mode 600): they are the backup.
+  Protect them like the database itself.
+- **A logical dump of one database, not a physical backup of the cluster.** Database-level
+  permissions and settings (e.g. who may `CONNECT`) are not in it; after a restore, the role
+  bootstrap re-applies the database-level revokes. The script rehearses a restore into a
+  separate database; it never restores over an existing one.
 
 ## Environment variables
 
