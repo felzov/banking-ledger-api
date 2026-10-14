@@ -820,5 +820,5 @@ API container's environment, and the server's view of who is connected and who o
 6. ✅ Idempotency and the HTTP posting API (deposits, withdrawals, transfers)
 7. ✅ REST API: statements, single transactions, `Location` on postings
 8. ✅ Authentication and authorization (password login, bearer tokens, ownership on every user-scoped route)
-9. Reliability (in progress: database outages answer `503`, pre-`COMMIT` and cancellation behaviour tested, failure handling documented)
-10. Security and observability (in progress: least-privilege database roles and their guards ✅; structured logging, request correlation, rate limiting to come)
+9. ✅ Reliability (in progress: database outages answer `503`, pre-`COMMIT` and cancellation behaviour tested, failure handling documented)
+10. ✅ Security and observability (in progress: least-privilege database roles and their guards ✅; structured logging, request correlation, rate limiting to come)
