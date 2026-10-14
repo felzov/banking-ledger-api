@@ -168,3 +168,13 @@ future hardening work for Phase 10 and are not part of Phase 5.
 - **Known gap for other errors.** `audit event not written (<error class>)` usually means the
   insert failed or no connection was obtained. If the error came from the event's own COMMIT
   (e.g. a lost connection), the row may exist despite the wording.
+
+## Amendment (Phase 10, 2026-10-14): the application no longer runs as a superuser (ADR 0015)
+
+The "application currently connects as a PostgreSQL superuser" limitation above is resolved.
+The API connects as `ledger_app`: it may `INSERT` audit events (on the columns it writes; never
+`occurred_at` or `id`) but holds no `SELECT`, `UPDATE`, `DELETE` or `TRUNCATE` on
+`audit_events`, so it can neither read nor rewrite the trail. Its insert no longer uses
+`RETURNING` (which would need `SELECT`). `request_id` stays NULL, and is not writable by the
+API, until request correlation grants it. Who can still rewrite the trail: the admin superuser
+and `ledger_owner`, neither of which the API holds.
