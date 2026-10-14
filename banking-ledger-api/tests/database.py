@@ -160,6 +160,9 @@ async def run_alembic(engine: AsyncEngine, operation: Callable[[Config], None]) 
     def run(connection: Connection) -> None:
         config = Config(str(ALEMBIC_INI))
         config.attributes["connection"] = connection
+        # The suite migrates its own disposable databases as a superuser (or, in the role tests,
+        # as an owner role): the exemption from env.py's superuser guard is Python-only.
+        config.attributes["allow_superuser_migrations"] = True
         operation(config)
 
     async with engine.begin() as connection:

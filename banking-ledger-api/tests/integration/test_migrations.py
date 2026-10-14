@@ -449,7 +449,7 @@ async def test_0010_upgrades_a_populated_0009_database_and_keyed_postings_work()
     assert url.database is not None
     await recreate_database(server_url, url.database)
     engine = create_async_engine(url, poolclass=NullPool)
-    app_engine = create_engine(settings_for(url))
+    app_engine = create_engine(settings_for(url), privilege_guard=False)  # superuser
     try:
         await run_alembic(engine, lambda config: command.upgrade(config, "0009"))
         async with engine.begin() as connection:

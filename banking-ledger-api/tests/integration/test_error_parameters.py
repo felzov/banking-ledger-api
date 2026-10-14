@@ -34,7 +34,7 @@ HIDDEN_MARKER = "[SQL parameters hidden due to hide_parameters=True]"
 @pytest.fixture
 async def app_engine(engine: AsyncEngine, test_database_url: URL) -> AsyncIterator[AsyncEngine]:
     # Depends on `engine` so the test database exists and is migrated.
-    app_engine = create_engine(settings_for(test_database_url))
+    app_engine = create_engine(settings_for(test_database_url), privilege_guard=False)
     try:
         yield app_engine
     finally:

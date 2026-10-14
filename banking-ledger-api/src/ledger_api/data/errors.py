@@ -13,6 +13,17 @@ class DatabaseUnavailableError(ConnectionError):
     """
 
 
+class PrivilegedDatabaseRoleError(DatabaseUnavailableError):
+    """The database role the application connected as is too powerful to serve requests with
+    (Phase 10, ADR 0015), or its privileges could not be verified: the connection is discarded.
+
+    A DatabaseUnavailableError, so every request that needs the database is answered like an
+    unreachable database (503 temporarily_unavailable, a generic body) and the readiness probe
+    reports unavailable. The reason is logged at CRITICAL, never sent to the client. The message
+    names no host, user or other connection parameter.
+    """
+
+
 def violated_constraint(error: IntegrityError) -> str | None:
     """Name of the constraint PostgreSQL reported, or None if it reported none.
 

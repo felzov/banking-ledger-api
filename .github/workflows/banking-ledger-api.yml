@@ -104,13 +104,15 @@ jobs:
           cache-from: type=gha
           cache-to: type=gha,mode=max
 
-      # Proves the image contains the migrations and that db -> migrate -> api start in order.
+      # The production start-up sequence on this job's own stack: db -> bootstrap (admin) ->
+      # migrate (ledger_owner) -> api (ledger_app), then an API flow and the server's view of who
+      # is connected and who owns the schema (scripts/compose-smoke.sh; `make smoke` locally).
       - name: Smoke-test the compose stack
+        env:
+          SMOKE_UP_ARGS: --no-build
         run: |
           cp .env.example .env
-          docker compose up --detach --no-build --wait --wait-timeout 120
-          curl --fail --silent --show-error http://127.0.0.1:8000/health/live
-          curl --fail --silent --show-error http://127.0.0.1:8000/health/ready
+          scripts/compose-smoke.sh
 
       - name: Show compose logs on failure
         if: failure()

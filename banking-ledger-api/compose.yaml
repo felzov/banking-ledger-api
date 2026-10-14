@@ -1,9 +1,17 @@
 name: banking-ledger
 
-# The app reaches PostgreSQL by its service name. Credentials come from .env (single source);
-# a password containing URL-reserved characters (@ : / ?) would need percent-encoding here.
-x-database-url: &database-url
-  DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+# Three roles, three URLs (ADR 0015), each given only to the service that needs it:
+# - admin (POSTGRES_USER, the bootstrap superuser): the db itself and the one-shot bootstrap;
+# - ledger_owner: owns every object, runs the migrations;
+# - ledger_app: the API's only identity (a member of ledger_runtime, migration 0013's grants).
+# Start order: db healthy -> bootstrap -> migrate -> api. Passwords come from .env and are
+# written into URLs unescaped: use letters, digits and . _ ~ - only.
+x-admin-database-url: &admin-database-url
+  ADMIN_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
+x-owner-database-url: &owner-database-url
+  DATABASE_URL: postgresql+asyncpg://ledger_owner:${LEDGER_OWNER_PASSWORD:?set LEDGER_OWNER_PASSWORD in .env}@db:5432/${POSTGRES_DB}
+x-app-database-url: &app-database-url
+  DATABASE_URL: postgresql+asyncpg://ledger_app:${LEDGER_APP_PASSWORD:?set LEDGER_APP_PASSWORD in .env}@db:5432/${POSTGRES_DB}
 
 services:
   db:
@@ -25,16 +33,35 @@ services:
       retries: 10
       start_period: 10s
 
-  # One-shot: applies migrations, then exits. Never done at API startup, where several
-  # workers or replicas would race to migrate the same database.
+  # One-shot, as the admin: creates or reconciles ledger_owner, ledger_runtime and ledger_app,
+  # restricts the database, and on an existing volume transfers the objects to ledger_owner
+  # (python -m ledger_api.admin.bootstrap, idempotent). The only service with the admin URL.
+  bootstrap:
+    image: ${LEDGER_IMAGE:-banking-ledger-api:dev}
+    build:
+      context: .
+      target: runtime
+    command: ["python", "-m", "ledger_api.admin.bootstrap"]
+    environment:
+      <<: *admin-database-url
+      LEDGER_OWNER_PASSWORD: ${LEDGER_OWNER_PASSWORD:?set LEDGER_OWNER_PASSWORD in .env}
+      LEDGER_APP_PASSWORD: ${LEDGER_APP_PASSWORD:?set LEDGER_APP_PASSWORD in .env}
+    depends_on:
+      db:
+        condition: service_healthy
+    restart: "no"
+
+  # One-shot, as ledger_owner: applies migrations, then exits (migrations/env.py refuses a
+  # superuser). Never done at API startup, where several workers or replicas would race to
+  # migrate the same database.
   migrate:
-    image: banking-ledger-api:dev
+    image: ${LEDGER_IMAGE:-banking-ledger-api:dev}
     build:
       context: .
       target: runtime
     command: ["alembic", "upgrade", "head"]
     environment:
-      <<: *database-url
+      <<: *owner-database-url
       APP_ENV: ${APP_ENV:-development}
     volumes:
       # Edited migrations apply without rebuilding the image.
@@ -42,15 +69,19 @@ services:
     depends_on:
       db:
         condition: service_healthy
+      bootstrap:
+        condition: service_completed_successfully
     restart: "no"
 
+  # As ledger_app: no admin or owner credential in its environment, and every new database
+  # connection is refused if its role turns out to be privileged (data/engine.py).
   api:
-    image: banking-ledger-api:dev
+    image: ${LEDGER_IMAGE:-banking-ledger-api:dev}
     build:
       context: .
       target: runtime
     environment:
-      <<: *database-url
+      <<: *app-database-url
       APP_ENV: ${APP_ENV:-development}
       # Mounted source shadows the installed package so --reload picks up edits.
       PYTHONPATH: /app/src
@@ -74,8 +105,10 @@ services:
 
   # The test suite's own cluster (`make test`), never the development database: data on tmpfs, so
   # nothing survives the container, and the tests may create the cluster-wide roles migrations
-  # grant to (tests/database.py checks LEDGER_TEST_CLUSTER=disposable first). Profile "test":
-  # `make up` does not start it.
+  # grant to. tests/database.py refuses to create a database or role unless all three hold:
+  # LEDGER_TEST_CLUSTER=disposable in the test process's environment, the server-side marker
+  # ledger.test_cluster=disposable (set by `make test` on this service), and a database with no
+  # applied migrations. Profile "test": `make up` does not start it.
   test-db:
     image: postgres:18-alpine
     profiles: ["test"]

@@ -12,7 +12,10 @@ from ledger_api.data.engine import create_engine, create_sessionmaker
 from ledger_api.domain.passwords import make_hasher
 
 
-def create_app(settings: Settings | None = None) -> FastAPI:
+def create_app(settings: Settings | None = None, *, privilege_guard: bool = True) -> FastAPI:
+    """The application. uvicorn calls it with no argument (--factory), so the database
+    privilege guard is always on in a served process; privilege_guard=False is a Python-only hook
+    for tests that deliberately connect as a superuser (ADR 0015)."""
     # Loading settings here makes a misconfigured process fail at startup, not on first request.
     settings = settings or Settings()
 
@@ -21,7 +24,7 @@ def create_app(settings: Settings | None = None) -> FastAPI:
         # One engine (and connection pool) per process, created here rather than at import time
         # so tests and workers each get their own. Creating it opens no connection, so the app
         # starts (and /health/live answers) even while the database is down.
-        engine = create_engine(settings)
+        engine = create_engine(settings, privilege_guard=privilege_guard)
         app.state.engine = engine
         app.state.sessionmaker = create_sessionmaker(engine)
         try:
