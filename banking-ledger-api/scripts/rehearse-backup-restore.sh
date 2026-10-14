@@ -11,7 +11,8 @@
 #   scripts/rehearse-backup-restore.sh --backup-dir DIR                # plan only (the default)
 #   scripts/rehearse-backup-restore.sh --backup-dir DIR --execute      # do it
 #   scripts/rehearse-backup-restore.sh --backup-dir DIR --execute --keep-restored
-#   scripts/rehearse-backup-restore.sh --execute --cleanup NAME --expected-oid OID
+#   scripts/rehearse-backup-restore.sh --execute --cleanup NAME --expected-oid OID \
+#     --expected-cluster SYSTEM_IDENTIFIER
 #
 # Without --execute nothing runs: no docker command, no database contact. With it, every step is
 # gated: the containers and servers are identified first (compose labels, image, storage, system
@@ -24,6 +25,10 @@
 # POSTGRES_USER (trusted locally), so no password or URL is read, passed or printed. The role dump
 # uses --no-role-passwords. The optional bootstrap-and-upgrade rehearsal of the restored copy is
 # deliberately not implemented here.
+#
+# Not covered: database-level properties of `ledger` (its ACL, e.g. CONNECT, and ALTER DATABASE
+# settings). pg_dump without --create does not dump them, so they are neither restored nor
+# compared; after a real restore the role bootstrap re-applies the database-level revokes.
 set -euo pipefail
 set -o noclobber # never overwrite a file through a redirection
 
@@ -43,7 +48,10 @@ keep_restored=false
 backup_dir=""
 cleanup_name=""
 expected_oid=""
-leftover="" # "name oid" of the database this run created and has not yet dropped or kept
+expected_cluster=""
+dev_cluster="" # system identifiers, set by verify_containers
+test_cluster=""
+leftover="" # "name oid cluster" of the database this run created and has not yet dropped or kept
 
 # Whatever ends the run (a refusal, a failure, an interruption): if this run's database is still
 # there, say so and how to remove it, gated. Never removes anything by itself.
@@ -51,8 +59,8 @@ report_leftover() {
   local status=$?
   if [ -n "$leftover" ]; then
     set -- $leftover
-    printf 'rehearsal: %s (OID %s) was left on %s; remove it with:\n  %s --execute --cleanup %s --expected-oid %s\n' \
-      "$1" "$2" "$TEST_CONTAINER" "$0" "$1" "$2" >&2
+    printf 'rehearsal: %s (OID %s) was left on %s; remove it with:\n  %s --execute --cleanup %s --expected-oid %s --expected-cluster %s\n' \
+      "$1" "$2" "$TEST_CONTAINER" "$0" "$1" "$2" "$3" >&2
   fi
   exit "$status"
 }
@@ -68,7 +76,7 @@ fail() {
   printf 'rehearsal: FAILED: %s\n' "$*" >&2
   exit 1
 }
-usage() { sed -n '2,25p' "$0" | sed 's/^# \{0,1\}//'; }
+usage() { sed -n '2,31p' "$0" | sed 's/^# \{0,1\}//'; }
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -77,6 +85,7 @@ while [ $# -gt 0 ]; do
     --keep-restored) keep_restored=true; shift ;;
     --cleanup) cleanup_name="${2:?--cleanup needs a database name}"; shift 2 ;;
     --expected-oid) expected_oid="${2:?--expected-oid needs an OID}"; shift 2 ;;
+    --expected-cluster) expected_cluster="${2:?--expected-cluster needs a system identifier}"; shift 2 ;;
     -h | --help) usage; exit 0 ;;
     *) usage >&2; refuse "unknown argument: $1" ;;
   esac
@@ -85,14 +94,14 @@ done
 # --- read-only helpers (used only with --execute) ---------------------------------------------
 
 # Run SQL inside a container, as its POSTGRES_USER over the local socket. read_only: the server
-# refuses any write in that session (default_transaction_read_only=on).
-psql_in() { # container database read_only sql
-  local container=$1 database=$2 read_only=$3 sql=$4 options=""
-  [ "$read_only" = read-only ] && options="-c default_transaction_read_only=on"
+# refuses any write in that session (default_transaction_read_only=on). settings: more -c options.
+psql_in() { # container database read_only sql [settings]
+  local container=$1 database=$2 read_only=$3 sql=$4 options=${5:-}
+  [ "$read_only" = read-only ] && options="-c default_transaction_read_only=on $options"
   docker exec -e PGOPTIONS="$options" "$container" sh -c \
     'psql -U "$POSTGRES_USER" -d "$1" -X -A -t -q -v ON_ERROR_STOP=1 -c "$2"' sh "$database" "$sql"
 }
-ro() { psql_in "$1" "$2" read-only "$3"; }
+ro() { psql_in "$1" "$2" read-only "$3" "${4:-}"; }
 
 inspect() { docker inspect --format "$2" "$1" 2>/dev/null || refuse "container $1 not found"; }
 
@@ -117,18 +126,19 @@ verify_containers() {
 
   # The servers: the test one carries the disposable marker, the development one does not, and
   # they are different clusters (system identifiers, unique per initdb).
-  local marker dev_marker dev_id test_id
+  local marker dev_marker
   marker=$(ro "$TEST_CONTAINER" postgres "SELECT current_setting('$DISPOSABLE_SETTING', true)")
   [ "$marker" = "$DISPOSABLE_VALUE" ] \
     || refuse "$TEST_CONTAINER lacks $DISPOSABLE_SETTING=$DISPOSABLE_VALUE (run make test once)"
   dev_marker=$(ro "$DEV_CONTAINER" postgres "SELECT current_setting('$DISPOSABLE_SETTING', true)")
   [ -z "$dev_marker" ] || refuse "$DEV_CONTAINER carries the disposable marker: wrong container?"
-  dev_id=$(ro "$DEV_CONTAINER" postgres "SELECT system_identifier FROM pg_control_system()")
-  test_id=$(ro "$TEST_CONTAINER" postgres "SELECT system_identifier FROM pg_control_system()")
-  [ -n "$dev_id" ] && [ -n "$test_id" ] || refuse "could not read the system identifiers"
-  [ "$dev_id" != "$test_id" ] || refuse "development and test containers are the same cluster"
-  say "verified: $DEV_CONTAINER (service $DEV_SERVICE, cluster $dev_id)"
-  say "verified: $TEST_CONTAINER (service $TEST_SERVICE, tmpfs, marked, cluster $test_id)"
+  dev_cluster=$(ro "$DEV_CONTAINER" postgres "SELECT system_identifier FROM pg_control_system()")
+  test_cluster=$(ro "$TEST_CONTAINER" postgres "SELECT system_identifier FROM pg_control_system()")
+  [[ "$dev_cluster" =~ ^[0-9]+$ && "$test_cluster" =~ ^[0-9]+$ ]] \
+    || refuse "could not read the system identifiers"
+  [ "$dev_cluster" != "$test_cluster" ] || refuse "development and test containers are the same cluster"
+  say "verified: $DEV_CONTAINER (service $DEV_SERVICE, cluster $dev_cluster)"
+  say "verified: $TEST_CONTAINER (service $TEST_SERVICE, tmpfs, marked, cluster $test_cluster)"
 }
 
 major_of_tool() { docker exec "$1" "$2" --version | sed -E 's/.* ([0-9]+)(\.[0-9]+)*.*/\1/'; }
@@ -167,11 +177,15 @@ verify_backup_dir() {
 
 # --- cleanup: drop exactly the database this rehearsal created ------------------------------------
 
-drop_rehearsal_database() { # name oid
-  local name=$1 oid=$2 current
+# An OID is unique only within one cluster: the database is identified by both.
+drop_rehearsal_database() { # name oid cluster
+  local name=$1 oid=$2 cluster=$3 current
   [[ "$name" =~ $TARGET_PATTERN ]] || refuse "refusing to drop $name: not a rehearsal database name"
   [[ "$oid" =~ ^[0-9]+$ ]] || refuse "refusing to drop $name: no recorded OID"
+  [[ "$cluster" =~ ^[0-9]+$ ]] || refuse "refusing to drop $name: no recorded cluster"
   verify_containers # again, right before the drop
+  [ "$test_cluster" = "$cluster" ] \
+    || refuse "refusing to drop $name: $TEST_CONTAINER is cluster $test_cluster, not the recorded $cluster"
   current=$(database_oid "$TEST_CONTAINER" "$name")
   [ "$current" = "$oid" ] \
     || refuse "refusing to drop $name: its OID is '${current:-none}', not the recorded $oid"
@@ -186,8 +200,10 @@ if [ -n "$cleanup_name" ]; then
   [[ "$cleanup_name" =~ $TARGET_PATTERN ]] \
     || refuse "refusing to drop $cleanup_name: not a rehearsal database name"
   [[ "$expected_oid" =~ ^[0-9]+$ ]] || refuse "refusing to drop $cleanup_name: --expected-oid is required"
-  $execute || { say "plan: would verify the containers, then drop $cleanup_name only if its OID is $expected_oid (add --execute)"; exit 0; }
-  drop_rehearsal_database "$cleanup_name" "$expected_oid"
+  [[ "$expected_cluster" =~ ^[0-9]+$ ]] \
+    || refuse "refusing to drop $cleanup_name: --expected-cluster is required"
+  $execute || { say "plan: would verify the containers, then drop $cleanup_name only if its OID is $expected_oid on cluster $expected_cluster (add --execute)"; exit 0; }
+  drop_rehearsal_database "$cleanup_name" "$expected_oid" "$expected_cluster"
   exit 0
 fi
 
@@ -200,7 +216,7 @@ target="ledger_restore_rehearsal_${stamp}_test"
 dump_file="$backup_dir/ledger-$stamp.dump"
 roles_file="$backup_dir/roles-$stamp.sql"
 sums_file="$backup_dir/SHA256SUMS-$stamp"
-for file in "$dump_file" "$roles_file" "$sums_file"; do
+for file in "$dump_file" "$dump_file.partial" "$roles_file" "$roles_file.partial" "$sums_file"; do
   [ ! -e "$file" ] || refuse "$file already exists"
 done
 
@@ -230,9 +246,14 @@ verify_versions
 
 say "backing up $DEV_DATABASE (read-only)"
 docker exec -e PGOPTIONS="-c default_transaction_read_only=on" "$DEV_CONTAINER" sh -c \
-  'pg_dump -U "$POSTGRES_USER" -d "$1" --format=custom' sh "$DEV_DATABASE" >"$dump_file"
+  'pg_dump -U "$POSTGRES_USER" -d "$1" --format=custom' sh "$DEV_DATABASE" >"$dump_file.partial" \
+  || fail "pg_dump failed; $dump_file.partial is incomplete and not a backup"
 docker exec -e PGOPTIONS="-c default_transaction_read_only=on" "$DEV_CONTAINER" sh -c \
-  'pg_dumpall -U "$POSTGRES_USER" --roles-only --no-role-passwords' >"$roles_file"
+  'pg_dumpall -U "$POSTGRES_USER" --roles-only --no-role-passwords' >"$roles_file.partial" \
+  || fail "pg_dumpall failed; $roles_file.partial is incomplete and not a backup"
+# Only a complete dump gets the final name.
+mv -n -- "$dump_file.partial" "$dump_file"
+mv -n -- "$roles_file.partial" "$roles_file"
 chmod 600 "$dump_file" "$roles_file"
 (cd "$backup_dir" && sha256sum "$(basename "$dump_file")" "$(basename "$roles_file")") >"$sums_file"
 chmod 600 "$sums_file"
@@ -245,7 +266,7 @@ say "backup written and checked: $(basename "$dump_file") ($(grep -c ' TABLE pub
 psql_in "$TEST_CONTAINER" postgres read-write "CREATE DATABASE \"$target\""
 oid=$(database_oid "$TEST_CONTAINER" "$target")
 [[ "$oid" =~ ^[0-9]+$ ]] || fail "created $target but could not read its OID: drop it by hand"
-leftover="$target $oid"
+leftover="$target $oid $test_cluster"
 say "created $target (OID $oid) on $TEST_CONTAINER"
 
 docker exec -i "$TEST_CONTAINER" sh -c \
@@ -254,7 +275,11 @@ docker exec -i "$TEST_CONTAINER" sh -c \
 say "restored into $target"
 
 # --- compare, read-only ----------------------------------------------------------------------------
+# Byte-stable on both servers: lines sorted and rows ordered by "C" collation, and the settings
+# that change how a row prints (timestamptz above all) pinned for the session.
+FINGERPRINT_SETTINGS="-c TimeZone=UTC -c DateStyle=ISO -c IntervalStyle=postgres -c extra_float_digits=1 -c bytea_output=hex"
 read -r -d '' FINGERPRINTS <<'SQL' || true
+SELECT line FROM (
 SELECT 'revision ' || version_num FROM alembic_version
 UNION ALL
 SELECT format('column %s.%s %s %s notnull=%s default=%s identity=%s', c.relname, a.attnum,
@@ -301,13 +326,14 @@ SELECT format('data %s rows=%s md5=%s', relname,
               (xpath('/row/n/text()', query_to_xml(format(
                   'SELECT count(*) AS n FROM public.%I', relname), false, true, '')))[1],
               (xpath('/row/h/text()', query_to_xml(format(
-                  'SELECT md5(coalesce(string_agg(t::text, ''|'' ORDER BY t::text), '''')) AS h '
-                  'FROM public.%I t', relname), false, true, '')))[1])
+                  'SELECT md5(coalesce(string_agg(t::text, ''|'' ORDER BY t::text COLLATE "C"), '''')) '
+                  'AS h FROM public.%I t', relname), false, true, '')))[1])
   FROM pg_class WHERE relnamespace = 'public'::regnamespace AND relkind = 'r'
-ORDER BY 1
+) fingerprint(line)
+ORDER BY line COLLATE "C"
 SQL
-source_fingerprint=$(ro "$DEV_CONTAINER" "$DEV_DATABASE" "$FINGERPRINTS")
-copy_fingerprint=$(ro "$TEST_CONTAINER" "$target" "$FINGERPRINTS")
+source_fingerprint=$(ro "$DEV_CONTAINER" "$DEV_DATABASE" "$FINGERPRINTS" "$FINGERPRINT_SETTINGS")
+copy_fingerprint=$(ro "$TEST_CONTAINER" "$target" "$FINGERPRINTS" "$FINGERPRINT_SETTINGS")
 [ -n "$source_fingerprint" ] || fail "empty fingerprint of the source"
 if [ "$source_fingerprint" != "$copy_fingerprint" ]; then
   diff <(printf '%s\n' "$source_fingerprint") <(printf '%s\n' "$copy_fingerprint") >&2 || true
@@ -334,9 +360,9 @@ violations=$(ro "$TEST_CONTAINER" "$target" "$INTEGRITY")
 say "integrity of the copy: balances, ledgers and transactions consistent"
 
 if $keep_restored; then
-  say "kept $target (OID $oid). Remove it with: $0 --execute --cleanup $target --expected-oid $oid"
+  say "kept $target (OID $oid). Remove it with: $0 --execute --cleanup $target --expected-oid $oid --expected-cluster $test_cluster"
 else
-  drop_rehearsal_database "$target" "$oid"
+  drop_rehearsal_database "$target" "$oid" "$test_cluster"
 fi
 leftover=""
 say "OK. Backup kept: $dump_file, $roles_file, $sums_file"
