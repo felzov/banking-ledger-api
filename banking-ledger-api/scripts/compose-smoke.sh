@@ -40,7 +40,10 @@ step "bootstrap and migrate completed"
 
 curl --fail --silent --show-error "$api/health/live" >/dev/null
 curl --fail --silent --show-error "$api/health/ready" >/dev/null || fail "the API is not ready"
-step "the API is live and ready"
+# Every response carries the request's id (ADR 0017).
+curl --fail --silent --show-error --include "$api/health/live" | grep -qi '^x-request-id: ' \
+  || fail "no X-Request-ID header"
+step "the API is live and ready, and answers with request ids"
 
 # --- an API flow, as a client ------------------------------------------------------------------
 token=$(python3 -c "import secrets; print(secrets.token_hex(4))")
@@ -79,7 +82,7 @@ owners=$(sql "SELECT string_agg(DISTINCT pg_get_userbyid(owner), ',') FROM (
                 UNION SELECT proowner FROM pg_proc WHERE pronamespace = 'public'::regnamespace) o")
 [ "$owners" = ledger_owner ] || fail "public is owned by: $owners"
 version=$(sql "SELECT version_num FROM alembic_version")
-[ "$version" = 0013 ] || fail "schema version $version"
+[ "$version" = 0014 ] || fail "schema version $version"
 privileged=$(sql "SELECT count(*) FROM pg_roles
                   WHERE rolname IN ('ledger_owner', 'ledger_app', 'ledger_runtime')
                     AND (rolsuper OR rolcreaterole OR rolcreatedb OR rolbypassrls OR rolreplication)")

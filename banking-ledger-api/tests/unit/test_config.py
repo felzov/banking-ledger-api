@@ -142,3 +142,21 @@ def test_argon2_memory_must_cover_every_lane(monkeypatch: pytest.MonkeyPatch) ->
 
     with pytest.raises(ValidationError, match="8 x ARGON2_PARALLELISM"):
         Settings()
+
+
+# --- logging (ADR 0017) ---------------------------------------------------------------------------
+
+
+def test_log_level_defaults_to_info_and_ignores_case(monkeypatch: pytest.MonkeyPatch) -> None:
+    assert Settings().log_level == "INFO"
+
+    monkeypatch.setenv("LOG_LEVEL", "debug")
+
+    assert Settings().log_level == "DEBUG"
+
+
+def test_an_unknown_log_level_is_refused(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("LOG_LEVEL", "LOUD")
+
+    with pytest.raises(ValidationError):
+        Settings()

@@ -37,6 +37,7 @@ from ledger_api.domain.errors import (
     TemporarilyUnavailableError,
     UnavailableError,
 )
+from ledger_api.observability.correlation import current_request_id
 
 logger = logging.getLogger(__name__)
 
@@ -52,6 +53,9 @@ class AuditContext:
     attempted_transaction_id: uuid.UUID | None = None
     # Postings only: the request's Idempotency-Key, recorded on every outcome (ADR 0006).
     idempotency_key: str | None = None
+    # The request being served when the call began (ADR 0017): every event of the call records
+    # it. None outside a request (a service called directly, e.g. by a test).
+    request_id: str | None = field(default_factory=current_request_id)
 
     def succeeded(
         self,
@@ -71,6 +75,7 @@ class AuditContext:
             transaction_id=transaction_id,
             details={**self.details, **(created or {})},
             idempotency_key=self.idempotency_key,
+            request_id=self.request_id,
         )
 
     def rejected(self, error: DomainError) -> AuditRecord:
@@ -81,6 +86,7 @@ class AuditContext:
             reason=error.code,
             details=self.details,
             idempotency_key=self.idempotency_key,
+            request_id=self.request_id,
         )
 
     def failed(self, error: Exception) -> AuditRecord:
@@ -95,6 +101,7 @@ class AuditContext:
             reason=reason,
             details=details,
             idempotency_key=self.idempotency_key,
+            request_id=self.request_id,
         )
 
 
@@ -167,7 +174,7 @@ def _log_lost(
     # certain=False: the event's COMMIT was interrupted, so it may exist after all.
     logger.error(
         "audit event %s (%s): action=%s outcome=%s reason=%s actor_user_id=%s "
-        "idempotency_key=%s details=%s",
+        "idempotency_key=%s request_id=%s details=%s",
         "not written" if certain else "possibly not written",
         cause,
         record.action,
@@ -175,6 +182,7 @@ def _log_lost(
         record.reason,
         record.actor_user_id,
         record.idempotency_key,
+        record.request_id,
         dict(record.details),
         exc_info=error,
     )

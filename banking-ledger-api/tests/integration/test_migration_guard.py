@@ -31,7 +31,7 @@ from tests.integration.test_role_bootstrap import (
 )
 
 REFUSAL = "refusing to run migrations as a PostgreSQL superuser"
-HEAD = "0013"
+HEAD = "0014"
 
 
 @pytest.fixture

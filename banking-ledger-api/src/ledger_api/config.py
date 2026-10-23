@@ -32,6 +32,14 @@ class Settings(BaseSettings):
     # database's 24-hour cap (ck_auth_sessions_expiry_window).
     auth_session_ttl_seconds: int = Field(1_800, ge=60, le=86_400)
 
+    # Level of the JSON log lines on stderr (ADR 0017), for the application and its libraries.
+    log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
+
+    @field_validator("log_level", mode="before")
+    @classmethod
+    def _log_level_in_capitals(cls, value: object) -> object:
+        return value.upper() if isinstance(value, str) else value
+
     @field_validator("database_url")
     @classmethod
     def _require_asyncpg_driver(cls, value: SecretStr) -> SecretStr:

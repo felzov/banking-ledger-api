@@ -20,6 +20,10 @@ from ledger_api.domain.errors import (
     TemporarilyUnavailableError,
     UnavailableError,
 )
+from ledger_api.observability.correlation import current_request_id
+
+# The response header carrying the request's id (api.middleware, ADR 0017).
+REQUEST_ID_HEADER = "X-Request-ID"
 
 # Domain errors are mapped by category, so a new error type needs no change here.
 STATUS_BY_CATEGORY: dict[type[DomainError], int] = {
@@ -154,10 +158,14 @@ async def _database_unavailable(request: Request, exc: Exception) -> JSONRespons
 
 async def _unexpected_error(request: Request, exc: Exception) -> JSONResponse:
     # Starlette re-raises the exception after sending this response, so the server logs the
-    # traceback; nothing about it reaches the client.
+    # traceback; nothing about it reaches the client. Starlette answers this one outside the
+    # request middleware, so the request id header is added here (api.middleware).
     body = ErrorResponse(code="internal_error", detail="Internal server error.")
+    request_id = current_request_id()
     return JSONResponse(
-        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, content=body.model_dump()
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content=body.model_dump(),
+        headers={REQUEST_ID_HEADER: request_id} if request_id is not None else None,
     )
 
 

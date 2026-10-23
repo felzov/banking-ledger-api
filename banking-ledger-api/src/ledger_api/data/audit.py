@@ -30,7 +30,7 @@ async def insert_audit_event(session: AsyncSession, record: AuditRecord) -> None
         )
     # inline(): no implicit RETURNING of the generated id, which nothing here needs. RETURNING
     # requires SELECT, and the application's role may write audit events but never read them
-    # (migration 0013).
+    # (migration 0013). request_id is writable since migration 0014 (ADR 0017).
     await session.execute(
         insert(AuditEvent)
         .values(
@@ -40,6 +40,7 @@ async def insert_audit_event(session: AsyncSession, record: AuditRecord) -> None
             reason=record.reason,
             transaction_id=record.transaction_id,
             idempotency_key=record.idempotency_key,
+            request_id=record.request_id,
             details=stored_details,
         )
         .inline()
