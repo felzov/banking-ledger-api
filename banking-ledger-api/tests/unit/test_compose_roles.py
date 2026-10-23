@@ -35,7 +35,8 @@ def _text(environment: dict[str, str]) -> str:
 
 def test_the_api_gets_only_the_app_role(services: dict[str, Any]) -> None:
     environment = _environment(services["api"])
-    assert set(environment) == {"DATABASE_URL", "APP_ENV", "PYTHONPATH"}
+    # REDIS_URL: the rate limits' counters (ADR 0016), no database credential.
+    assert set(environment) == {"DATABASE_URL", "APP_ENV", "PYTHONPATH", "REDIS_URL"}
     assert environment["DATABASE_URL"].startswith("postgresql+asyncpg://ledger_app:")
     everything = _text(environment)
     for reference in (*ADMIN_REFERENCES, OWNER_REFERENCE):
@@ -63,6 +64,20 @@ def test_only_the_bootstrap_gets_the_admin(services: dict[str, Any]) -> None:
         name for name, service in services.items() if "ADMIN_DATABASE_URL" in _environment(service)
     }
     assert holders == {"bootstrap"}
+
+
+def test_redis_holds_no_credential_and_is_reached_by_the_api_only(
+    services: dict[str, Any],
+) -> None:
+    # Rate-limit counters only (ADR 0008): no database credential, no host port, no persistence.
+    redis = services["redis"]
+    everything = _text(_environment(redis))
+    for reference in (*ADMIN_REFERENCES, OWNER_REFERENCE, APP_REFERENCE):
+        assert reference not in everything
+    assert "ports" not in redis
+    assert redis["command"][redis["command"].index("--appendonly") + 1] == "no"
+    assert _environment(services["api"])["REDIS_URL"] == "redis://redis:6379/0"
+    assert services["api"]["depends_on"]["redis"] == {"condition": "service_healthy"}
 
 
 def test_start_order_is_db_bootstrap_migrate_api(services: dict[str, Any]) -> None:

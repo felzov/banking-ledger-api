@@ -46,7 +46,7 @@ from tests.database import (
 
 OWNER_PASSWORD = SecretStr("synthetic-owner-password-0001")
 APP_PASSWORD = SecretStr("synthetic-app-password-000001")
-HEAD = "0013"
+HEAD = "0014"
 # Migration 0013 grants the helper to this cluster-wide group (created by tests.database).
 RUNTIME_GROUP = "ledger_runtime"
 PINNED_SEARCH_PATH = ["search_path=pg_catalog, pg_temp"]

@@ -47,6 +47,10 @@ INTERNAL_ERROR = "internal_error"
 # Stable, machine-readable codes: the same shape as DomainError.code.
 REASON_PATTERN = re.compile(r"[a-z][a-z0-9_]{0,63}")
 
+# The id of the request that caused an event (ADR 0017): server-generated, but checked here so a
+# value that could break a log line never reaches the trail. Within the column's 1-128 CHECK.
+REQUEST_ID_PATTERN = re.compile(r"[0-9A-Za-z._-]{1,128}")
+
 # Upper bound on the JSON text of `details` (ck_audit_events_details_size). Details are a few
 # identifiers and numbers; the bound stops an event from becoming a data dump.
 MAX_DETAILS_BYTES = 2048
@@ -90,6 +94,8 @@ class AuditRecord:
     # The request's Idempotency-Key, if it had one (ADR 0006). Stored in its own column, never
     # in details.
     idempotency_key: str | None = None
+    # The id of the HTTP request it happened in (ADR 0017); None outside a request.
+    request_id: str | None = None
 
     def __post_init__(self) -> None:
         # Inconsistent events are programming errors, like a malformed Posting: ValueError.
@@ -105,6 +111,8 @@ class AuditRecord:
         # Stricter than ck_audit_events_idempotency_key_length (1-255): the key format itself.
         if self.idempotency_key is not None and not is_valid_idempotency_key(self.idempotency_key):
             raise ValueError("an idempotency key must be 1-255 visible ASCII characters")
+        if self.request_id is not None and not REQUEST_ID_PATTERN.fullmatch(self.request_id):
+            raise ValueError("a request id must be 1-128 letters, digits, '.', '_' or '-'")
 
         details = {key: _json_scalar(value) for key, value in self.details.items()}
         if not all(isinstance(key, str) for key in details):

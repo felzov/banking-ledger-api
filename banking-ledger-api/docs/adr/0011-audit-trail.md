@@ -178,3 +178,11 @@ The API connects as `ledger_app`: it may `INSERT` audit events (on the columns i
 `RETURNING` (which would need `SELECT`). `request_id` stays NULL, and is not writable by the
 API, until request correlation grants it. Who can still rewrite the trail: the admin superuser
 and `ledger_owner`, neither of which the API holds.
+
+## Amendment (Phase 10, 2026-10-23): request ids (ADR 0017)
+
+`request_id` now records the HTTP request an event happened in (NULL outside a request), and the
+fallback log line of an event that could not be written names it too. Migration 0014 grants the
+runtime group `INSERT` on that column only; the API still cannot read the trail. Requests refused
+by a rate limit are not audited (ADR 0016).
+See [ADR 0017](0017-structured-logs-and-request-correlation.md).

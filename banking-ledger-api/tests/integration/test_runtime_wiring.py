@@ -88,7 +88,7 @@ async def _migrate_as_owner(url: URL) -> None:
 
 
 async def _assert_owned_by_ledger_owner(url: URL) -> None:
-    assert await _scalar(url, "SELECT version_num FROM alembic_version") == "0013"
+    assert await _scalar(url, "SELECT version_num FROM alembic_version") == "0014"
     assert await _owners_in_public(url) == {DEFAULT_ROLE_NAMES.owner}
     roles = {
         row.rolname: row
@@ -206,7 +206,7 @@ async def test_an_existing_volume_upgraded_in_place(
     await _assert_consistent_and_audited(url, user_id)
 
 
-# --- the development volume's own path: 0007 -> bootstrap -> 0008-0013 ------------------------
+# --- the development volume's own path: 0007 -> bootstrap -> 0008-0014 ------------------------
 
 # Every table and routine migration 0007 leaves in public: what the bootstrap must transfer.
 OBJECTS_AT_0007 = {
@@ -354,9 +354,9 @@ async def test_a_0007_volume_bootstrapped_and_upgraded_as_the_development_one_wi
     assert after_bootstrap == {key: DEFAULT_ROLE_NAMES.owner for key in OBJECTS_AT_0007}
     assert await _scalar(url, "SELECT version_num FROM alembic_version") == "0007"
 
-    # 0008-0013, in one run of the real alembic command line, as ledger_owner.
+    # 0008-0014, in one run of the real alembic command line, as ledger_owner.
     await _migrate_as_owner(url)
-    await _assert_owned_by_ledger_owner(url)  # 0013, everything (new objects too) the owner's
+    await _assert_owned_by_ledger_owner(url)  # 0014, everything (new objects too) the owner's
     # 0008/0009, run by the owner, pinned the search_path of the trigger functions that read
     # tables (as 0010-0012 created theirs). The two that read nothing never needed it (ADR 0012).
     configs = {

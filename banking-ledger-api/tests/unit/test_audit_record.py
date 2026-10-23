@@ -19,6 +19,7 @@ from ledger_api.domain.errors import (
     InsufficientFundsError,
     TemporarilyUnavailableError,
 )
+from ledger_api.observability.correlation import bind_request_id, unbind_request_id
 from ledger_api.services.audit import AuditContext
 
 ACTOR = uuid.uuid7()
@@ -228,3 +229,44 @@ def test_errors_without_a_cause_record_no_cause_type() -> None:
 
     assert "cause_type" not in context.failed(RuntimeError(CONNECTION_DETAILS)).details
     assert "cause_type" not in context.failed(TemporarilyUnavailableError()).details
+
+
+# --- the request id (ADR 0017) --------------------------------------------------------------------
+
+
+@pytest.mark.parametrize(
+    "request_id",
+    ["", "x" * 129, "has space", "line\nbreak", 'quote"d', "ünïcode"],
+    ids=["empty", "too-long", "space", "newline", "quote", "non-ascii"],
+)
+def test_a_malformed_request_id_is_refused(request_id: str) -> None:
+    with pytest.raises(ValueError, match="request id"):
+        AuditRecord(
+            AuditAction.USER_REGISTER,
+            AuditOutcome.REJECTED,
+            reason="email_already_registered",
+            request_id=request_id,
+        )
+
+
+def test_an_audit_context_records_the_request_it_began_in_on_every_outcome() -> None:
+    token = bind_request_id("0199f6c2-7b1e-7c3a-9d4e-5f6a7b8c9d0e")
+    try:
+        context = AuditContext(AuditAction.POSTING_DEPOSIT, ACTOR)
+    finally:
+        unbind_request_id(token)
+
+    records = [
+        context.succeeded(transaction_id=TRANSACTION),
+        context.rejected(InsufficientFundsError()),
+        context.failed(TemporarilyUnavailableError()),
+    ]
+
+    assert {record.request_id for record in records} == {"0199f6c2-7b1e-7c3a-9d4e-5f6a7b8c9d0e"}
+
+
+def test_outside_a_request_an_audit_context_has_no_request_id() -> None:
+    # A service called directly (a test, a script): the column stays NULL.
+    context = AuditContext(AuditAction.POSTING_DEPOSIT, ACTOR)
+
+    assert context.rejected(InsufficientFundsError()).request_id is None

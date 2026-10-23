@@ -130,3 +130,14 @@ The "least-privilege database role" gap above is closed: the API connects as `le
 reads `user_credentials` and `auth_sessions` (login and token lookup need it), may update only
 `password_hash` and `updated_at` (a rehash) and `revoked_at` (logout), and may insert a session
 but not one already revoked or backdated. Rate limiting, session cleanup and TLS remain open.
+
+## Amendment (Phase 10, 2026-10-23): rate limits (ADR 0016)
+
+The "rate limiting and lockout" gap is closed with limits rather than a lockout: every login is
+limited per client address, and attempts per email since its last successful login (in effect,
+failures, counted before the password is checked) throttle that email, correct password
+included, until a 15-minute window ends; a success clears the count. Unknown and registered
+emails are counted alike, so the throttle is no enumeration oracle. Registration is limited per
+address, the mitigation for the `409` enumeration named above. While Redis is unavailable, login
+and registration answer `503`. Session cleanup and TLS remain open.
+See [ADR 0016](0016-rate-limiting.md).

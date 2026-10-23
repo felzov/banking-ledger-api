@@ -33,6 +33,10 @@ class UnavailableError(DomainError):
     """A transient condition (contention): nothing happened, and retrying may succeed."""
 
 
+class TooManyRequestsError(DomainError):
+    """The caller exceeded a rate limit (ADR 0016): nothing happened; retry after a while."""
+
+
 class InternalError(DomainError):
     """The service detected that its own data is inconsistent. Fails closed: the caller gets
     no result rather than a possibly wrong one, and no detail about what was found."""
@@ -149,3 +153,13 @@ class TemporarilyUnavailableError(UnavailableError):
     # Timeouts, exhausted retries, no DB connection, a posting's connection lost before COMMIT.
     code = "temporarily_unavailable"
     message = "The service is temporarily unavailable. Please retry."
+
+
+class RateLimitedError(TooManyRequestsError):
+    # Which limit and whose counter stay in the server log: the answer is the same for all.
+    code = "rate_limited"
+    message = "Too many requests. Retry after the time in the Retry-After header."
+
+    def __init__(self, retry_after_seconds: int) -> None:
+        super().__init__()
+        self.retry_after_seconds = retry_after_seconds

@@ -6,10 +6,14 @@ from fastapi import APIRouter, Depends, FastAPI, status
 
 from ledger_api.api.dependencies import require_path_user
 from ledger_api.api.errors import ErrorResponse, register_error_handlers
+from ledger_api.api.middleware import RequestContextMiddleware
 from ledger_api.api.routes import accounts, health, postings, sessions, users
 from ledger_api.config import Settings
 from ledger_api.data.engine import create_engine, create_sessionmaker
+from ledger_api.data.rate_limits import connect as connect_redis
 from ledger_api.domain.passwords import make_hasher
+from ledger_api.observability.logs import configure_logging
+from ledger_api.services.rate_limits import RateLimiter
 
 
 def create_app(settings: Settings | None = None, *, privilege_guard: bool = True) -> FastAPI:
@@ -21,22 +25,39 @@ def create_app(settings: Settings | None = None, *, privilege_guard: bool = True
 
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
+        # JSON log lines with the request's id, for the app, uvicorn and libraries (ADR 0017).
+        # Here rather than at import time, when uvicorn has already set up its own logging.
+        configure_logging(settings.log_level)
         # One engine (and connection pool) per process, created here rather than at import time
         # so tests and workers each get their own. Creating it opens no connection, so the app
         # starts (and /health/live answers) even while the database is down.
         engine = create_engine(settings, privilege_guard=privilege_guard)
         app.state.engine = engine
         app.state.sessionmaker = create_sessionmaker(engine)
+        # Rate limits (ADR 0016) when Redis is configured; like the engine, the client opens no
+        # connection until first use, so the app starts while Redis is down.
+        redis = connect_redis(settings.redis_url.get_secret_value()) if settings.redis_url else None
+        if redis is not None:
+            app.state.rate_limiter = RateLimiter(
+                redis, namespace=settings.rate_limit_namespace, limits=settings.rate_limits()
+            )
         try:
             yield
         finally:
             await engine.dispose()
+            if redis is not None:
+                await redis.aclose()
 
     app = FastAPI(title="Banking Ledger API", version="0.1.0", lifespan=lifespan)
     app.state.settings = settings
     # One Argon2id hasher per process, with the configured cost (ADR 0013).
     app.state.password_hasher = make_hasher(settings.argon2_parameters())
+    # No rate limits unless the lifespan finds REDIS_URL set (production requires it).
+    app.state.rate_limiter = None
     register_error_handlers(app)
+    # The request id for logs, audit events and the X-Request-ID header (ADR 0017). The only
+    # application middleware, so the outermost one.
+    app.add_middleware(RequestContextMiddleware)
     app.include_router(health.router)
     app.include_router(users.router)
     app.include_router(sessions.router)

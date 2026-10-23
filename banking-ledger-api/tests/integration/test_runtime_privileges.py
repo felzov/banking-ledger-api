@@ -1,4 +1,4 @@
-"""The runtime role's effective privileges after migration 0013 (Phase 10 E3).
+"""The runtime role's effective privileges after migrations 0013 and 0014 (Phase 10).
 
 Setup, as in a deployment: the role bootstrap (unique test names for the owner and the login
 role), migrations run by the owner role, and a login role that inherits ledger_runtime, the
@@ -402,11 +402,6 @@ DENIED = [
         "VALUES ('user.register', 'rejected', 'x', '{}') RETURNING id",
     ),
     (
-        "insert-audit-request-id",
-        "INSERT INTO public.audit_events (action, outcome, reason, details, request_id) "
-        "VALUES ('user.register', 'rejected', 'x', '{}', 'r')",
-    ),
-    (
         "insert-session-revoked",
         "INSERT INTO public.auth_sessions (id, user_id, token_hash, expires_at, revoked_at) "
         "VALUES (uuidv7(), uuidv7(), '\\x00', now(), now())",
@@ -458,6 +453,25 @@ async def test_the_app_is_refused(runtime_db: RuntimeDatabase, statement: str) -
     finally:
         await engine.dispose()
     assert sqlstate(excinfo.value) == "42501", excinfo.value
+
+
+async def test_the_app_may_record_a_request_id(runtime_db: RuntimeDatabase) -> None:
+    # Migration 0014 (ADR 0017): the one column added to what the app may insert. Reading the
+    # event back (RETURNING, SELECT) stays refused above.
+    engine = _engine(runtime_db.app_url)
+    try:
+        async with engine.connect() as connection:
+            transaction = await connection.begin()
+            await connection.execute(
+                text(
+                    "INSERT INTO public.audit_events "
+                    "(action, outcome, reason, details, request_id) "
+                    "VALUES ('user.register', 'rejected', 'x', '{}', 'r')"
+                )
+            )
+            await transaction.rollback()
+    finally:
+        await engine.dispose()
 
 
 async def test_the_app_cannot_read_a_sequence(runtime_db: RuntimeDatabase) -> None:

@@ -214,8 +214,9 @@ class TablePrivileges:
     update: frozenset[str] = frozenset()
 
 
-# Migration 0013's grants to the runtime group, restated here rather than imported: the tests
-# compare the catalog with this independent statement, so the migration cannot vouch for itself.
+# Migration 0013's grants to the runtime group (and 0014's one column), restated here rather than
+# imported: the tests compare the catalog with this independent statement, so the migrations
+# cannot vouch for themselves.
 # Every table in public must appear (alembic_version with nothing): a new table needs a decision.
 RUNTIME_PRIVILEGES: dict[str, TablePrivileges] = {
     "users": TablePrivileges(frozenset({"SELECT"}), frozenset({"id", "email"})),
@@ -259,6 +260,8 @@ RUNTIME_PRIVILEGES: dict[str, TablePrivileges] = {
                 "transaction_id",
                 "idempotency_key",
                 "details",
+                # Since migration 0014: the request's id (ADR 0017).
+                "request_id",
             }
         )
     ),

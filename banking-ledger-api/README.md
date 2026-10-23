@@ -3,20 +3,21 @@
 A production-oriented banking backend built around a **double-entry ledger**: ACID money
 movement, concurrency control, idempotent APIs, and an append-only audit trail.
 
-> **Status: Phase 9 of 10 (in progress). Reliability.**
+> **Status: complete (all 10 phases).**
 > Users register with a password and log in for a 30-minute bearer token. Every user-scoped
 > route requires that token, and only its owner may use it on their own data. Deposits,
 > withdrawals and transfers require an `Idempotency-Key`: a retried request never moves money
 > twice, and an unknown COMMIT outcome is recoverable. An unreachable database answers `503`,
 > not `500`, and cancelled requests are tested to leave the ledger consistent (see
 > [Reliability](#reliability)). Statements and single transactions are read from the owner's
-> side. Every attempt is recorded in an append-only audit trail. The full design is documented
-> in the [ADRs](docs/adr/).
+> side. Every attempt is recorded in an append-only audit trail. Login, registration and postings
+> are rate limited in Redis ([Security](#security)); every response carries an `X-Request-ID`
+> that its JSON log lines and audit events share ([Observability](#observability)). The full
+> design is documented in the [ADRs](docs/adr/).
 
 > [!WARNING]
-> **Not production-ready.** Authentication and authorization are implemented (see
+> **Not production-ready.** Authentication, authorization and rate limits are implemented (see
 > [Security](#security)), but several controls a public deployment needs are not:
-> - **no rate limiting or lockout** against password guessing (Phase 10);
 > - **no HTTPS**: the local stack is plain HTTP on 127.0.0.1, and bearer tokens must only
 >   travel over TLS;
 > - **database roles are separated** (the API runs as an unprivileged `ledger_app`, see
@@ -34,6 +35,7 @@ All data is synthetic. No real financial information, credentials or personal da
 | Language | Python 3.14 |
 | Web framework | FastAPI, Pydantic v2 |
 | Database | PostgreSQL 18, SQLAlchemy 2.1 (async, asyncpg driver), Alembic migrations |
+| Rate limits | Redis 8, for counters only (redis-py, asyncio) |
 | Tooling | uv, ruff, mypy (strict), pytest, pre-commit (including gitleaks) |
 | Runtime | Docker, Docker Compose |
 
@@ -49,14 +51,15 @@ make up                     # start PostgreSQL, create the roles, migrate, start
 curl localhost:8000/health/ready
 ```
 
-`make up` starts four services, each only once the previous one has succeeded, each with its
-own database identity ([Database roles](#database-roles)):
+`make up` starts five services. The database ones start only once the previous one has
+succeeded, each with its own database identity ([Database roles](#database-roles)):
 
 1. `db`, PostgreSQL, until healthy;
 2. `bootstrap`, one-shot, as the admin: creates or reconciles the roles
    (`python -m ledger_api.admin.bootstrap`);
 3. `migrate`, one-shot, as `ledger_owner`: `alembic upgrade head`;
-4. `api`, as `ledger_app`.
+4. `redis`, the rate limits' counters, until healthy (no host port, no persistence);
+5. `api`, as `ledger_app`, once the migrations completed and Redis is healthy.
 
 **Existing volume** (created before Phase 10, where everything belongs to the admin): **back
 it up first** ([below](#back-up-before-upgrading-an-existing-database)). Then add
@@ -112,6 +115,14 @@ scripts/rehearse-backup-restore.sh --backup-dir ~/ledger-backups --execute   # b
 | `API_PORT` | compose | `8000` | Host port, bound to 127.0.0.1 |
 | `AUTH_SESSION_TTL_SECONDS` | api | `1800` | Absolute lifetime of a login session (30 minutes; 60–86,400) |
 | `ARGON2_TIME_COST` / `ARGON2_MEMORY_COST_KIB` / `ARGON2_PARALLELISM` | api | `3` / `65536` / `4` | Argon2id password-hashing cost (RFC 9106 low-memory profile). With `APP_ENV=production`, anything below 19,456 KiB or 2 passes is refused at startup |
+| `REDIS_URL` | api | unset | `redis://` or `rediss://`: the rate limits' counters. Unset: no rate limits; `APP_ENV=production` refuses to start without it. Compose sets it for the API |
+| `RATE_LIMIT_NAMESPACE` | api | `ledger` | Prefix of every counter key, so deployments can share a Redis |
+| `LOGIN_ATTEMPTS_PER_MINUTE` | api | `20` | `POST /sessions` per client address |
+| `LOGIN_FAILURES_PER_EMAIL` / `LOGIN_FAILURE_WINDOW_SECONDS` | api | `10` / `900` | Logins per email since its last successful login (in effect, failures) before it is throttled until the window ends |
+| `REGISTRATIONS_PER_HOUR` | api | `10` | `POST /users` per client address |
+| `POSTINGS_PER_MINUTE` | api | `60` | Deposits, withdrawals and transfers per user, together |
+| `LOG_LEVEL` | api | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR`, for the application and its libraries |
+| `TEST_REDIS_URL` | tests | (set by `make test`) | The rate-limit tests' Redis (`test-redis`). Never `REDIS_URL`: the rest of the suite runs without limits |
 
 ## Development commands
 
@@ -123,7 +134,7 @@ scripts/rehearse-backup-restore.sh --backup-dir ~/ledger-backups --execute   # b
 | `make migrate` | Apply migrations from the host, as `ledger_owner` (after `make bootstrap`) |
 | `make revision m="..."` | Create a new, empty migration |
 | `make db-shell` | Open `psql` in the database container |
-| `make test` | Run the test suite on its own disposable PostgreSQL (`test-db`, started if needed) |
+| `make test` | Run the test suite on its own disposable PostgreSQL and Redis (`test-db`, `test-redis`, started if needed) |
 | `make smoke` | Start-up smoke test in an isolated Compose project (own volume, ports and image), removed afterwards |
 | `make lint` / `make fmt` | Lint and format check, or auto-fix |
 | `make typecheck` | `mypy --strict` |
@@ -275,9 +286,12 @@ Every error body is `{"code": "...", "detail": ...}`:
 | 422 | `invalid_statement_limit`, `invalid_statement_cursor` | A `limit` outside 1–100; a cursor that is not an entry of this account. (A non-integer `limit` or a malformed cursor is `validation_error`) |
 | 422 | `invalid_idempotency_key` | The header is not one value of 1–255 visible ASCII characters (never echoed) |
 | 428 | `idempotency_key_required` | A posting without an `Idempotency-Key` header |
-| 503 | `temporarily_unavailable` | Lock or statement timeout, or contention retries exhausted; the database could not be reached, or no pooled connection was free in time (any route); a posting's connection was lost before its `COMMIT` was sent. The request changed nothing (a failed audit event may still be recorded). Retry later (postings: with the same `Idempotency-Key`) |
+| 429 | `rate_limited` | A rate limit was exceeded (login, registration, postings; [Security](#security)). `Retry-After` gives the seconds until its window ends |
+| 503 | `temporarily_unavailable` | Lock or statement timeout, or contention retries exhausted; the database could not be reached, or no pooled connection was free in time (any route); a posting's connection was lost before its `COMMIT` was sent; Redis could not be reached for a login or registration (their rate limits fail closed). The request changed nothing (a failed audit event may still be recorded). Retry later (postings: with the same `Idempotency-Key`) |
 | 503 | `outcome_unknown` | The connection was lost during COMMIT: the posting may or may not have been applied. **Retry with the same `Idempotency-Key`** |
 | 500 | `internal_error` | Anything unexpected, including a statement whose balance does not match its entries (refused rather than returned). No details are returned; the traceback goes to the server log |
+
+Every response, errors included, carries an `X-Request-ID` header ([Observability](#observability)).
 
 Two body shapes share `422`, and the OpenAPI schema documents both where both can occur:
 `validation_error` carries a list of `{type, loc, msg}`; every other code carries a string.
@@ -427,7 +441,8 @@ User registration, account opening, every posting attempt, logins (successful an
 and logouts are recorded in `audit_events`
 ([ADR 0011](docs/adr/0011-audit-trail.md), [ADR 0013](docs/adr/0013-authentication-and-authorization.md)).
 A rejected login records the email's user when the email is registered, never the email itself.
-Requests refused with `401` or `403` are not audited (no service runs):
+Every event records the `request_id` of the HTTP request it happened in (NULL outside one).
+Requests refused with `401`, `403` or `429` are not audited (no service runs):
 
 - **Succeeded** events are the last write of the business transaction: they commit with it or
   not at all, even when a deferred check rejects the transaction at `COMMIT`. If the audit
@@ -553,10 +568,10 @@ carrying the event's fields instead:
 | `audit event not written (<error class>): ...` | The write raised that error. Usually the insert failed or no connection was obtained (e.g. `TimeoutError`, `DatabaseUnavailableError`), and the event is not there. **Known gap:** if the error came from the event's own `COMMIT` (e.g. a lost connection), the row may exist despite the wording; check `audit_events` |
 | `audit event possibly not written (cancelled during COMMIT): ...` | The insert completed but its `COMMIT` was interrupted by a cancellation. The row **may exist**: check `audit_events` before treating the event as missing |
 
-A log line is a fallback, not an audit record: it is not append-only, cannot be queried with
-the events, and is only as durable as the process's stderr. No logging handler is configured,
-so WARNING and ERROR lines reach stderr through Python's last-resort handler (`make logs`
-includes the `api` container's output); structured logging is Phase 10.
+Each line is a JSON log line ([Observability](#observability)) and names the event's
+`request_id`. A log line is a fallback, not an audit record: it is not append-only, cannot be
+queried with the events, and is only as durable as the process's stderr (`make logs` includes
+the `api` container's output).
 
 ## Statements
 
@@ -586,7 +601,8 @@ historical balance calculation (also used by idempotent replays).
 
 ## Security
 
-**Implemented** ([ADR 0013](docs/adr/0013-authentication-and-authorization.md)):
+**Implemented** ([ADR 0013](docs/adr/0013-authentication-and-authorization.md),
+[ADR 0016](docs/adr/0016-rate-limiting.md)):
 
 - Passwords: the 12–128-character policy after NFKC; Argon2id hashing, with production refusing
   parameters below OWASP's minimum; hashing and verification run in a worker thread, never
@@ -603,19 +619,35 @@ historical balance calculation (also used by idempotent replays).
 - Owner-scoped lookups and identical 404s inside the caller's scope (ADR 0009); idempotency
   keys scoped to the authenticated user; database-enforced ledger, idempotency and audit
   invariants.
+- **Rate limits**, counted in Redis so every worker and replica shares them (`429
+  rate_limited` with `Retry-After`, not audited):
+
+  | Limit | Per | Default | If Redis is unreachable |
+  |---|---|---|---|
+  | Login attempts | client address | 20 / minute | `503` (fail closed) |
+  | Failed logins | email address | 10 attempts since the last successful login / 15 minutes, then the email is throttled until the window ends, correct password included; a success clears the count | `503` (fail closed) |
+  | Registrations | client address | 10 / hour | `503` (fail closed) |
+  | Postings | user | 60 / minute, replays included | not enforced, WARNING (fail open) |
+
+  Each login is counted before its password is checked, so concurrent attempts cannot outrun
+  the limit, and a throttled login computes no hash. Unknown and registered emails are counted
+  alike, so the throttle reveals nothing about which emails exist; the price is that anyone can
+  throttle a known email for one window. IPv6 clients count per `/64`. Redis holds counters only, with
+  emails as SHA-256 digests. The client address is the peer uvicorn sees: behind a reverse
+  proxy, uvicorn must trust it (`--forwarded-allow-ips`), or every client shares the proxy's
+  budget.
 
 **Not implemented** (deferred, so not controls this project provides today):
 
-- **Rate limiting and lockout** against password guessing and credential stuffing (Phase 10,
-  [ADR 0008](docs/adr/0008-redis-only-for-rate-limiting.md)). Each guess only costs one Argon2id
-  verification.
 - **Session cleanup** (expired rows accumulate), a **per-user session limit**, listing sessions,
   and "revoke all sessions".
 - **Production HTTPS.** The local stack serves plain HTTP on 127.0.0.1; a deployment needs TLS
   termination, since bearer tokens must never travel unencrypted.
 - Password change and reset, email verification, MFA, roles and administrators.
-- Registration answers `409` for a registered email, which allows enumerating addresses; rate
-  limiting is the intended mitigation.
+- Registration still answers `409` for a registered email; the per-address limit bounds how
+  fast addresses can be enumerated, it does not remove the signal.
+- Redis has no password in the Compose stack (no host port; Compose network only). A deployment
+  where anything else reaches Redis needs `rediss://` with credentials in `REDIS_URL`.
 
 ### Database roles
 
@@ -645,6 +677,30 @@ Three identities, each holding only what its job needs
   owner's, only `api` the app's (a test reads `compose.yaml` to keep it so; the smoke test
   inspects the running containers).
 
+## Observability
+
+([ADR 0017](docs/adr/0017-structured-logs-and-request-correlation.md))
+
+- **JSON log lines** on stderr, one object per line, from the application, uvicorn and the
+  libraries alike: `time` (UTC), `level`, `logger`, `message`, `request_id`, and for an
+  exception `exc_type` and `traceback`. `LOG_LEVEL` sets the level. Only a fixed list of extra
+  fields is ever written, and never a password, token, token digest or email address.
+- **A request id per request**, generated by the server (a UUIDv7; a client's own
+  `X-Request-ID` is ignored) and returned in the `X-Request-ID` header of every response,
+  `500` included. Every log line written while serving the request carries it, uvicorn's
+  traceback of an unhandled error included, and every audit event records it in `request_id`.
+- **One access line per request** (`ledger_api.access`): method, path without the query
+  string, status and `duration_ms`. uvicorn's own access log is silenced.
+
+```json
+{"time": "2026-10-23T11:03:01.777+00:00", "level": "INFO", "logger": "ledger_api.access", "message": "GET /health/live 200", "request_id": "01a1686d-b190-71e8-bc7d-93173bad0894", "method": "GET", "path": "/health/live", "status": 200, "duration_ms": 1.7}
+```
+
+To follow one request: take the `X-Request-ID` a client reports, find its lines in the logs,
+and its events with `SELECT * FROM audit_events WHERE request_id = '…'` (as the admin: the API
+cannot read the trail). uvicorn's first two startup lines are plain text: they are written
+before the application configures logging.
+
 ## Testing
 
 Tests run against real PostgreSQL, never SQLite, because the invariants above live in
@@ -670,7 +726,9 @@ cluster-wide):
 - and a database is only ever dropped if its name ends in `_test`.
 
 Running `uv run pytest` directly therefore needs a marked, disposable server and both settings;
-use `make test`.
+use `make test`. It also starts `test-redis` and sets `TEST_REDIS_URL` for the rate-limit tests;
+each of them counts under a key namespace of its own, deleted afterwards, and the suite fails
+rather than skips them without it.
 
 Negative tests assert the exact constraint or trigger that rejected the data, not just that
 some error occurred. API tests run each request in a fresh session on the test's rolled-back
@@ -785,10 +843,30 @@ Reliability tests (Phase 9):
   `COMMIT` logs no warning; a cancelled rejection-audit write is logged as "not written", or as
   "possibly not written" when its own `COMMIT` was interrupted.
 
-CI runs the same suite against a PostgreSQL service container (marked disposable), and runs
+Rate limit and observability tests (Phase 10):
+
+- **Counters** against a real Redis: windows that start at the first hit and are never
+  extended, expiry, 50 concurrent hits counted exactly, and an unreachable Redis that fails in
+  one short attempt without naming its host.
+- **Limits over HTTP**: each limit's `429` and `Retry-After`; malformed attempts count; IPv6 per
+  `/64`; registered and unknown emails throttled identically, the right password included, and
+  cleared by a success; a throttled login computes no hash and writes no audit event; 40
+  concurrent logins for one email against a limit of 3 get exactly 3 password checks; postings
+  limited per user across kinds and replays, moving nothing when refused. With Redis down,
+  login and registration answer `503` and postings still post, with a WARNING.
+- **Correlation**: an `X-Request-ID` on 2xx, 401, 404, 422 and 500 responses (and a client's
+  own ignored); audit events record the id of their request; access lines carry it; register,
+  login and logout leave no email, password or token in any log line; against a real uvicorn,
+  the traceback of an unhandled error carries the request's id.
+- **Migration 0014**: the privilege matrix gains `audit_events.request_id` only, and the app
+  role may insert it.
+
+CI runs the same suite against a PostgreSQL service container (marked disposable) and a Redis
+service container, and runs
 the start-up smoke test (`scripts/compose-smoke.sh`, `make smoke` locally) on its own Compose
-stack: `db` → `bootstrap` → `migrate` (`ledger_owner`) → `api` (`ledger_app`), an API flow, the
-API container's environment, and the server's view of who is connected and who owns the schema.
+stack: `db` → `bootstrap` → `migrate` (`ledger_owner`) → `api` (`ledger_app`, with Redis), an API
+flow with request ids, the API container's environment, and the server's view of who is
+connected and who owns the schema.
 
 ## Architecture decisions
 
@@ -809,6 +887,8 @@ API container's environment, and the server's view of who is connected and who o
 | [0013](docs/adr/0013-authentication-and-authorization.md) | Password login (Argon2id) with opaque, database-backed bearer tokens; one router-level ownership check |
 | [0014](docs/adr/0014-failure-handling-unavailability-cancellation-and-shutdown.md) | Failure handling: `503` for unreachable databases and pre-`COMMIT` connection loss, cancellation, audit fallback logs, shutdown as configured |
 | [0015](docs/adr/0015-database-roles-and-least-privilege.md) | Database roles: admin bootstrap, `ledger_owner` migrations, `ledger_app` with column-level grants; migration and startup privilege guards |
+| [0016](docs/adr/0016-rate-limiting.md) | Rate limiting: four limits in Redis, a per-email login throttle, fail closed for login and registration |
+| [0017](docs/adr/0017-structured-logs-and-request-correlation.md) | JSON log lines and a server-generated request id shared by the response, the logs and the audit trail |
 
 ## Roadmap
 
@@ -820,5 +900,5 @@ API container's environment, and the server's view of who is connected and who o
 6. ✅ Idempotency and the HTTP posting API (deposits, withdrawals, transfers)
 7. ✅ REST API: statements, single transactions, `Location` on postings
 8. ✅ Authentication and authorization (password login, bearer tokens, ownership on every user-scoped route)
-9. ✅ Reliability (in progress: database outages answer `503`, pre-`COMMIT` and cancellation behaviour tested, failure handling documented)
-10. ✅ Security and observability (in progress: least-privilege database roles and their guards ✅; structured logging, request correlation, rate limiting to come)
+9. ✅ Reliability: database outages answer `503`, pre-`COMMIT` and cancellation behaviour tested, failure handling documented
+10. ✅ Security and observability: least-privilege database roles and their guards, rate limits in Redis, JSON logs and request correlation

@@ -9,6 +9,10 @@ Login:
      password if the hash parameters changed, and writes the succeeded audit event, together.
 The slow hash therefore never runs on the event loop and never holds a database connection.
 
+With rate limits configured (ADR 0016), every attempt is counted for its email before step 1, and
+one over the limit is refused there, with no hash computed and nothing audited; a success clears
+the count (services.rate_limits).
+
 Logout revokes the caller's live session and audits it, in one transaction. A repeated logout
 (or any unknown, expired or malformed token) is 401 invalid_token and is not audited, like any
 unauthenticated request (ADR 0007).
@@ -47,6 +51,7 @@ from ledger_api.domain.passwords import (
 from ledger_api.domain.principal import Principal
 from ledger_api.domain.tokens import generate_token, hash_token, is_well_formed_token
 from ledger_api.services.audit import AuditContext, audited, record_in_transaction
+from ledger_api.services.rate_limits import RateLimiter
 
 
 @dataclass(frozen=True, slots=True)
@@ -81,10 +86,18 @@ async def login(
     email: str,
     password: str,
     lifetime: timedelta,
+    limiter: RateLimiter | None = None,
 ) -> LoginResult:
     """Open a session for the user registered with `email` (canonical form), or raise
     InvalidCredentialsError. Audited as auth.login: succeeded, or rejected with
-    reason invalid_credentials (the actor is the email's user when there is one)."""
+    reason invalid_credentials (the actor is the email's user when there is one).
+
+    With a limiter: RateLimitedError, unaudited, for an email over its failure limit."""
+    if limiter is not None:
+        # Counted before the password is checked, and before the audited call: a refused attempt
+        # costs no hash and writes no audit row, so a flood of them cannot turn into a flood of
+        # database writes, and concurrent attempts cannot all slip past the count.
+        await limiter.reserve_login_attempt(email)
     context = AuditContext(AuditAction.AUTH_LOGIN, actor_user_id=None)
 
     async def run() -> LoginResult:
@@ -123,7 +136,10 @@ async def login(
             expires_at=stored_session.expires_at,
         )
 
-    return await audited(session, context, run)
+    result = await audited(session, context, run)
+    if limiter is not None:
+        await limiter.clear_login_failures(email)
+    return result
 
 
 async def logout(session: AsyncSession, *, token: str) -> None:

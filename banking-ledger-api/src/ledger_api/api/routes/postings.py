@@ -13,15 +13,22 @@ import uuid
 from datetime import datetime
 from typing import Any
 
-from fastapi import APIRouter, Request, Response, status
+from fastapi import APIRouter, Depends, Request, Response, status
 from pydantic import BaseModel, ConfigDict, StrictInt
 
-from ledger_api.api.dependencies import IdempotencyKeyDep, SessionDep
-from ledger_api.api.errors import VALIDATION_OR_RULE_ERROR_RESPONSE, ErrorResponse
+from ledger_api.api.dependencies import IdempotencyKeyDep, SessionDep, limit_postings
+from ledger_api.api.errors import (
+    TOO_MANY_REQUESTS_RESPONSE,
+    VALIDATION_OR_RULE_ERROR_RESPONSE,
+    ErrorResponse,
+)
 from ledger_api.domain.transaction import TransactionKind
 from ledger_api.services.posting import PostingResult, deposit, transfer, withdraw
 
-router = APIRouter(prefix="/accounts/{account_id}", tags=["postings"])
+# Every posting counts against its user's rate limit (ADR 0016), replays included.
+router = APIRouter(
+    prefix="/accounts/{account_id}", tags=["postings"], dependencies=[Depends(limit_postings)]
+)
 
 REPLAYED_HEADER = "Idempotent-Replayed"
 
@@ -29,6 +36,7 @@ ERROR_RESPONSES: dict[int | str, dict[str, Any]] = {
     status.HTTP_404_NOT_FOUND: {"model": ErrorResponse},
     **VALIDATION_OR_RULE_ERROR_RESPONSE,
     status.HTTP_428_PRECONDITION_REQUIRED: {"model": ErrorResponse},
+    **TOO_MANY_REQUESTS_RESPONSE,
     status.HTTP_503_SERVICE_UNAVAILABLE: {"model": ErrorResponse},
 }
 CREATED_OR_REPLAYED: dict[str, Any] = {

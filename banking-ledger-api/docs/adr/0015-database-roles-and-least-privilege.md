@@ -124,3 +124,10 @@ throwaway server, never through `DATABASE_URL`) AND the database is not migrated
 - Credentials still come from a local `.env`, not a secrets manager.
 - `audit_events.request_id` is not writable by the API until request correlation adds it.
 - Each new physical connection costs one catalog query; pooled connections are reused unchecked.
+
+## Amendment (Phase 10, 2026-10-23): `audit_events.request_id` (migration 0014)
+
+Request correlation exists (ADR 0017), so migration 0014 grants `ledger_runtime` `INSERT` on
+`audit_events.request_id`, the one column added to the matrix. Still no `SELECT` on
+`audit_events`. Its downgrade revokes the column, after which every audit insert of this version
+is refused (it names the column).
