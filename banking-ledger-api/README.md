@@ -1,55 +1,98 @@
 # banking-ledger-api
 
+[![CI](https://github.com/felzov/banking-ledger-api/actions/workflows/banking-ledger-api.yml/badge.svg?branch=main)](https://github.com/felzov/banking-ledger-api/actions/workflows/banking-ledger-api.yml)
+
 A production-oriented banking backend built around a **double-entry ledger**: ACID money
 movement, concurrency control, idempotent APIs, and an append-only audit trail.
 
-> **Status: complete (all 10 phases).**
-> Users register with a password and log in for a 30-minute bearer token. Every user-scoped
-> route requires that token, and only its owner may use it on their own data. Deposits,
-> withdrawals and transfers require an `Idempotency-Key`: a retried request never moves money
-> twice, and an unknown COMMIT outcome is recoverable. An unreachable database answers `503`,
-> not `500`, and cancelled requests are tested to leave the ledger consistent (see
-> [Reliability](#reliability)). Statements and single transactions are read from the owner's
-> side. Every attempt is recorded in an append-only audit trail. Login, registration and postings
-> are rate limited in Redis ([Security](#security)); every response carries an `X-Request-ID`
-> that its JSON log lines and audit events share ([Observability](#observability)). The full
-> design is documented in the [ADRs](docs/adr/).
+**Status: complete.** All ten planned phases are built and merged; CI runs ruff, `mypy --strict`
+and the test suite against PostgreSQL 18 and Redis, builds the Docker image and smoke-tests the
+Compose stack. It is **not production-ready** and must not be exposed to untrusted networks:
+there is no HTTPS, and credentials come from a local `.env`, not a secrets manager
+([Known limitations](#known-limitations)). All data is synthetic: no real financial
+information, credentials or personal data.
 
-> [!WARNING]
-> **Not production-ready.** Authentication, authorization and rate limits are implemented (see
-> [Security](#security)), but several controls a public deployment needs are not:
-> - **no HTTPS**: the local stack is plain HTTP on 127.0.0.1, and bearer tokens must only
->   travel over TLS;
-> - **database roles are separated** (the API runs as an unprivileged `ledger_app`, see
->   [Database roles](#database-roles)), but credentials come from a local `.env` file, not a
->   secrets manager.
->
-> Do not expose it to untrusted networks.
+**Stack:** Python 3.14, FastAPI, Pydantic v2, SQLAlchemy 2.1 (async, asyncpg), PostgreSQL 18,
+Alembic, Redis 8, uv, ruff, mypy (strict), pytest, Hypothesis, pre-commit (with gitleaks),
+Docker Compose, GitHub Actions.
 
-All data is synthetic. No real financial information, credentials or personal data are used.
+## What it does
 
-## Technology stack
+- **Double-entry postings**: deposits, withdrawals and transfers are balanced entries in one
+  ledger per currency (GBP, EUR); amounts are integer minor units, never floats
+  ([ADR 0002](docs/adr/0002-money-as-integer-minor-units.md),
+  [ADR 0003](docs/adr/0003-per-currency-ledgers-and-signed-double-entry.md)).
+- **Invariants in the database**: every transaction sums to zero (deferred triggers, checked at
+  `COMMIT`), posted history is never updated, deleted or truncated, and no posting crosses
+  currencies ([ADR 0004](docs/adr/0004-immutable-transactions-without-status.md)).
+- **Concurrency control**: accounts are locked in id order under READ COMMITTED, so parallel
+  transfers neither deadlock each other nor overdraw; a deadlock retries the whole transaction
+  ([ADR 0005](docs/adr/0005-pessimistic-locking-under-read-committed.md),
+  [ADR 0010](docs/adr/0010-posting-protocol.md)).
+- **Idempotent postings**: every posting needs an `Idempotency-Key`; a retry replays the original
+  result instead of posting twice, which also resolves a lost `COMMIT` acknowledgement
+  ([ADR 0006](docs/adr/0006-idempotency-inside-the-posting-transaction.md)).
+- **Audit trail**: every attempt, succeeded, rejected or failed, in an append-only table the API
+  can write but not read ([ADR 0007](docs/adr/0007-auditing-rejected-financial-attempts.md),
+  [ADR 0011](docs/adr/0011-audit-trail.md)).
+- **Statements and reconciliation**: commit-ordered history with running balances and cursor
+  pagination; independent checks that every balance equals its entries
+  ([ADR 0012](docs/adr/0012-statement-ordering-and-reconciliation.md)).
+- **Authentication and ownership**: Argon2id password login, opaque 30-minute bearer tokens
+  stored only as digests, and every user-scoped route open to its owner only
+  ([ADR 0009](docs/adr/0009-owner-scoped-access-and-error-responses.md),
+  [ADR 0013](docs/adr/0013-authentication-and-authorization.md)).
+- **Failure handling**: an unreachable database answers `503`, and cancelled requests are tested
+  to leave the ledger consistent
+  ([ADR 0014](docs/adr/0014-failure-handling-unavailability-cancellation-and-shutdown.md)).
+- **Least privilege**: the API runs as `ledger_app` with column-level grants, and refuses to
+  serve through a privileged database role
+  ([ADR 0015](docs/adr/0015-database-roles-and-least-privilege.md)).
+- **Rate limits and observability**: login, registration and postings are limited in Redis; JSON
+  log lines and an `X-Request-ID` shared by the response, its log lines and its audit events
+  ([ADR 0016](docs/adr/0016-rate-limiting.md),
+  [ADR 0017](docs/adr/0017-structured-logs-and-request-correlation.md)).
 
-| Concern | Choice |
-|---|---|
-| Language | Python 3.14 |
-| Web framework | FastAPI, Pydantic v2 |
-| Database | PostgreSQL 18, SQLAlchemy 2.1 (async, asyncpg driver), Alembic migrations |
-| Rate limits | Redis 8, for counters only (redis-py, asyncio) |
-| Tooling | uv, ruff, mypy (strict), pytest, pre-commit (including gitleaks) |
-| Runtime | Docker, Docker Compose |
+Not built: TLS termination, a secrets manager, session cleanup, password change and reset, email
+verification, MFA, roles and administrators.
 
-## Local setup
+## Quick start
 
-Prerequisites: Docker with Compose v2+, [uv](https://docs.astral.sh/uv/), and GNU Make.
+Requires Docker with Compose v2+, [uv](https://docs.astral.sh/uv/) and GNU Make.
 
 ```bash
 cd banking-ledger-api
 cp .env.example .env        # synthetic local-only values
 make install                # create .venv from uv.lock
-make up                     # start PostgreSQL, create the roles, migrate, start the API
+make up                     # PostgreSQL, the roles, the migrations and Redis, then the API
+make check                  # ruff, mypy --strict and the tests, on their own PostgreSQL and Redis
 curl localhost:8000/health/ready
 ```
+
+Interactive API docs: <http://localhost:8000/docs>. To enable the git hooks, run this once from
+the repository root:
+
+```bash
+banking-ledger-api/.venv/bin/pre-commit install
+```
+
+## Development commands
+
+| Command | Action |
+|---|---|
+| `make up` / `make down` | Start or stop the stack. Data is kept in the `pgdata` volume |
+| `make logs` | Follow container logs |
+| `make bootstrap` | Create or reconcile the database roles, as the admin (the `db` service must be up) |
+| `make migrate` | Apply migrations from the host, as `ledger_owner` (after `make bootstrap`) |
+| `make revision m="..."` | Create a new, empty migration |
+| `make db-shell` | Open `psql` in the database container |
+| `make test` | Run the test suite on its own disposable PostgreSQL and Redis (`test-db`, `test-redis`, started if needed) |
+| `make smoke` | Start-up smoke test in an isolated Compose project (own volume, ports and image), removed afterwards |
+| `make lint` / `make fmt` | Lint and format check, or auto-fix |
+| `make typecheck` | `mypy --strict` |
+| `make check` | All quality gates |
+
+## Database
 
 `make up` starts five services. The database ones start only once the previous one has
 succeeded, each with its own database identity ([Database roles](#database-roles)):
@@ -67,14 +110,6 @@ it up first** ([below](#back-up-before-upgrading-an-existing-database)). Then ad
 `make up`. The bootstrap transfers every object in `public` to `ledger_owner`, then migration
 0013 grants `ledger_app` its privileges; the data is untouched. Without those two variables
 Compose refuses to start and names the missing one.
-
-Interactive API docs: <http://localhost:8000/docs>
-
-To enable the git hooks, run this once from the repository root:
-
-```bash
-banking-ledger-api/.venv/bin/pre-commit install
-```
 
 ### Back up before upgrading an existing database
 
@@ -124,21 +159,26 @@ scripts/rehearse-backup-restore.sh --backup-dir ~/ledger-backups --execute   # b
 | `LOG_LEVEL` | api | `INFO` | `DEBUG`, `INFO`, `WARNING` or `ERROR`, for the application and its libraries |
 | `TEST_REDIS_URL` | tests | (set by `make test`) | The rate-limit tests' Redis (`test-redis`). Never `REDIS_URL`: the rest of the suite runs without limits |
 
-## Development commands
+## Authentication
 
-| Command | Action |
-|---|---|
-| `make up` / `make down` | Start or stop the stack. Data is kept in the `pgdata` volume |
-| `make logs` | Follow container logs |
-| `make bootstrap` | Create or reconcile the database roles, as the admin (the `db` service must be up) |
-| `make migrate` | Apply migrations from the host, as `ledger_owner` (after `make bootstrap`) |
-| `make revision m="..."` | Create a new, empty migration |
-| `make db-shell` | Open `psql` in the database container |
-| `make test` | Run the test suite on its own disposable PostgreSQL and Redis (`test-db`, `test-redis`, started if needed) |
-| `make smoke` | Start-up smoke test in an isolated Compose project (own volume, ports and image), removed afterwards |
-| `make lint` / `make fmt` | Lint and format check, or auto-fix |
-| `make typecheck` | `mypy --strict` |
-| `make check` | All quality gates |
+- **Register, then log in.** `POST /users` takes an email and a password. The password must be
+  12–128 characters after Unicode NFKC normalization, with no composition rules. `POST /sessions`
+  exchanges the email and password for an opaque bearer token (`lt_...`, 256 random bits),
+  shown exactly once, with `Cache-Control: no-store`.
+- **Sessions last 30 minutes,** absolutely (`expires_at`, set by the database's clock). There is
+  no refresh token: log in again. `DELETE /sessions/current` revokes the token immediately.
+- **Every route under `/users/{user_id}` needs `Authorization: Bearer <token>`**, and
+  `{user_id}` must be the token's user.
+  - No usable header (missing, empty, repeated, another scheme): `401 authentication_required`.
+  - A malformed, unknown, expired or revoked token: `401 invalid_token`. One answer for all.
+  - Every `401` carries `WWW-Authenticate: Bearer` (`invalid_token` adds `error="invalid_token"`).
+  - A valid token on another user's id, existing or not: `403 forbidden`, before anything is
+    read or written. It never claims an idempotency key or moves money.
+- **Login failures are indistinguishable:** an unknown email and a wrong password both answer
+  `401 invalid_credentials`, and cost the same work.
+- **Never stored or logged:** the password (only its Argon2id hash is stored) and the token
+  (only its SHA-256 digest is stored). Neither ever appears in a response other than the login,
+  in a log line, or in the audit trail.
 
 ## API
 
@@ -212,27 +252,6 @@ curl -s -o /dev/null -w '%{http_code}\n' -X DELETE localhost:8000/sessions/curre
 # 204: the token is revoked; using it again answers 401 invalid_token
 ```
 
-### Authentication
-
-- **Register, then log in.** `POST /users` takes an email and a password. The password must be
-  12–128 characters after Unicode NFKC normalization, with no composition rules. `POST /sessions`
-  exchanges the email and password for an opaque bearer token (`lt_...`, 256 random bits),
-  shown exactly once, with `Cache-Control: no-store`.
-- **Sessions last 30 minutes,** absolutely (`expires_at`, set by the database's clock). There is
-  no refresh token: log in again. `DELETE /sessions/current` revokes the token immediately.
-- **Every route under `/users/{user_id}` needs `Authorization: Bearer <token>`**, and
-  `{user_id}` must be the token's user.
-  - No usable header (missing, empty, repeated, another scheme): `401 authentication_required`.
-  - A malformed, unknown, expired or revoked token: `401 invalid_token`. One answer for all.
-  - Every `401` carries `WWW-Authenticate: Bearer` (`invalid_token` adds `error="invalid_token"`).
-  - A valid token on another user's id, existing or not: `403 forbidden`, before anything is
-    read or written. It never claims an idempotency key or moves money.
-- **Login failures are indistinguishable:** an unknown email and a wrong password both answer
-  `401 invalid_credentials`, and cost the same work.
-- **Never stored or logged:** the password (only its Argon2id hash is stored) and the token
-  (only its SHA-256 digest is stored). Neither ever appears in a response other than the login,
-  in a log line, or in the audit trail.
-
 ### Rules
 
 - **Accounts are only reachable through their owner.** Every user-scoped route lives under
@@ -305,7 +324,7 @@ non-posting request (login, registration, account opening, reads) also stays `50
 posting service tracks whether `COMMIT` was already sent. See [Reliability](#reliability) and
 [ADR 0014](docs/adr/0014-failure-handling-unavailability-cancellation-and-shutdown.md).
 
-## Database
+## Schema and invariants
 
 [`0001_initial_schema`](migrations/versions/0001_initial_schema.py) creates the schema and
 seeds one ledger per supported currency (GBP, EUR), each with its external settlement account.
@@ -637,17 +656,7 @@ historical balance calculation (also used by idempotent replays).
   proxy, uvicorn must trust it (`--forwarded-allow-ips`), or every client shares the proxy's
   budget.
 
-**Not implemented** (deferred, so not controls this project provides today):
-
-- **Session cleanup** (expired rows accumulate), a **per-user session limit**, listing sessions,
-  and "revoke all sessions".
-- **Production HTTPS.** The local stack serves plain HTTP on 127.0.0.1; a deployment needs TLS
-  termination, since bearer tokens must never travel unencrypted.
-- Password change and reset, email verification, MFA, roles and administrators.
-- Registration still answers `409` for a registered email; the per-address limit bounds how
-  fast addresses can be enumerated, it does not remove the signal.
-- Redis has no password in the Compose stack (no host port; Compose network only). A deployment
-  where anything else reaches Redis needs `rediss://` with credentials in `REDIS_URL`.
+**Not implemented:** see [Known limitations](#known-limitations).
 
 ### Database roles
 
@@ -701,7 +710,7 @@ and its events with `SELECT * FROM audit_events WHERE request_id = '…'` (as th
 cannot read the trail). uvicorn's first two startup lines are plain text: they are written
 before the application configures logging.
 
-## Testing
+## Tests
 
 Tests run against real PostgreSQL, never SQLite, because the invariants above live in
 triggers and constraints. They run on their **own disposable cluster**, never the development
@@ -868,37 +877,73 @@ stack: `db` → `bootstrap` → `migrate` (`ledger_owner`) → `api` (`ledger_ap
 flow with request ids, the API container's environment, and the server's view of who is
 connected and who owns the schema.
 
-## Architecture decisions
+## Project layout
 
-| ADR | Decision |
-|---|---|
-| [0001](docs/adr/0001-layered-modular-monolith.md) | Layered modular monolith on FastAPI and PostgreSQL |
-| [0002](docs/adr/0002-money-as-integer-minor-units.md) | Money as integer minor units (`amount_minor`) |
-| [0003](docs/adr/0003-per-currency-ledgers-and-signed-double-entry.md) | Per-currency ledgers and signed double-entry postings |
-| [0004](docs/adr/0004-immutable-transactions-without-status.md) | Immutable transactions without a status column |
-| [0005](docs/adr/0005-pessimistic-locking-under-read-committed.md) | Pessimistic row locking under READ COMMITTED |
-| [0006](docs/adr/0006-idempotency-inside-the-posting-transaction.md) | Idempotency keys stored inside the posting transaction |
-| [0007](docs/adr/0007-auditing-rejected-financial-attempts.md) | Auditing rejected attempts outside the financial transaction |
-| [0008](docs/adr/0008-redis-only-for-rate-limiting.md) | Redis only for distributed rate limiting |
-| [0009](docs/adr/0009-owner-scoped-access-and-error-responses.md) | Owner-scoped account access and `{code, detail}` error responses |
-| [0010](docs/adr/0010-posting-protocol.md) | Posting protocol: sealed transactions, one sorted lock, whole-transaction retries |
-| [0011](docs/adr/0011-audit-trail.md) | Audit trail: schema, write protocol, scope and the limits of trigger protection |
-| [0012](docs/adr/0012-statement-ordering-and-reconciliation.md) | Commit-ordered entries, statements with computed running balances, independent reconciliation |
-| [0013](docs/adr/0013-authentication-and-authorization.md) | Password login (Argon2id) with opaque, database-backed bearer tokens; one router-level ownership check |
-| [0014](docs/adr/0014-failure-handling-unavailability-cancellation-and-shutdown.md) | Failure handling: `503` for unreachable databases and pre-`COMMIT` connection loss, cancellation, audit fallback logs, shutdown as configured |
-| [0015](docs/adr/0015-database-roles-and-least-privilege.md) | Database roles: admin bootstrap, `ledger_owner` migrations, `ledger_app` with column-level grants; migration and startup privilege guards |
-| [0016](docs/adr/0016-rate-limiting.md) | Rate limiting: four limits in Redis, a per-email login throttle, fail closed for login and registration |
-| [0017](docs/adr/0017-structured-logs-and-request-correlation.md) | JSON log lines and a server-generated request id shared by the response, the logs and the audit trail |
+```text
+banking-ledger-api/
+  src/ledger_api/
+    domain/        pure rules and types (no I/O): money, postings, idempotency, audit records,
+                   passwords, tokens, rate-limit keys
+    data/          SQLAlchemy models, the engine (timeouts, privilege guard), owner-scoped
+                   queries, reconciliation, Redis counters
+    services/      use cases: the only layer that opens and commits transactions (ADR 0001)
+    api/           FastAPI routes (thin), dependencies, error mapping, request middleware
+    observability/ JSON log lines and the request id
+    admin/         the role bootstrap, run by an operator, never imported by the application
+    config.py      settings from the environment
+    main.py        app factory
+  migrations/      Alembic environment and versions 0001-0014
+  scripts/         start-up smoke test, backup and restore rehearsal
+  tests/
+    unit/          no database or Redis
+    api/           HTTP, through the application
+    integration/   against a real PostgreSQL and Redis
+  docs/adr/        architecture decision records
+```
 
-## Roadmap
+## Known limitations
 
-1. ✅ Repository and development environment
-2. ✅ Database and domain models
-3. ✅ Users and accounts
-4. ✅ Ledger and transaction posting
-5. ✅ Audit trail, statements (service layer) and reconciliation
-6. ✅ Idempotency and the HTTP posting API (deposits, withdrawals, transfers)
-7. ✅ REST API: statements, single transactions, `Location` on postings
-8. ✅ Authentication and authorization (password login, bearer tokens, ownership on every user-scoped route)
-9. ✅ Reliability: database outages answer `503`, pre-`COMMIT` and cancellation behaviour tested, failure handling documented
-10. ✅ Security and observability: least-privilege database roles and their guards, rate limits in Redis, JSON logs and request correlation
+- **No HTTPS.** The local stack serves plain HTTP on 127.0.0.1; a deployment needs TLS
+  termination, since bearer tokens must never travel unencrypted.
+- **No session cleanup** (expired rows accumulate), no per-user session limit, no listing of
+  sessions and no "revoke all sessions".
+- **No** password change or reset, email verification, MFA, roles or administrators.
+- Registration still answers `409` for a registered email; the per-address limit bounds how
+  fast addresses can be enumerated, it does not remove the signal.
+- Redis has no password in the Compose stack (no host port; Compose network only). A deployment
+  where anything else reaches Redis needs `rediss://` with credentials in `REDIS_URL`.
+- **Credentials** come from a local `.env` file, not a secrets manager.
+- **Rate limits** use fixed windows: up to about twice a limit can pass around a window
+  boundary. Anyone can throttle a known email for one window by failing on purpose. Behind a
+  reverse proxy, uvicorn must trust it (`--forwarded-allow-ips`), or every client shares the
+  proxy's budget ([ADR 0016](docs/adr/0016-rate-limiting.md)).
+- **Logs** are as durable as the process's stderr; shipping them somewhere queryable is the
+  deployment's job. uvicorn's first two startup lines are plain text
+  ([ADR 0017](docs/adr/0017-structured-logs-and-request-correlation.md)).
+- **The audit trail** can still be rewritten by the admin superuser and `ledger_owner`, neither of
+  which the API holds; rejected and failed events are best-effort
+  ([Audit trail](#audit-trail), [ADR 0011](docs/adr/0011-audit-trail.md)).
+- **Two currencies**, GBP and EUR, each with its own ledger; accounts in different currencies
+  cannot transact with each other.
+- **Users registered before Phase 8** cannot log in: no credentials were backfilled
+  ([ADR 0013](docs/adr/0013-authentication-and-authorization.md)).
+
+## Decisions
+
+- [ADR 0001 — Layered modular monolith on FastAPI and PostgreSQL](docs/adr/0001-layered-modular-monolith.md)
+- [ADR 0002 — Money as integer minor units (`amount_minor`)](docs/adr/0002-money-as-integer-minor-units.md)
+- [ADR 0003 — Per-currency ledgers and signed double-entry postings](docs/adr/0003-per-currency-ledgers-and-signed-double-entry.md)
+- [ADR 0004 — Immutable transactions without a status column](docs/adr/0004-immutable-transactions-without-status.md)
+- [ADR 0005 — Pessimistic row locking under READ COMMITTED](docs/adr/0005-pessimistic-locking-under-read-committed.md)
+- [ADR 0006 — Idempotency keys stored inside the posting transaction](docs/adr/0006-idempotency-inside-the-posting-transaction.md)
+- [ADR 0007 — Auditing rejected attempts outside the financial transaction](docs/adr/0007-auditing-rejected-financial-attempts.md)
+- [ADR 0008 — Redis only for distributed rate limiting](docs/adr/0008-redis-only-for-rate-limiting.md)
+- [ADR 0009 — Owner-scoped account access and `{code, detail}` error responses](docs/adr/0009-owner-scoped-access-and-error-responses.md)
+- [ADR 0010 — Posting protocol: sealed transactions, one sorted lock, whole-transaction retries](docs/adr/0010-posting-protocol.md)
+- [ADR 0011 — Audit trail: schema, write protocol, scope and the limits of trigger protection](docs/adr/0011-audit-trail.md)
+- [ADR 0012 — Commit-ordered entries, statements with computed running balances, independent reconciliation](docs/adr/0012-statement-ordering-and-reconciliation.md)
+- [ADR 0013 — Password login (Argon2id) with opaque, database-backed bearer tokens; one router-level ownership check](docs/adr/0013-authentication-and-authorization.md)
+- [ADR 0014 — Failure handling: `503` for unreachable databases and pre-`COMMIT` connection loss, cancellation, audit fallback logs, shutdown as configured](docs/adr/0014-failure-handling-unavailability-cancellation-and-shutdown.md)
+- [ADR 0015 — Database roles: admin bootstrap, `ledger_owner` migrations, `ledger_app` with column-level grants; migration and startup privilege guards](docs/adr/0015-database-roles-and-least-privilege.md)
+- [ADR 0016 — Rate limiting: four limits in Redis, a per-email login throttle, fail closed for login and registration](docs/adr/0016-rate-limiting.md)
+- [ADR 0017 — JSON log lines and a server-generated request id shared by the response, the logs and the audit trail](docs/adr/0017-structured-logs-and-request-correlation.md)
