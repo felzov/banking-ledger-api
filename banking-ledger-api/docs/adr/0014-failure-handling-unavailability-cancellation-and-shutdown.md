@@ -176,3 +176,10 @@ server; the `docker compose stop` sequence itself is not exercised by the test s
   reasons), `test_posting_cancellation.py` (cancellation before and after COMMIT, in a lock
   wait, during audit writes, of a replay; `tests/tcp_proxy.py` withholds COMMIT
   acknowledgements). The COMMIT-time tests of `test_commit_outcome.py` are unchanged.
+
+## Amendment (Phase 10, 2026-10-23): a logging handler (ADR 0017)
+
+Logging is configured: every record, the fallback lines of section 4 included, is one JSON line
+on stderr with the request's id, and those fallback lines also name the event's `request_id`.
+They remain a fallback, as durable as stderr. See
+[ADR 0017](0017-structured-logs-and-request-correlation.md).

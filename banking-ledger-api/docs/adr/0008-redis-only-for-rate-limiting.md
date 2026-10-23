@@ -22,3 +22,10 @@ replicas, because each process counts separately.
 - Redis becomes a runtime dependency only once it solves a real problem.
 - Behavior when Redis is unavailable (fail open or fail closed per endpoint) must be decided
   in Phase 10.
+
+## Amendment (Phase 10, 2026-10-23): implemented (ADR 0016)
+
+Redis holds the rate-limit counters and nothing else. The open question is decided: login and
+registration fail closed (`503`) while Redis is unavailable, postings fail open with a WARNING.
+"`POST /transactions`" above is the three posting routes (deposits, withdrawals, transfers),
+limited together per user. See [ADR 0016](0016-rate-limiting.md).

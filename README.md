@@ -6,8 +6,8 @@ Production-oriented Python backend projects focused on fintech, banking systems,
 
 | Project | Status | Description |
 |---|---|---|
-| [banking-ledger-api](banking-ledger-api/) | Completed | Double-entry banking ledger API built with FastAPI, PostgreSQL, and SQLAlchemy. Features ACID transactions, concurrency control, idempotent operations, authentication, audit logging, and least-privilege database roles. |
-| banking-transaction-analytics | Planned | Transaction ingestion, validation, and analytics pipeline. |
+| [banking-ledger-api](banking-ledger-api/) | Completed | Double-entry banking ledger API built with FastAPI, PostgreSQL, and SQLAlchemy. Features ACID transactions, concurrency control, idempotent operations, authentication, audit logging, least-privilege database roles, rate limiting, and structured logs with request correlation. |
+| [banking-transaction-analytics](https://github.com/felzov/banking-transaction-analytics) | Completed | Imports, validates, deduplicates and analyses bank-statement CSVs, or syncs a ledger account from this API: exact minor-unit money, row-level errors, per-currency analytics. Its own repository. |
 
 ## Featured Project
 
@@ -20,11 +20,13 @@ A backend service that models core banking operations with an emphasis on correc
 - Transactional database operations and concurrency control.
 - Idempotency and safe request retries.
 - Authentication, authorization, and auditability.
+- Rate limiting in Redis against password guessing and enumeration.
+- Structured JSON logs and a request id shared by responses, logs, and audit events.
 - PostgreSQL privilege separation and least-privilege access.
 - Integration testing, database migrations, and CI/CD.
 - Guarded database backup and restore rehearsal.
 
-**Tech stack:** Python, FastAPI, PostgreSQL, SQLAlchemy 2.0, Alembic, pytest, Docker Compose, GitHub Actions.
+**Tech stack:** Python, FastAPI, PostgreSQL, SQLAlchemy 2.0, Alembic, Redis, pytest, Docker Compose, GitHub Actions.
 
 **Repository:** [banking-ledger-api](banking-ledger-api/)
 
