@@ -4,8 +4,10 @@ from pydantic import Field, SecretStr, field_validator, model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 from ledger_api.domain.passwords import DEFAULT_PARAMETERS, Argon2Parameters
+from ledger_api.domain.rate_limits import Limit, RateLimits
 
 ASYNCPG_URL_PREFIX = "postgresql+asyncpg://"
+REDIS_URL_PREFIXES = ("redis://", "rediss://")
 
 # OWASP's weakest acceptable Argon2id configuration (19 MiB, 2 passes): production refuses
 # anything cheaper. Development and test may go lower, e.g. to keep the test suite fast.
@@ -35,6 +37,22 @@ class Settings(BaseSettings):
     # Level of the JSON log lines on stderr (ADR 0017), for the application and its libraries.
     log_level: Literal["DEBUG", "INFO", "WARNING", "ERROR"] = "INFO"
 
+    # Rate limits (ADR 0016), counted in Redis (ADR 0008). Unset: no limits, for development and
+    # the test suite; production refuses to start without it. Secret: a URL may hold a password.
+    redis_url: SecretStr | None = None
+    # Prefix of every counter key: several deployments (or test runs) can share one Redis.
+    rate_limit_namespace: str = Field("ledger", pattern=r"^[a-z0-9-]{1,64}$")
+    # Per client address, every attempt.
+    login_attempts_per_minute: int = Field(20, ge=1)
+    # Per email address: attempts since its last successful login (in effect, failures), then a
+    # throttle until the window ends.
+    login_failures_per_email: int = Field(10, ge=1)
+    login_failure_window_seconds: int = Field(900, ge=60, le=86_400)
+    # Per client address.
+    registrations_per_hour: int = Field(10, ge=1)
+    # Per authenticated user, deposits, withdrawals and transfers together.
+    postings_per_minute: int = Field(60, ge=1)
+
     @field_validator("log_level", mode="before")
     @classmethod
     def _log_level_in_capitals(cls, value: object) -> object:
@@ -47,6 +65,20 @@ class Settings(BaseSettings):
         if not value.get_secret_value().startswith(ASYNCPG_URL_PREFIX):
             raise ValueError(f"DATABASE_URL must start with {ASYNCPG_URL_PREFIX}")
         return value
+
+    @field_validator("redis_url")
+    @classmethod
+    def _require_redis_scheme(cls, value: SecretStr | None) -> SecretStr | None:
+        if value is not None and not value.get_secret_value().startswith(REDIS_URL_PREFIXES):
+            raise ValueError(f"REDIS_URL must start with {' or '.join(REDIS_URL_PREFIXES)}")
+        return value
+
+    @model_validator(mode="after")
+    def _require_rate_limits_in_production(self) -> Self:
+        # Without Redis there are no rate limits: nothing stops password guessing (ADR 0016).
+        if self.app_env == "production" and self.redis_url is None:
+            raise ValueError("REDIS_URL is required in production: it holds the rate limits")
+        return self
 
     @model_validator(mode="after")
     def _check_argon2_parameters(self) -> Self:
@@ -63,6 +95,16 @@ class Settings(BaseSettings):
                 f"{PRODUCTION_MIN_ARGON2_TIME_COST} passes"
             )
         return self
+
+    def rate_limits(self) -> RateLimits:
+        return RateLimits(
+            login_address=Limit("login_address", self.login_attempts_per_minute, 60),
+            login_failures=Limit(
+                "login_failures", self.login_failures_per_email, self.login_failure_window_seconds
+            ),
+            registration_address=Limit("registration_address", self.registrations_per_hour, 3600),
+            postings_user=Limit("postings_user", self.postings_per_minute, 60),
+        )
 
     def argon2_parameters(self) -> Argon2Parameters:
         return Argon2Parameters(

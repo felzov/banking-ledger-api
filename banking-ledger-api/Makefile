@@ -45,22 +45,26 @@ db-shell: ## Open psql inside the database container
 # never the development database: this always overrides DATABASE_URL.
 POSTGRES_TEST_PORT ?= 5433
 TEST_DATABASE_URL = postgresql+asyncpg://$(POSTGRES_USER):$(POSTGRES_PASSWORD)@127.0.0.1:$(POSTGRES_TEST_PORT)/$(POSTGRES_DB)
+# The rate-limit tests' Redis (compose service test-redis). TEST_REDIS_URL, never REDIS_URL: the
+# app reads REDIS_URL, and the rest of the suite must run without limits.
+REDIS_TEST_PORT ?= 6380
 
 # Compose interpolates the whole file, so the role passwords other services require must be set
 # even though test-db uses none of them: placeholders when .env has none, never passed to test-db.
 TEST_COMPOSE = LEDGER_OWNER_PASSWORD="$${LEDGER_OWNER_PASSWORD:-unused-by-test-db}" \
 	LEDGER_APP_PASSWORD="$${LEDGER_APP_PASSWORD:-unused-by-test-db}" docker compose --profile test
 
-test: ## Run the test suite against the disposable test cluster (started if needed)
-	$(TEST_COMPOSE) up -d --wait test-db
+test: ## Run the test suite against the disposable test cluster and Redis (started if needed)
+	$(TEST_COMPOSE) up -d --wait test-db test-redis
 	@# Mark the test-db server itself, addressed by its service name (never through DATABASE_URL):
 	@# tests/database.py refuses any server without this marker. Data on tmpfs: the marker goes
 	@# with the container.
 	$(TEST_COMPOSE) exec -T test-db psql -U $(POSTGRES_USER) -d $(POSTGRES_DB) \
 		-v ON_ERROR_STOP=1 -q -c "ALTER SYSTEM SET ledger.test_cluster = 'disposable'" \
 		-c "SELECT pg_reload_conf()" -o /dev/null
-	@echo '+ pytest (against test-db, 127.0.0.1:$(POSTGRES_TEST_PORT))'
-	@DATABASE_URL='$(TEST_DATABASE_URL)' LEDGER_TEST_CLUSTER=disposable uv run pytest
+	@echo '+ pytest (against test-db, 127.0.0.1:$(POSTGRES_TEST_PORT), and test-redis, :$(REDIS_TEST_PORT))'
+	@DATABASE_URL='$(TEST_DATABASE_URL)' LEDGER_TEST_CLUSTER=disposable \
+		TEST_REDIS_URL='redis://127.0.0.1:$(REDIS_TEST_PORT)/0' uv run pytest
 
 # The start-up smoke test (scripts/compose-smoke.sh) in an isolated compose project: its own name,
 # volume, image tag and host ports, configured from .env.example only (a clean environment, so

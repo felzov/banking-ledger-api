@@ -18,6 +18,7 @@ from ledger_api.config import Settings
 from ledger_api.domain.idempotency import is_valid_idempotency_key
 from ledger_api.domain.principal import Principal
 from ledger_api.services.auth import authenticate
+from ledger_api.services.rate_limits import RateLimiter
 
 
 def get_engine(request: Request) -> AsyncEngine:
@@ -125,3 +126,41 @@ def require_path_user(user_id: uuid.UUID, principal: PrincipalDep) -> Principal:
     if principal.user_id != user_id:
         raise ForbiddenError
     return principal
+
+
+# --- rate limits (ADR 0016) -----------------------------------------------------------------------
+
+
+def get_rate_limiter(request: Request) -> RateLimiter | None:
+    """The process's limiter (main.py lifespan), or None when REDIS_URL is unset: no limits."""
+    limiter: RateLimiter | None = request.app.state.rate_limiter
+    return limiter
+
+
+RateLimiterDep = Annotated[RateLimiter | None, Depends(get_rate_limiter)]
+
+
+def _client_host(request: Request) -> str | None:
+    # The peer uvicorn reports; behind a proxy, the proxy's own address unless uvicorn trusts it
+    # (--forwarded-allow-ips) and takes the client from X-Forwarded-For (README, Security).
+    return request.client.host if request.client is not None else None
+
+
+async def limit_login_attempts(request: Request, limiter: RateLimiterDep) -> None:
+    """POST /sessions, every attempt per client address. A dependency, so it runs before the
+    body is validated: malformed attempts count too."""
+    if limiter is not None:
+        await limiter.limit_login_address(_client_host(request))
+
+
+async def limit_registrations(request: Request, limiter: RateLimiterDep) -> None:
+    """POST /users, every attempt per client address: bounds email enumeration (ADR 0008)."""
+    if limiter is not None:
+        await limiter.limit_registration_address(_client_host(request))
+
+
+async def limit_postings(principal: PrincipalDep, limiter: RateLimiterDep) -> None:
+    """Every posting per authenticated user, replays included. After authentication and the
+    ownership check (the router's dependency runs first; the principal is cached per request)."""
+    if limiter is not None:
+        await limiter.limit_postings(principal.user_id)

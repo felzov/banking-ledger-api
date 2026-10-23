@@ -44,8 +44,19 @@ jobs:
           --health-interval 5s
           --health-timeout 3s
           --health-retries 10
+      # The rate-limit tests' Redis (ADR 0016); discarded with the job.
+      redis:
+        image: redis:8-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 5s
+          --health-timeout 3s
+          --health-retries 10
     env:
       DATABASE_URL: postgresql+asyncpg://ledger@localhost:5432/ledger
+      TEST_REDIS_URL: redis://localhost:6379/0
       # The service container above is created for this job and discarded with it: the tests may
       # create the cluster-wide roles migrations grant to (tests/database.py checks this, and the
       # server's own marker, set below).

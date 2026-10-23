@@ -3,6 +3,7 @@
 #
 #     db (healthy) -> bootstrap (admin) -> migrate (ledger_owner) -> api (ledger_app)
 #
+# The api also needs redis (rate limits, ADR 0016): `compose up --wait` waits for it to be healthy.
 # Then an API flow (register, log in, open an account, deposit) and the server's own view: which
 # role the API is connected as, who owns the schema, which credentials the API container holds.
 #

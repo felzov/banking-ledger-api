@@ -4,8 +4,8 @@ name: banking-ledger
 # - admin (POSTGRES_USER, the bootstrap superuser): the db itself and the one-shot bootstrap;
 # - ledger_owner: owns every object, runs the migrations;
 # - ledger_app: the API's only identity (a member of ledger_runtime, migration 0013's grants).
-# Start order: db healthy -> bootstrap -> migrate -> api. Passwords come from .env and are
-# written into URLs unescaped: use letters, digits and . _ ~ - only.
+# Start order: db healthy -> bootstrap -> migrate -> api (with redis healthy). Passwords come
+# from .env and are written into URLs unescaped: use letters, digits and . _ ~ - only.
 x-admin-database-url: &admin-database-url
   ADMIN_DATABASE_URL: postgresql+asyncpg://${POSTGRES_USER}:${POSTGRES_PASSWORD}@db:5432/${POSTGRES_DB}
 x-owner-database-url: &owner-database-url
@@ -32,6 +32,28 @@ services:
       timeout: 3s
       retries: 10
       start_period: 10s
+
+  # Rate-limit counters only (ADR 0008, ADR 0016): nothing else is ever stored here. No
+  # persistence (counters are short-lived by design, and a restart only resets them), memory
+  # capped with eviction of the keys closest to expiry, and no host port: only the api reaches
+  # it, on the compose network.
+  redis:
+    image: redis:8-alpine
+    command:
+      - redis-server
+      - --save
+      - ""
+      - --appendonly
+      - "no"
+      - --maxmemory
+      - 64mb
+      - --maxmemory-policy
+      - volatile-ttl
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
 
   # One-shot, as the admin: creates or reconciles ledger_owner, ledger_runtime and ledger_app,
   # restricts the database, and on an existing volume transfers the objects to ledger_owner
@@ -83,6 +105,8 @@ services:
     environment:
       <<: *app-database-url
       APP_ENV: ${APP_ENV:-development}
+      # The rate limits' counters (ADR 0016); no password: reachable on the compose network only.
+      REDIS_URL: redis://redis:6379/0
       # Mounted source shadows the installed package so --reload picks up edits.
       PYTHONPATH: /app/src
     command:
@@ -102,6 +126,8 @@ services:
         condition: service_healthy
       migrate:
         condition: service_completed_successfully
+      redis:
+        condition: service_healthy
 
   # The test suite's own cluster (`make test`), never the development database: data on tmpfs, so
   # nothing survives the container, and the tests may create the cluster-wide roles migrations
@@ -126,6 +152,20 @@ services:
       timeout: 3s
       retries: 15
       start_period: 5s
+
+  # The test suite's own Redis (`make test`, TEST_REDIS_URL), never the development one. Tests
+  # only touch keys under a namespace of their own (tests/conftest.py). Profile "test".
+  test-redis:
+    image: redis:8-alpine
+    profiles: ["test"]
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "127.0.0.1:${REDIS_TEST_PORT:-6380}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 3s
+      retries: 15
 
 volumes:
   pgdata:

@@ -6,7 +6,9 @@ from ledger_api.domain.errors import (
     DomainError,
     InternalError,
     NotFoundError,
+    RateLimitedError,
     RuleViolationError,
+    TooManyRequestsError,
     UnavailableError,
 )
 
@@ -23,6 +25,13 @@ def _concrete_errors() -> list[type[DomainError]]:
 
 
 CONCRETE_ERRORS = _concrete_errors()
+
+
+def instance_of(error_type: type[DomainError]) -> DomainError:
+    """An instance of a concrete error; one that carries data gets a sample value."""
+    if issubclass(error_type, RateLimitedError):
+        return error_type(retry_after_seconds=1)
+    return error_type()
 
 
 def test_there_are_concrete_domain_errors() -> None:
@@ -43,6 +52,7 @@ def test_every_concrete_error_has_a_code_message_and_category(
             ConflictError,
             RuleViolationError,
             UnavailableError,
+            TooManyRequestsError,
             InternalError,
         ),
     )
@@ -57,4 +67,4 @@ def test_error_codes_are_unique() -> None:
 def test_error_carries_its_message() -> None:
     error_type = CONCRETE_ERRORS[0]
 
-    assert str(error_type()) == error_type.message
+    assert str(instance_of(error_type)) == error_type.message

@@ -8,16 +8,22 @@ logged; failures answer {code, detail} with a WWW-Authenticate challenge.
 from datetime import datetime
 from typing import Annotated, Any, Literal
 
-from fastapi import APIRouter, Response, status
+from fastapi import APIRouter, Depends, Response, status
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, SecretStr
 
 from ledger_api.api.dependencies import (
     BearerTokenDep,
     PasswordHasherDep,
+    RateLimiterDep,
     SessionDep,
     SessionLifetimeDep,
+    limit_login_attempts,
 )
-from ledger_api.api.errors import VALIDATION_ERROR_RESPONSE, ErrorResponse
+from ledger_api.api.errors import (
+    TOO_MANY_REQUESTS_RESPONSE,
+    VALIDATION_ERROR_RESPONSE,
+    ErrorResponse,
+)
 from ledger_api.api.routes.users import MAX_RAW_PASSWORD_LENGTH
 from ledger_api.domain.user import normalize_email
 from ledger_api.services.auth import login, logout
@@ -53,22 +59,26 @@ class LoginResponse(BaseModel):
 @router.post(
     "",
     status_code=status.HTTP_201_CREATED,
-    responses={**UNAUTHORIZED, **VALIDATION_ERROR_RESPONSE},
+    responses={**UNAUTHORIZED, **VALIDATION_ERROR_RESPONSE, **TOO_MANY_REQUESTS_RESPONSE},
+    dependencies=[Depends(limit_login_attempts)],
 )
 async def create_session(
     body: LoginRequest,
     session: SessionDep,
     hasher: PasswordHasherDep,
     lifetime: SessionLifetimeDep,
+    limiter: RateLimiterDep,
     response: Response,
 ) -> LoginResponse:
-    """Log in. An unknown email and a wrong password are the same 401 invalid_credentials."""
+    """Log in. An unknown email and a wrong password are the same 401 invalid_credentials.
+    Rate limited per client address and per email's failed logins (429, ADR 0016)."""
     result = await login(
         session,
         hasher,
         email=body.email,
         password=body.password.get_secret_value(),
         lifetime=lifetime,
+        limiter=limiter,
     )
     response.headers.update(NO_STORE)
     return LoginResponse(access_token=result.token, expires_at=result.expires_at)

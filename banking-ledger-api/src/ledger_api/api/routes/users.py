@@ -2,11 +2,15 @@ import uuid
 from datetime import datetime
 from typing import Annotated
 
-from fastapi import APIRouter, Request, Response, status
+from fastapi import APIRouter, Depends, Request, Response, status
 from pydantic import AfterValidator, BaseModel, ConfigDict, Field, SecretStr
 
-from ledger_api.api.dependencies import PasswordHasherDep, SessionDep
-from ledger_api.api.errors import VALIDATION_ERROR_RESPONSE, ErrorResponse
+from ledger_api.api.dependencies import PasswordHasherDep, SessionDep, limit_registrations
+from ledger_api.api.errors import (
+    TOO_MANY_REQUESTS_RESPONSE,
+    VALIDATION_ERROR_RESPONSE,
+    ErrorResponse,
+)
 from ledger_api.data.models import User
 from ledger_api.domain.passwords import normalize_password
 from ledger_api.domain.user import normalize_email
@@ -60,7 +64,12 @@ class UserResponse(BaseModel):
 @router.post(
     "",
     status_code=status.HTTP_201_CREATED,
-    responses={status.HTTP_409_CONFLICT: {"model": ErrorResponse}, **VALIDATION_ERROR_RESPONSE},
+    responses={
+        status.HTTP_409_CONFLICT: {"model": ErrorResponse},
+        **VALIDATION_ERROR_RESPONSE,
+        **TOO_MANY_REQUESTS_RESPONSE,
+    },
+    dependencies=[Depends(limit_registrations)],
 )
 async def create_user(
     body: CreateUserRequest,

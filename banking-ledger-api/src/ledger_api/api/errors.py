@@ -16,8 +16,10 @@ from ledger_api.domain.errors import (
     InternalError,
     InvalidTokenError,
     NotFoundError,
+    RateLimitedError,
     RuleViolationError,
     TemporarilyUnavailableError,
+    TooManyRequestsError,
     UnavailableError,
 )
 from ledger_api.observability.correlation import current_request_id
@@ -32,6 +34,7 @@ STATUS_BY_CATEGORY: dict[type[DomainError], int] = {
     ConflictError: status.HTTP_409_CONFLICT,
     RuleViolationError: status.HTTP_422_UNPROCESSABLE_CONTENT,
     UnavailableError: status.HTTP_503_SERVICE_UNAVAILABLE,
+    TooManyRequestsError: status.HTTP_429_TOO_MANY_REQUESTS,
     InternalError: status.HTTP_500_INTERNAL_SERVER_ERROR,
 }
 
@@ -118,6 +121,9 @@ async def _domain_error(request: Request, exc: Exception) -> JSONResponse:
             INVALID_TOKEN_CHALLENGE if isinstance(exc, InvalidTokenError) else BEARER_CHALLENGE
         )
         headers = {"WWW-Authenticate": challenge}
+    elif isinstance(exc, RateLimitedError):
+        # Whole seconds until the limit's window ends (RFC 9110, section 10.2.3).
+        headers = {"Retry-After": str(exc.retry_after_seconds)}
     return JSONResponse(status_code=status_code, content=body.model_dump(), headers=headers)
 
 
@@ -179,6 +185,20 @@ def register_error_handlers(app: FastAPI) -> None:
 
 
 # Shared OpenAPI documentation for error responses.
+
+# A rate-limited route (ADR 0016).
+TOO_MANY_REQUESTS_RESPONSE: dict[int | str, dict[str, Any]] = {
+    status.HTTP_429_TOO_MANY_REQUESTS: {
+        "model": ErrorResponse,
+        "description": "rate_limited, with a Retry-After header (seconds).",
+        "headers": {
+            "Retry-After": {
+                "description": "Seconds until the limit's window ends.",
+                "schema": {"type": "integer"},
+            }
+        },
+    }
+}
 
 # A route whose 422 can only be a malformed request (FastAPI's validation).
 VALIDATION_ERROR_RESPONSE: dict[int | str, dict[str, Any]] = {
