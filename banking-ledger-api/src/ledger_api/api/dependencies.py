@@ -142,7 +142,7 @@ RateLimiterDep = Annotated[RateLimiter | None, Depends(get_rate_limiter)]
 
 def _client_host(request: Request) -> str | None:
     # The peer uvicorn reports; behind a proxy, the proxy's own address unless uvicorn trusts it
-    # (--forwarded-allow-ips) and takes the client from X-Forwarded-For (README, Security).
+    # (--forwarded-allow-ips) and takes the client from X-Forwarded-For (docs/security.md).
     return request.client.host if request.client is not None else None
 
 
